@@ -189,7 +189,7 @@ export async function processUserMessage(prompt: string): Promise<BotResponse> {
 
 # Plik: src/services/finance.service.ts
 ```typescript
-import { db } from '../db';
+import { db } from '../db/index.js';
 import {
   dailyRecords,
   cashTips,
@@ -197,10 +197,10 @@ import {
   balanceCheckpoints,
   courseOffers,
   earningTargets,
-} from '../db/schema';
-import { eq, and, gte, lte, sql, desc, inArray } from 'drizzle-orm';
-import { NETTO_FACTOR } from '../config';
-import { VoiceExtractedData, WalletTransactionItem } from './gemini.service';
+} from '../db/schema.js';
+import { eq, and, gte, lte, sql, desc } from 'drizzle-orm';
+import { CFG } from '../config.js';
+import { VoiceExtractedData, WalletTransactionItem } from './gemini.service.js';
 
 export interface DailySummary {
   date: string;
@@ -211,6 +211,8 @@ export interface DailySummary {
   walletPayouts: number;
   walletCollections: number;
   doPrzelewu: number;
+  workFrom: string | null;
+  workTo: string | null;
   workHours: number;
   hourlyRateNetto: number;
   fuelPrice: number;
@@ -237,6 +239,9 @@ export interface CourseOfferStats {
   totalOffers: number;
   profitable: number;
   unprofitable: number;
+  accepted: number;
+  rejected: number;
+  pending: number;
   avgNetRatePerKm: number;
   bestNetRate: number;
   worstNetRate: number;
@@ -255,7 +260,7 @@ export class FinanceService {
 
   adjustDateForNightShift(dateStr: string, timeStr?: string): string {
     if (!timeStr) return dateStr;
-    const hour = parseInt(timeStr.split(':')[0], 10);
+    const hour = parseInt(timeStr.split(':')[0] || '0', 10);
     if (hour >= 0 && hour < 4) {
       const d = new Date(`${dateStr}T12:00:00`);
       d.setDate(d.getDate() - 1);
@@ -285,6 +290,8 @@ export class FinanceService {
   calculateHours(fromStr: string, toStr: string): number {
     const [fH, fM] = fromStr.split(':').map(Number);
     const [tH, tM] = toStr.split(':').map(Number);
+    if (fH === undefined || fM === undefined || tH === undefined || tM === undefined) return 0;
+
     let diffMinutes = tH * 60 + tM - (fH * 60 + fM);
     if (diffMinutes < 0) diffMinutes += 24 * 60;
     const hours = Math.round((diffMinutes / 60) * 100) / 100;
@@ -310,6 +317,95 @@ export class FinanceService {
       startDate: monday.toISOString().slice(0, 10),
       endDate: sunday.toISOString().slice(0, 10),
     };
+  }
+
+  async setShiftStart(
+    telegramId: string | number,
+    date: string,
+    workFrom: string
+  ): Promise<DailySummary> {
+    const tId = String(telegramId);
+    const [existing] = await db
+      .select()
+      .from(dailyRecords)
+      .where(and(eq(dailyRecords.telegramId, tId), eq(dailyRecords.date, date)))
+      .limit(1);
+
+    let calculatedHours: string | null = null;
+    if (existing?.workTo) {
+      const h = this.calculateHours(workFrom, existing.workTo);
+      if (h > 0) calculatedHours = h.toString();
+    }
+
+    await db
+      .insert(dailyRecords)
+      .values({
+        telegramId: tId,
+        date,
+        workFrom,
+        workTo: existing?.workTo || null,
+        workHours: calculatedHours || existing?.workHours || null,
+      })
+      .onConflictDoUpdate({
+        target: [dailyRecords.telegramId, dailyRecords.date],
+        set: {
+          workFrom,
+          ...(calculatedHours && { workHours: calculatedHours }),
+        },
+      });
+
+    return this.getDailySummary(tId, date);
+  }
+
+  async setShiftEnd(
+    telegramId: string | number,
+    date: string,
+    data: {
+      workTo?: string | null;
+      fuelDistance?: number | null;
+      walletCash?: number | null;
+    }
+  ): Promise<DailySummary> {
+    const tId = String(telegramId);
+    const [existing] = await db
+      .select()
+      .from(dailyRecords)
+      .where(and(eq(dailyRecords.telegramId, tId), eq(dailyRecords.date, date)))
+      .limit(1);
+
+    const workFrom = existing?.workFrom || null;
+    const workTo = data.workTo || existing?.workTo || null;
+    let calculatedHours: string | null = existing?.workHours || null;
+
+    if (workFrom && workTo) {
+      const h = this.calculateHours(workFrom, workTo);
+      calculatedHours = h > 0 ? h.toString() : null;
+    }
+
+    await db
+      .insert(dailyRecords)
+      .values({
+        telegramId: tId,
+        date,
+        workFrom,
+        workTo,
+        workHours: calculatedHours,
+        fuelDistance: data.fuelDistance != null ? data.fuelDistance : (existing?.fuelDistance ?? null),
+      })
+      .onConflictDoUpdate({
+        target: [dailyRecords.telegramId, dailyRecords.date],
+        set: {
+          ...(workTo && { workTo }),
+          ...(calculatedHours && { workHours: calculatedHours }),
+          ...(data.fuelDistance != null && { fuelDistance: data.fuelDistance }),
+        },
+      });
+
+    if (data.walletCash != null) {
+      await this.setBalanceCheckpoint(tId, date, data.walletCash);
+    }
+
+    return this.getDailySummary(tId, date);
   }
 
   async saveCashTip(telegramId: string | number, date: string, amount: number): Promise<void> {
@@ -351,26 +447,50 @@ export class FinanceService {
       deliveryAddress: string;
       verificationText?: string;
     }
-  ): Promise<void> {
+  ): Promise<number> {
     const now = new Date();
     const date = this.getEffectiveDate(now);
     const time = now.toTimeString().slice(0, 5);
 
-    await db.insert(courseOffers).values({
-      telegramId: String(telegramId),
-      date,
-      time,
-      grossAmount: data.grossAmount.toFixed(2),
-      netAmount: data.netAmount.toFixed(2),
-      totalDistance: data.totalDistance.toFixed(2),
-      netRatePerKm: data.netRatePerKm.toFixed(2),
-      isProfitable: data.isProfitable,
-      pointsJson: JSON.stringify({
-        pickup: data.pickupAddress,
-        delivery: data.deliveryAddress,
-      }),
-      verificationText: data.verificationText || null,
-    });
+    const [inserted] = await db
+      .insert(courseOffers)
+      .values({
+        telegramId: String(telegramId),
+        date,
+        time,
+        grossAmount: data.grossAmount.toFixed(2),
+        netAmount: data.netAmount.toFixed(2),
+        totalDistance: data.totalDistance.toFixed(2),
+        netRatePerKm: data.netRatePerKm.toFixed(2),
+        isProfitable: data.isProfitable,
+        status: 'PENDING',
+        pointsJson: JSON.stringify({
+          pickup: data.pickupAddress,
+          delivery: data.deliveryAddress,
+        }),
+        verificationText: data.verificationText || null,
+      })
+      .returning({ id: courseOffers.id });
+
+    if (!inserted) {
+      throw new Error('Błąd zapisu oferty kursu.');
+    }
+
+    return inserted.id;
+  }
+
+  async updateCourseOfferStatus(
+    offerId: number,
+    telegramId: string | number,
+    status: 'ACCEPTED' | 'REJECTED'
+  ): Promise<boolean> {
+    const result = await db
+      .update(courseOffers)
+      .set({ status })
+      .where(and(eq(courseOffers.id, offerId), eq(courseOffers.telegramId, String(telegramId))))
+      .returning({ id: courseOffers.id });
+
+    return result.length > 0;
   }
 
   async previewWalletImport(
@@ -601,7 +721,7 @@ export class FinanceService {
     }
 
     const gross = record?.grossEarnings ? parseFloat(record.grossEarnings) : 0;
-    const netEarnings = Math.round(gross * NETTO_FACTOR * 100) / 100;
+    const netEarnings = Math.round(gross * CFG.NETTO_FACTOR * 100) / 100;
     const cashTipsTotal = tips[0]?.total ? parseFloat(tips[0].total) : 0;
     const totalNetto = Math.round((netEarnings + cashTipsTotal) * 100) / 100;
     const doPrzelewu = Math.max(0, Math.round((totalNetto - cashTipsTotal - walletPayouts) * 100) / 100);
@@ -617,6 +737,8 @@ export class FinanceService {
       walletPayouts,
       walletCollections,
       doPrzelewu,
+      workFrom: record?.workFrom || null,
+      workTo: record?.workTo || null,
       workHours,
       hourlyRateNetto,
       fuelPrice: record?.fuelPrice ? parseFloat(record.fuelPrice) : 0,
@@ -681,7 +803,7 @@ export class FinanceService {
       }
     }
 
-    const totalNettoEarnings = Math.round(totalGross * NETTO_FACTOR * 100) / 100;
+    const totalNettoEarnings = Math.round(totalGross * CFG.NETTO_FACTOR * 100) / 100;
     const totalCashTips = tips[0]?.total ? parseFloat(tips[0].total) : 0;
     const grandTotalNetto = Math.round((totalNettoEarnings + totalCashTips) * 100) / 100;
     const totalDoPrzelewu = Math.max(0, Math.round((grandTotalNetto - totalCashTips - totalWalletPayouts) * 100) / 100);
@@ -712,6 +834,9 @@ export class FinanceService {
 
     let profitable = 0;
     let unprofitable = 0;
+    let accepted = 0;
+    let rejected = 0;
+    let pending = 0;
     let sumRates = 0;
     let bestRate = 0;
     let worstRate = 999;
@@ -721,6 +846,10 @@ export class FinanceService {
     for (const o of offers) {
       if (o.isProfitable) profitable++;
       else unprofitable++;
+
+      if (o.status === 'ACCEPTED') accepted++;
+      else if (o.status === 'REJECTED') rejected++;
+      else pending++;
 
       const rate = parseFloat(o.netRatePerKm);
       sumRates += rate;
@@ -736,6 +865,9 @@ export class FinanceService {
       totalOffers: offers.length,
       profitable,
       unprofitable,
+      accepted,
+      rejected,
+      pending,
       avgNetRatePerKm: offers.length > 0 ? Math.round((sumRates / offers.length) * 100) / 100 : 0,
       bestNetRate: bestRate,
       worstNetRate: worstRate === 999 ? 0 : worstRate,
@@ -1217,10 +1349,10 @@ export const geminiService = new GeminiService();
 ```typescript
 import { Telegraf, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
-import { geminiService, WalletTransactionItem } from './gemini.service';
-import { financeService, TargetProgress } from './finance.service';
-import { mapsService } from './maps.service';
-import { NETTO_FACTOR, MIN_STAWKA_NETTO_KM } from '../config';
+import { geminiService, WalletTransactionItem } from './gemini.service.js';
+import { financeService, TargetProgress, DailySummary } from './finance.service.js';
+import { verifyOfferDistance } from './maps.service.js';
+import { CFG } from '../config.js';
 
 interface CourierLocation {
   latitude: number;
@@ -1230,6 +1362,17 @@ interface CourierLocation {
 
 const lastCourierLocation: Map<string, CourierLocation> = new Map();
 const pendingWalletImports: Map<string, { transactions: WalletTransactionItem[]; expiresAt: number }> = new Map();
+const awaitingInput: Map<string, 'START_CUSTOM_TIME' | 'START_CASH' | 'END_CUSTOM_TIME' | 'END_DIST' | 'END_CASH'> = new Map();
+
+function getCurrentWarsawTime(): string {
+  const now = new Date();
+  return now.toLocaleTimeString('pl-PL', {
+    timeZone: 'Europe/Warsaw',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+}
 
 function generateProgressBar(percent: number, totalBlocks = 10): string {
   const filledBlocks = Math.min(totalBlocks, Math.max(0, Math.round((percent / 100) * totalBlocks)));
@@ -1247,7 +1390,7 @@ function formatTargetCard(progress: TargetProgress): string {
       header,
       `${bar} *${progress.progressPercent.toFixed(1)}%*`,
       '',
-      `🏆 *CEL OSIĄGNIĘTY!*`,
+      '🏆 *CEL OSIĄGNIĘTY!*',
       `💰 *Zarobione netto:* *${progress.currentNetto.toFixed(2)} zł* / *${progress.targetAmount.toFixed(2)} zł*`,
       `📈 *Nadwyżka:* *+${(progress.currentNetto - progress.targetAmount).toFixed(2)} zł*`,
     ].join('\n');
@@ -1267,37 +1410,480 @@ function formatTargetCard(progress: TargetProgress): string {
   ].join('\n');
 }
 
+async function renderStartShiftCard(telegramId: string | number, date: string): Promise<string> {
+  const summary = await financeService.getDailySummary(telegramId, date);
+  const rolling = await financeService.getRollingBalance(telegramId, date);
+  const currentTime = getCurrentWarsawTime();
+
+  return [
+    '🚀 *Rozpoczęcie Zmiany*',
+    `📅 *Data:* \`${date}\``,
+    '',
+    `⏱️ *Godzina wyjazdu:* *${summary.workFrom ? summary.workFrom + ' (zapisano w bazie)' : `_Nieustalona_ (teraz: ${currentTime})`}*`,
+    `💵 *Portfel Glovo:* *${rolling.balance.toFixed(2)} zł*`,
+    '',
+    summary.workFrom
+      ? '✅ _Godzina wyjazdu została zapisana w bazie PostgreSQL._'
+      : 'Wybierz godzinę startu poniżej:',
+  ].join('\n');
+}
+
+async function renderEndShiftCard(telegramId: string | number, date: string): Promise<string> {
+  const summary = await financeService.getDailySummary(telegramId, date);
+  const rolling = await financeService.getRollingBalance(telegramId, date);
+  const currentTime = getCurrentWarsawTime();
+
+  return [
+    '🏁 *Zakończenie Zmiany*',
+    `📅 *Data zmiany:* \`${date}\``,
+    '',
+    `⏱️ *Godziny pracy:* \`${summary.workFrom || '--:--'} - ${summary.workTo || '--:--'}\` (*${summary.workHours.toFixed(2)} h*)`,
+    `🚗 *Stan licznika / Dystans:* *${summary.fuelDistance != null ? summary.fuelDistance + ' km' : '_Brak_'}*`,
+    `💰 *Zarobek brutto:* *${summary.grossEarnings.toFixed(2)} zł*`,
+    `💵 *Czyste Netto:* *${summary.totalNetto.toFixed(2)} zł* (Stawka: *${summary.hourlyRateNetto.toFixed(2)} zł/h*)`,
+    `💼 *Stan portfela Glovo:* *${rolling.balance.toFixed(2)} zł*`,
+    '',
+    summary.workTo
+      ? '✅ _Godzina zjazdu i rozliczenie są zapisane w bazie._'
+      : `⏱️ _Ustaw godzinę zjazdu (teraz: ${currentTime}) lub podaj przebieg:_`,
+  ].join('\n');
+}
+
 export function registerBotHandlers(bot: Telegraf): void {
   // 1. Pomoc i Menu
-  bot.command(['start', 'pomoc', 'help'], async (ctx) => {
+  bot.command(['start', 'pomoc', 'help', 'menu'], async (ctx) => {
     const text = [
       '🤖 *GlovoBot – Asystent Kuriera*',
       '',
+      '🛵 *Obsługa zmiany:*',
+      ' • `/wyjazd` – start zmiany i zapis godziny.',
+      ' • `/wyjazd 16:00 120` – wyjazd z parametrami (godz, kasetka).',
+      ' • `/koniec` – zjazd i rozliczenie.',
+      ' • `/koniec 23:15 54 180` – szybki zjazd (godz, dystans km, gotówka).',
+      '',
       '📍 *Lokalizacja:*',
-      ' • `/lokalizacja` – wywołaj przycisk wysłania pinezki GPS.',
+      ' • `/lokalizacja` – wyślij GPS do weryfikacji zleceń.',
       '',
       '🎯 *Cele zarobkowe:*',
-      ' • `/cel 4500` – ustaw cel miesięczny netto.',
-      ' • `/cel tydzien 1200` – ustaw cel tygodniowy netto.',
+      ' • `/cel 4500` – cel miesięczny netto.',
+      ' • `/cel tydzien 1200` – cel tygodniowy netto.',
       ' • `/cele` – sprawdź postęp i wymagane tempo.',
       '',
       '📊 *Raporty i historia:*',
       ' • `/dzis` – podsumowanie dzisiejszej zmiany.',
-      ' • `/dzien 2026-08-06` – podsumowanie konkretnego dnia.',
-      ' • `/tydzien` – bieżący tydzień (pon–ndz).',
-      ' • `/ptydzien` – poprzedni tydzień (pon–ndz).',
-      ' • `/miesiac` lub `/miesiac 2026-07` – podsumowanie miesiąca.',
-      ' • `/statystyki` lub `/statystyki 2026-08-06` – statystyki ofert Glovo.',
-      ' • `/saldo` lub `/saldo 150.00` – podgląd / ustawienie salda Glovo.',
+      ' • `/dzien 2026-08-15` – podsumowanie wybranego dnia.',
+      ' • `/tydzien` / `/ptydzien` – bieżący / poprzedni tydzień.',
+      ' • `/miesiac` – podsumowanie miesiąca.',
+      ' • `/statystyki` – statystyki ofert kursów.',
+      ' • `/saldo` – stan portfela Glovo.',
       '',
-      '🎙️ *Głos (Voice-to-Data):* Notatki tankowania, zarobków i cofania.',
+      '🎙️ *Głos (Voice-to-Data):* Notatki tankowania, godzin i zarobków.',
       '📸 *Zdjęcia:* Zrzuty Portfela, paragony paliwowe, oferty zleceń.',
     ].join('\n');
+
+    await ctx.reply(text, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback('🚀 Rozpocznij zmianę', 'btn_quick_start_shift'),
+          Markup.button.callback('🏁 Zakończ zmianę', 'btn_quick_end_shift'),
+        ],
+        [
+          Markup.button.callback('📊 Podsumowanie dziś', 'btn_quick_today'),
+          Markup.button.callback('🎯 Moje cele', 'btn_quick_targets'),
+        ],
+      ]),
+    });
+  });
+
+  // Skróty z menu głównego
+  bot.action('btn_quick_start_shift', async (ctx) => {
+    await ctx.answerCbQuery();
+    const effDate = financeService.getEffectiveDate();
+    const currentTime = getCurrentWarsawTime();
+    const text = await renderStartShiftCard(ctx.from.id, effDate);
+
+    await ctx.reply(text, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback(`⚡ Zapisz start teraz (${currentTime})`, 'startshift_start_now'),
+        ],
+        [
+          Markup.button.callback('✏️ Wpisz inną godzinę', 'startshift_custom_time'),
+          Markup.button.callback('💵 Ustaw kasetkę', 'startshift_set_cash'),
+        ],
+      ]),
+    });
+  });
+
+  bot.action('btn_quick_end_shift', async (ctx) => {
+    await ctx.answerCbQuery();
+    const effDate = financeService.getEffectiveDate();
+    const currentTime = getCurrentWarsawTime();
+    const text = await renderEndShiftCard(ctx.from.id, effDate);
+
+    await ctx.reply(text, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback(`⏱️ Zapisz zjazd teraz (${currentTime})`, 'endshift_set_now'),
+        ],
+        [
+          Markup.button.callback('✏️ Inna godzina', 'endshift_custom_time'),
+          Markup.button.callback('🚗 Dystans / licznik', 'endshift_set_dist'),
+        ],
+        [
+          Markup.button.callback('💵 Stan gotówki Glovo', 'endshift_set_cash'),
+        ],
+      ]),
+    });
+  });
+
+  bot.action('btn_quick_today', async (ctx) => {
+    await ctx.answerCbQuery();
+    const date = financeService.getEffectiveDate();
+    const summary = await financeService.getDailySummary(ctx.from.id, date);
+    const text = [
+      `📅 *Raport dzienny:* \`${summary.date}\``,
+      '',
+      `💰 *Brutto:* *${summary.grossEarnings.toFixed(2)} zł*`,
+      `💵 *Netto ze zleceń (81.4%):* *${summary.netEarnings.toFixed(2)} zł*`,
+      `🪙 *Napiwki gotówka:* *+${summary.cashTipsTotal.toFixed(2)} zł*`,
+      `🏁 *Netto łącznie:* *${summary.totalNetto.toFixed(2)} zł*`,
+      summary.walletPayouts > 0 ? `🏧 *Wypłaty z portfela:* *-${summary.walletPayouts.toFixed(2)} zł*` : '',
+      `💳 *Do przelewu:* *${summary.doPrzelewu.toFixed(2)} zł*`,
+      '',
+      summary.workHours > 0
+        ? `⏱️ *Czas:* *${summary.workHours.toFixed(2)} h* (Stawka: *${summary.hourlyRateNetto.toFixed(2)} zł netto/h*)`
+        : '⏱️ *Czas pracy:* _Brak wpisu_',
+    ]
+      .filter(Boolean)
+      .join('\n');
 
     await ctx.reply(text, { parse_mode: 'Markdown' });
   });
 
-  // 2. Przycisk geolokalizacji na żądanie
+  bot.action('btn_quick_targets', async (ctx) => {
+    await ctx.answerCbQuery();
+    const mProg = await financeService.getTargetProgress(ctx.from.id, 'MONTHLY');
+    const wProg = await financeService.getTargetProgress(ctx.from.id, 'WEEKLY');
+    if (!mProg && !wProg) {
+      await ctx.reply('🎯 *Brak celów.* Wpisz np. `/cel 4500` lub `/cel tydzien 1200`.', { parse_mode: 'Markdown' });
+      return;
+    }
+    const cards = [mProg && formatTargetCard(mProg), wProg && formatTargetCard(wProg)].filter(Boolean);
+    await ctx.reply(cards.join('\n\n────────────────\n\n'), { parse_mode: 'Markdown' });
+  });
+
+  // 2. Start zmiany: /wyjazd
+  bot.command(['wyjazd', 'startzmiana', 'poczatek', 'start_zmiana'], async (ctx) => {
+    const parts = ctx.message.text.trim().split(/\s+/);
+    const effDate = financeService.getEffectiveDate();
+
+    if (parts.length > 1) {
+      let workFrom = getCurrentWarsawTime();
+      let initialCash: number | null = null;
+
+      for (let i = 1; i < parts.length; i++) {
+        const p = parts[i]!;
+        if (/^\d{1,2}:\d{2}$/.test(p)) {
+          workFrom = p.length === 4 ? `0${p}` : p;
+        } else {
+          const val = parseFloat(p.replace(',', '.').replace(/zł|zl/i, ''));
+          if (!isNaN(val)) initialCash = val;
+        }
+      }
+
+      await financeService.setShiftStart(ctx.from.id, effDate, workFrom);
+      if (initialCash != null) {
+        await financeService.setBalanceCheckpoint(ctx.from.id, effDate, initialCash);
+      }
+
+      const userLoc = lastCourierLocation.get(String(ctx.from.id));
+      const hasRecentLocation = Boolean(userLoc && Date.now() - userLoc.updatedAt <= 30 * 60 * 1000);
+
+      await ctx.reply(
+        `🚀 *Zmiana rozpoczęta!*\n📅 Data: \`${effDate}\`\n⏱️ Godzina wyjazdu: *${workFrom}* (zapisano w bazie)`,
+        {
+          parse_mode: 'Markdown',
+          ...(!hasRecentLocation
+            ? Markup.keyboard([[Markup.button.locationRequest('📍 Wyślij moją pozycję GPS')]])
+                .resize()
+                .oneTime()
+            : Markup.removeKeyboard()),
+        }
+      );
+      return;
+    }
+
+    const currentTime = getCurrentWarsawTime();
+    const text = await renderStartShiftCard(ctx.from.id, effDate);
+    await ctx.reply(text, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback(`⚡ Zapisz start teraz (${currentTime})`, 'startshift_start_now'),
+        ],
+        [
+          Markup.button.callback('✏️ Wpisz inną godzinę', 'startshift_custom_time'),
+          Markup.button.callback('💵 Ustaw kasetkę', 'startshift_set_cash'),
+        ],
+      ]),
+    });
+  });
+
+  // Callbacks startu
+  bot.action(/^startshift_(start_now|custom_time|set_cash)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const action = ctx.match[1];
+    const tId = String(ctx.from.id);
+    const effDate = financeService.getEffectiveDate();
+
+    if (action === 'start_now') {
+      const currentTime = getCurrentWarsawTime();
+      await financeService.setShiftStart(tId, effDate, currentTime);
+      const text = await renderStartShiftCard(tId, effDate);
+
+      await ctx.editMessageText(text, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [
+            Markup.button.callback('✏️ Popraw godzinę', 'startshift_custom_time'),
+            Markup.button.callback('💵 Ustaw kasetkę', 'startshift_set_cash'),
+          ],
+        ]),
+      });
+      return;
+    }
+
+    if (action === 'custom_time') {
+      awaitingInput.set(tId, 'START_CUSTOM_TIME');
+      await ctx.reply('⏱️ *Wpisz godzinę wyjazdu* w formacie `GG:MM` (np. `19:30`):', { parse_mode: 'Markdown' });
+      return;
+    }
+
+    if (action === 'set_cash') {
+      awaitingInput.set(tId, 'START_CASH');
+      await ctx.reply('💵 *Wpisz stan gotówki przed wyjazdem* (np. `150.00`):', { parse_mode: 'Markdown' });
+      return;
+    }
+  });
+
+  // 3. Koniec zmiany: /koniec
+  bot.command(['koniec', 'zjazd'], async (ctx) => {
+    const parts = ctx.message.text.trim().split(/\s+/);
+    const effDate = financeService.getEffectiveDate();
+
+    if (parts.length > 1) {
+      let workTo: string | null = null;
+      let fuelDistance: number | null = null;
+      let walletCash: number | null = null;
+
+      for (let i = 1; i < parts.length; i++) {
+        const p = parts[i]!;
+        if (/^\d{1,2}:\d{2}$/.test(p)) {
+          workTo = p.length === 4 ? `0${p}` : p;
+        } else if (/^\d+km$/i.test(p) || (/^\d+$/.test(p) && fuelDistance === null)) {
+          fuelDistance = parseInt(p.replace(/km/i, ''), 10);
+        } else {
+          const val = parseFloat(p.replace(',', '.').replace(/zł|zl/i, ''));
+          if (!isNaN(val)) walletCash = val;
+        }
+      }
+
+      const summary = await financeService.setShiftEnd(ctx.from.id, effDate, {
+        workTo,
+        fuelDistance,
+        walletCash,
+      });
+
+      const response = [
+        '🏁 *Zmiana została pomyślnie zamknięta!*',
+        '',
+        `📅 *Data:* \`${summary.date}\``,
+        summary.workFrom && summary.workTo ? `⏱️ *Godziny:* \`${summary.workFrom} - ${summary.workTo}\` (*${summary.workHours.toFixed(2)} h*)` : '',
+        summary.fuelDistance ? `🚗 *Przebieg:* *${summary.fuelDistance} km*` : '',
+        `💰 *Zarobek brutto:* *${summary.grossEarnings.toFixed(2)} zł*`,
+        `💵 *Netto łącznie:* *${summary.totalNetto.toFixed(2)} zł* (Stawka: *${summary.hourlyRateNetto.toFixed(2)} zł/h*)`,
+        `🪙 *Napiwki gotówka:* *+${summary.cashTipsTotal.toFixed(2)} zł*`,
+        summary.walletPayouts > 0 ? `🏧 *Wypłaty portfel:* *-${summary.walletPayouts.toFixed(2)} zł*` : '',
+        `💳 *Do przelewu:* *${summary.doPrzelewu.toFixed(2)} zł*`,
+        walletCash != null ? `💼 *Ustawiono stan portfela:* *${walletCash.toFixed(2)} zł*` : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      await ctx.reply(response, { parse_mode: 'Markdown' });
+      return;
+    }
+
+    const currentTime = getCurrentWarsawTime();
+    const text = await renderEndShiftCard(ctx.from.id, effDate);
+    await ctx.reply(text, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback(`⏱️ Zapisz zjazd teraz (${currentTime})`, 'endshift_set_now'),
+        ],
+        [
+          Markup.button.callback('✏️ Inna godzina', 'endshift_custom_time'),
+          Markup.button.callback('🚗 Dystans / licznik', 'endshift_set_dist'),
+        ],
+        [
+          Markup.button.callback('💵 Stan gotówki Glovo', 'endshift_set_cash'),
+        ],
+      ]),
+    });
+  });
+
+  // Callbacks zjazdu
+  bot.action(/^endshift_(set_now|custom_time|set_dist|set_cash)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const action = ctx.match[1];
+    const tId = String(ctx.from.id);
+    const effDate = financeService.getEffectiveDate();
+
+    if (action === 'set_now') {
+      const currentTime = getCurrentWarsawTime();
+      await financeService.setShiftEnd(tId, effDate, { workTo: currentTime });
+      const text = await renderEndShiftCard(tId, effDate);
+
+      await ctx.editMessageText(text, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [
+            Markup.button.callback(`⏱️ Odśwież zjazd (${getCurrentWarsawTime()})`, 'endshift_set_now'),
+          ],
+          [
+            Markup.button.callback('✏️ Popraw godzinę', 'endshift_custom_time'),
+            Markup.button.callback('🚗 Dystans / licznik', 'endshift_set_dist'),
+          ],
+          [
+            Markup.button.callback('💵 Stan gotówki Glovo', 'endshift_set_cash'),
+          ],
+        ]),
+      });
+      return;
+    }
+
+    if (action === 'custom_time') {
+      awaitingInput.set(tId, 'END_CUSTOM_TIME');
+      await ctx.reply('⏱️ *Wpisz godzinę zjazdu* w formacie `GG:MM` (np. `23:30`):', { parse_mode: 'Markdown' });
+      return;
+    }
+
+    if (action === 'set_dist') {
+      awaitingInput.set(tId, 'END_DIST');
+      await ctx.reply('🚗 *Wpisz stan licznika lub przejechany dystans w km* (np. `48`):', { parse_mode: 'Markdown' });
+      return;
+    }
+
+    if (action === 'set_cash') {
+      awaitingInput.set(tId, 'END_CASH');
+      await ctx.reply('💵 *Wpisz aktualny stan gotówki z aplikacji Glovo* (np. `142.50`):', { parse_mode: 'Markdown' });
+      return;
+    }
+  });
+
+  // 4. Obsługa wpisów tekstowych z klawiatury (Rozwiązanie problemu braku reakcji)
+  bot.on(message('text'), async (ctx, next) => {
+    const tId = String(ctx.from.id);
+    const rawText = ctx.message.text.trim();
+    const pendingInput = awaitingInput.get(tId);
+    const effDate = financeService.getEffectiveDate();
+
+    if (pendingInput) {
+      if (pendingInput === 'START_CUSTOM_TIME') {
+        if (/^\d{1,2}:\d{2}$/.test(rawText)) {
+          const time = rawText.length === 4 ? `0${rawText}` : rawText;
+          awaitingInput.delete(tId);
+          await financeService.setShiftStart(tId, effDate, time);
+          await ctx.reply(`✅ *Godzina wyjazdu ${time} zapisana w bazie!*`, { parse_mode: 'Markdown' });
+          return;
+        }
+        await ctx.reply('❌ Błędny format godziny. Podaj np. `19:30`.');
+        return;
+      }
+
+      if (pendingInput === 'START_CASH') {
+        const val = parseFloat(rawText.replace(',', '.').replace(/zł|zl/i, '').trim());
+        if (!isNaN(val)) {
+          awaitingInput.delete(tId);
+          await financeService.setBalanceCheckpoint(tId, effDate, val);
+          await ctx.reply(`✅ *Zapisano stan portfela startowego:* *${val.toFixed(2)} zł* na dzień \`${effDate}\``, {
+            parse_mode: 'Markdown',
+          });
+          return;
+        }
+        await ctx.reply('❌ Podaj poprawną kwotę (np. `120.00`).');
+        return;
+      }
+
+      if (pendingInput === 'END_CUSTOM_TIME') {
+        if (/^\d{1,2}:\d{2}$/.test(rawText)) {
+          const time = rawText.length === 4 ? `0${rawText}` : rawText;
+          awaitingInput.delete(tId);
+          const summary = await financeService.setShiftEnd(tId, effDate, { workTo: time });
+          await ctx.reply(
+            `✅ *Godzina zjazdu ${time} zapisana w bazie!* Czas pracy dzisiaj: *${summary.workHours.toFixed(2)} h*`,
+            { parse_mode: 'Markdown' }
+          );
+          return;
+        }
+        await ctx.reply('❌ Błędny format godziny. Podaj np. `23:15`.');
+        return;
+      }
+
+      if (pendingInput === 'END_DIST') {
+        const val = parseInt(rawText.replace(/km/i, '').trim(), 10);
+        if (!isNaN(val) && val >= 0) {
+          awaitingInput.delete(tId);
+          await financeService.setShiftEnd(tId, effDate, { fuelDistance: val });
+          await ctx.reply(`✅ *Przebieg ${val} km zapisany w bazie!*`, { parse_mode: 'Markdown' });
+          return;
+        }
+        await ctx.reply('❌ Podaj liczbę kilometrów (np. `52`).');
+        return;
+      }
+
+      if (pendingInput === 'END_CASH') {
+        const val = parseFloat(rawText.replace(',', '.').replace(/zł|zl/i, '').trim());
+        if (!isNaN(val)) {
+          awaitingInput.delete(tId);
+          await financeService.setBalanceCheckpoint(tId, effDate, val);
+          await ctx.reply(`✅ *Zapisano stan portfela Glovo:* *${val.toFixed(2)} zł*`, { parse_mode: 'Markdown' });
+          return;
+        }
+        await ctx.reply('❌ Podaj poprawną kwotę (np. `145.00`).');
+        return;
+      }
+    }
+
+    // Import portfela tekstem
+    const pending = pendingWalletImports.get(tId);
+    if (pending && Date.now() <= pending.expiresAt) {
+      const lower = rawText.toLowerCase();
+      if (['tak', 't', 'zapisz', 'ok', 'yes', 'y'].includes(lower)) {
+        pendingWalletImports.delete(tId);
+        const saveResult = await financeService.saveWalletTransactions(ctx.from.id, pending.transactions);
+        await ctx.reply(
+          `✅ *Zapisano ${saveResult.added} transakcji do bazy.*\n📅 *Dotknięte dni:* \`${saveResult.dates.join(', ')}\``,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      if (['nie', 'n', 'anuluj'].includes(lower)) {
+        pendingWalletImports.delete(tId);
+        await ctx.reply('✖️ *Anulowano import Portfela.* Nic nie zostało zapisane.', { parse_mode: 'Markdown' });
+        return;
+      }
+    }
+
+    return next();
+  });
+
+  // 5. Geolokalizacja
   bot.command('lokalizacja', async (ctx) => {
     await ctx.reply(
       '📍 *Kliknij przycisk poniżej*, aby udostępnić lokalizację GPS. Będzie używana do weryfikacji tras ofert Glovo przez 30 minut.',
@@ -1310,7 +1896,6 @@ export function registerBotHandlers(bot: Telegraf): void {
     );
   });
 
-  // 3. Obsługa lokalizacji
   bot.on(message('location'), async (ctx) => {
     const { latitude, longitude } = ctx.message.location;
     lastCourierLocation.set(String(ctx.from.id), {
@@ -1324,10 +1909,11 @@ export function registerBotHandlers(bot: Telegraf): void {
     });
   });
 
-  // 4. Raport: /dzis oraz /dzien [RRRR-MM-DD]
+  // 6. Raporty: /dzis oraz /dzien [RRRR-MM-DD]
   bot.command(['dzis', 'dzien'], async (ctx) => {
     const parts = ctx.message.text.trim().split(/\s+/);
-    const date = parts.length > 1 && /^\d{4}-\d{2}-\d{2}$/.test(parts[1]) ? parts[1] : financeService.getEffectiveDate();
+    const dateParam = parts[1];
+    const date = dateParam && /^\d{4}-\d{2}-\d{2}$/.test(dateParam) ? dateParam : financeService.getEffectiveDate();
     const summary = await financeService.getDailySummary(ctx.from.id, date);
 
     const text = [
@@ -1341,8 +1927,8 @@ export function registerBotHandlers(bot: Telegraf): void {
       `💳 *Do przelewu (bez gotówki):* *${summary.doPrzelewu.toFixed(2)} zł*`,
       '',
       summary.workHours > 0
-        ? `⏱️ *Czas pracy:* *${summary.workHours.toFixed(2)} h* (Stawka: *${summary.hourlyRateNetto.toFixed(2)} zł netto/h*)`
-        : '⏱️ *Czas pracy:* _Brak wpisu_',
+        ? `⏱️ *Czas pracy:* \`${summary.workFrom || '--:--'} - ${summary.workTo || '--:--'}\` (*${summary.workHours.toFixed(2)} h*) — Stawka: *${summary.hourlyRateNetto.toFixed(2)} zł/h*`
+        : '⏱️ *Czas pracy:* _Brak pełnego wpisu_',
       '',
       summary.fuelPrice > 0
         ? `⛽ *Paliwo:* *${summary.fuelPrice.toFixed(2)} zł* (${summary.fuelLiters.toFixed(2)} L)`
@@ -1355,7 +1941,7 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.reply(text, { parse_mode: 'Markdown' });
   });
 
-  // 5. Raport: /tydzien oraz /ptydzien
+  // 7. Raporty: /tydzien oraz /ptydzien
   bot.command(['tydzien', 'ptydzien'], async (ctx) => {
     const isPrevious = ctx.message.text.toLowerCase().includes('ptydzien');
     const { startDate, endDate } = financeService.getWeekRange(isPrevious ? -1 : 0);
@@ -1391,17 +1977,20 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.reply(text, { parse_mode: 'Markdown' });
   });
 
-  // 6. Raport: /miesiac [RRRR-MM]
+  // 8. Raporty: /miesiac [RRRR-MM]
   bot.command('miesiac', async (ctx) => {
     const parts = ctx.message.text.trim().split(/\s+/);
     let startDate = '';
     let endDate = '';
+    const monthParam = parts[1];
 
-    if (parts.length > 1 && /^\d{4}-\d{2}$/.test(parts[1])) {
-      const [year, month] = parts[1].split('-').map(Number);
-      startDate = `${parts[1]}-01`;
-      const lastDay = new Date(year, month, 0).getDate();
-      endDate = `${parts[1]}-${String(lastDay).padStart(2, '0')}`;
+    if (monthParam && /^\d{4}-\d{2}$/.test(monthParam)) {
+      const [year, month] = monthParam.split('-').map(Number);
+      if (year && month) {
+        startDate = `${monthParam}-01`;
+        const lastDay = new Date(year, month, 0).getDate();
+        endDate = `${monthParam}-${String(lastDay).padStart(2, '0')}`;
+      }
     } else {
       const now = new Date();
       startDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
@@ -1438,10 +2027,11 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.reply(text, { parse_mode: 'Markdown' });
   });
 
-  // 7. Statystyki ofert Glovo: /statystyki [RRRR-MM-DD]
+  // 9. Statystyki ofert Glovo: /statystyki [RRRR-MM-DD]
   bot.command('statystyki', async (ctx) => {
     const parts = ctx.message.text.trim().split(/\s+/);
-    const date = parts.length > 1 && /^\d{4}-\d{2}-\d{2}$/.test(parts[1]) ? parts[1] : financeService.getEffectiveDate();
+    const dateParam = parts[1];
+    const date = dateParam && /^\d{4}-\d{2}-\d{2}$/.test(dateParam) ? dateParam : financeService.getEffectiveDate();
     const stats = await financeService.getCourseOfferStats(ctx.from.id, date);
 
     if (stats.totalOffers === 0) {
@@ -1453,8 +2043,13 @@ export function registerBotHandlers(bot: Telegraf): void {
       `📊 *Statystyki ofert Glovo (${stats.date}):*`,
       '',
       `• *Sprawdzonych zleceń:* *${stats.totalOffers}*`,
-      `• ✅ *Opłacalne (≥${MIN_STAWKA_NETTO_KM.toFixed(2)} zł/km):* *${stats.profitable}*`,
+      `• ✅ *Opłacalne (≥${CFG.MIN_STAWKA_NETTO_KM.toFixed(2)} zł/km):* *${stats.profitable}*`,
       `• ❌ *Nieopłacalne:* *${stats.unprofitable}*`,
+      '',
+      '📌 *Decyzje kuriera:*',
+      ` • 🟢 *Zaakceptowane:* *${stats.accepted}*`,
+      ` • 🔴 *Odrzucone:* *${stats.rejected}*`,
+      ` • ⚪ *Bez decyzji:* *${stats.pending}*`,
       '',
       `📈 *Średnia stawka:* *${stats.avgNetRatePerKm.toFixed(2)} zł netto/km*`,
       `🥇 *Najlepsza:* *${stats.bestNetRate.toFixed(2)} zł/km*  |  🥉 *Najgorsza:* *${stats.worstNetRate.toFixed(2)} zł/km*`,
@@ -1465,12 +2060,13 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.reply(text, { parse_mode: 'Markdown' });
   });
 
-  // 8. Saldo Portfela Glovo: /saldo [kwota bazowa]
+  // 10. Saldo Portfela Glovo: /saldo [kwota bazowa]
   bot.command('saldo', async (ctx) => {
     const parts = ctx.message.text.trim().split(/\s+/);
+    const amountParam = parts[1];
 
-    if (parts.length > 1) {
-      const val = parseFloat(parts[1].replace(',', '.'));
+    if (amountParam) {
+      const val = parseFloat(amountParam.replace(',', '.'));
       if (!isNaN(val)) {
         const effDate = financeService.getEffectiveDate();
         await financeService.setBalanceCheckpoint(ctx.from.id, effDate, val);
@@ -1495,7 +2091,7 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.reply(text, { parse_mode: 'Markdown' });
   });
 
-  // 9. Cele zarobkowe: /cel [kwota] | /cel tydzien [kwota] | /cele
+  // 11. Cele zarobkowe: /cel [kwota] | /cel tydzien [kwota] | /cele
   bot.command(['cel', 'target', 'cele'], async (ctx) => {
     const textParts = ctx.message.text.trim().split(/\s+/);
 
@@ -1522,13 +2118,14 @@ export function registerBotHandlers(bot: Telegraf): void {
     let amountStr = textParts[1];
 
     if (textParts.length >= 3) {
-      if (['tydzien', 'week', 'w'].includes(textParts[1].toLowerCase())) {
+      const sub = textParts[1]?.toLowerCase();
+      if (sub && ['tydzien', 'week', 'w'].includes(sub)) {
         periodType = 'WEEKLY';
       }
       amountStr = textParts[2];
     }
 
-    const targetAmount = parseFloat(amountStr.replace(',', '.'));
+    const targetAmount = parseFloat(amountStr ? amountStr.replace(',', '.') : '0');
     if (isNaN(targetAmount) || targetAmount <= 0) {
       await ctx.reply('❌ Błędna kwota. Użyj np. `/cel 4000` lub `/cel tydzien 1200`.');
       return;
@@ -1542,9 +2139,44 @@ export function registerBotHandlers(bot: Telegraf): void {
     }
   });
 
-  // 10. Szybkie napiwki (Regex: "n 5.5", "np 3", "napiwek 10")
+  // 12. Przyciski akcji dla zleceń Glovo
+  bot.action(/^offer:(accept|reject):(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const action = ctx.match[1];
+    const offerId = parseInt(ctx.match[2] || '0', 10);
+    const isAccepted = action === 'accept';
+    const status = isAccepted ? 'ACCEPTED' : 'REJECTED';
+
+    await financeService.updateCourseOfferStatus(offerId, ctx.from.id, status);
+
+    const msg = ctx.callbackQuery.message;
+    const currentText = msg && 'text' in msg ? msg.text : '';
+    const statusLine = isAccepted ? '🟢 *Status:* *ZAAKCEPTOWANO*' : '🔴 *Status:* *ODRZUCONO*';
+
+    const lines = currentText.split('\n').filter((l) => !l.startsWith('🔘 Status:'));
+    lines.push('', `🔘 ${statusLine}`);
+
+    await ctx.editMessageText(lines.join('\n'), {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            isAccepted ? '✅ Zlecenie Zaakceptowane' : '❌ Zlecenie Odrzucone',
+            'offer_done'
+          ),
+        ],
+      ]),
+    });
+  });
+
+  bot.action('offer_done', async (ctx) => {
+    await ctx.answerCbQuery('Status tego zlecenia został już zarejestrowany.');
+  });
+
+  // 13. Szybkie napiwki (Regex: "n 5.5", "np 3", "napiwek 10")
   bot.hears(/^(?:n|np|napiwek)\s+(\d+(?:[.,]\d+)?)$/i, async (ctx) => {
-    const rawAmount = ctx.match[1].replace(',', '.');
+    const match = ctx.match[1];
+    const rawAmount = match ? match.replace(',', '.') : '0';
     const tipAmount = parseFloat(rawAmount);
 
     if (isNaN(tipAmount) || tipAmount <= 0) return;
@@ -1557,27 +2189,7 @@ export function registerBotHandlers(bot: Telegraf): void {
     });
   });
 
-  // 11. Potwierdzenie importu Portfela tekstowo ("tak" / "nie")
-  bot.hears(/^(tak|t|zapisz|ok|yes|y|nie|n|anuluj)$/i, async (ctx) => {
-    const pending = pendingWalletImports.get(String(ctx.from.id));
-    if (!pending || Date.now() > pending.expiresAt) return;
-
-    const text = ctx.match[1].toLowerCase();
-    pendingWalletImports.delete(String(ctx.from.id));
-
-    if (['nie', 'n', 'anuluj'].includes(text)) {
-      await ctx.reply('✖️ *Anulowano import Portfela.* Nic nie zostało zapisane.', { parse_mode: 'Markdown' });
-      return;
-    }
-
-    const saveResult = await financeService.saveWalletTransactions(ctx.from.id, pending.transactions);
-    await ctx.reply(
-      `✅ *Zapisano ${saveResult.added} transakcji do bazy.*\n📅 *Dotknięte dni:* \`${saveResult.dates.join(', ')}\``,
-      { parse_mode: 'Markdown' }
-    );
-  });
-
-  // 12. Przyciski Inline (Potwierdzenie importu Portfela)
+  // 14. Import Portfela Inline
   bot.action(/^wallet_(confirm|cancel)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const action = ctx.match[1];
@@ -1604,7 +2216,7 @@ export function registerBotHandlers(bot: Telegraf): void {
     );
   });
 
-  // 13. Voice-to-Data (Audio / Głos)
+  // 15. Voice-to-Data (Audio / Głos)
   bot.on([message('voice'), message('audio')], async (ctx) => {
     const voiceMsg = 'voice' in ctx.message ? ctx.message.voice : ctx.message.audio;
     if (!voiceMsg) return;
@@ -1672,9 +2284,10 @@ export function registerBotHandlers(bot: Telegraf): void {
     }
   });
 
-  // 14. Vision: Zdjęcia (Portfel Glovo, Paragony Paliwowe, Oferty Zleceń)
+  // 16. Vision: Zdjęcia (Portfel Glovo, Paragony Paliwowe, Oferty Zleceń)
   bot.on(message('photo'), async (ctx) => {
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
+    if (!photo) return;
     const caption = ctx.message.caption || '';
     const processingMsg = await ctx.reply('🔍 *Analizuję obraz...*', { parse_mode: 'Markdown' });
 
@@ -1685,7 +2298,6 @@ export function registerBotHandlers(bot: Telegraf): void {
 
       const category = await geminiService.classifyImage(imageBuffer, caption);
 
-      // Ścieżka 1: Zrzut ekranu Portfela Glovo
       if (category === 'WALLET') {
         const transactions = await geminiService.analyzeWalletScreenshot(imageBuffer);
 
@@ -1747,7 +2359,6 @@ export function registerBotHandlers(bot: Telegraf): void {
         return;
       }
 
-      // Ścieżka 2: Paragon paliwowy
       if (category === 'FUEL') {
         const receipt = await geminiService.extractFuelReceipt(imageBuffer);
         const effectiveDate = receipt.date || financeService.getEffectiveDate();
@@ -1776,32 +2387,33 @@ export function registerBotHandlers(bot: Telegraf): void {
         return;
       }
 
-      // Ścieżka 3: Oferta kursu Glovo
+      // Oferta kursu Glovo
       const offer = await geminiService.analyzeCourseOffer(imageBuffer);
       const userLoc = lastCourierLocation.get(String(ctx.from.id));
-      const hasRecentLocation = userLoc && Date.now() - userLoc.updatedAt <= 30 * 60 * 1000;
+      const hasRecentLocation = Boolean(userLoc && Date.now() - userLoc.updatedAt <= 30 * 60 * 1000);
 
       let totalKm = offer.appDistanceKm || 0;
       let calculatedViaMaps = false;
 
       if (hasRecentLocation && userLoc) {
-        const origin = `${userLoc.latitude},${userLoc.longitude}`;
-        const routeData = await mapsService.calculateFullDeliveryRoute(
-          origin,
-          offer.pickupAddress,
-          offer.deliveryAddress
+        const routeData = await verifyOfferDistance(
+          { lat: userLoc.latitude, lng: userLoc.longitude, ts: userLoc.updatedAt },
+          [
+            { rodzaj: 'odbior', adres: offer.pickupAddress, dystans_km: offer.appDistanceKm },
+            { rodzaj: 'dostawa', adres: offer.deliveryAddress },
+          ]
         );
-        if (routeData) {
-          totalKm = routeData.totalDistanceKm;
+        if (routeData && routeData.available && routeData.results[0]?.actual != null) {
+          totalKm = routeData.results[0].actual;
           calculatedViaMaps = true;
         }
       }
 
-      const netAmount = Math.round(offer.grossAmount * NETTO_FACTOR * 100) / 100;
+      const netAmount = Math.round(offer.grossAmount * CFG.NETTO_FACTOR * 100) / 100;
       const netRatePerKm = totalKm > 0 ? Math.round((netAmount / totalKm) * 100) / 100 : 0;
-      const isProfitable = netRatePerKm >= MIN_STAWKA_NETTO_KM;
+      const isProfitable = netRatePerKm >= CFG.MIN_STAWKA_NETTO_KM;
 
-      await financeService.saveCourseOffer(ctx.from.id, {
+      const offerId = await financeService.saveCourseOffer(ctx.from.id, {
         grossAmount: offer.grossAmount,
         netAmount,
         totalDistance: totalKm,
@@ -1817,7 +2429,9 @@ export function registerBotHandlers(bot: Telegraf): void {
         `💵 *Stawka:* *${offer.grossAmount.toFixed(2)} zł brutto* ➔ *${netAmount.toFixed(2)} zł netto*`,
         `📍 *Trasa:* \`${offer.pickupAddress}\` ➔ \`${offer.deliveryAddress}\``,
         `🛣️ *Dystans:* *${totalKm.toFixed(1)} km* ${calculatedViaMaps ? '_(zweryfikowany Google Maps)_' : '_(z aplikacji)_'}`,
-        `📊 *Stawka netto/km:* *${netRatePerKm.toFixed(2)} zł / km* (Min: ${MIN_STAWKA_NETTO_KM.toFixed(2)} zł)`,
+        `📊 *Stawka netto/km:* *${netRatePerKm.toFixed(2)} zł / km* (Min: ${CFG.MIN_STAWKA_NETTO_KM.toFixed(2)} zł)`,
+        '',
+        '🔘 *Status:* _Oczekuje na decyzję_',
       ];
 
       await ctx.telegram.editMessageText(
@@ -1825,7 +2439,15 @@ export function registerBotHandlers(bot: Telegraf): void {
         processingMsg.message_id,
         undefined,
         responseLines.join('\n'),
-        { parse_mode: 'Markdown' }
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [
+              Markup.button.callback('✅ Zaakceptowano', `offer:accept:${offerId}`),
+              Markup.button.callback('❌ Odrzucono', `offer:reject:${offerId}`),
+            ],
+          ]),
+        }
       );
     } catch (err) {
       console.error('[PhotoHandler Error]:', err);
@@ -2084,6 +2706,10 @@ export const CFG = {
   MAX_PHOTO_BYTES: 20 * 1024 * 1024,
   HISTORY_LEN: 5,
 };
+
+export const TAX_FACTOR = CFG.TAX_FACTOR;
+export const NETTO_FACTOR = CFG.NETTO_FACTOR;
+export const MIN_STAWKA_NETTO_KM = CFG.MIN_STAWKA_NETTO_KM;
 ```
 
 
@@ -2190,6 +2816,7 @@ export const courseOffers = pgTable('course_offers', {
   totalDistance: numeric('total_distance', { precision: 10, scale: 2 }).notNull(),
   netRatePerKm: numeric('net_rate_per_km', { precision: 10, scale: 2 }).notNull(),
   isProfitable: boolean('is_profitable').notNull(),
+  status: text('status').default('PENDING').notNull(), // 'PENDING' | 'ACCEPTED' | 'REJECTED'
   pointsJson: text('points_json'),
   verificationText: text('verification_text'),
   createdAt: timestamp('created_at').defaultNow().notNull(),

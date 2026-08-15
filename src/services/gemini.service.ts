@@ -1,82 +1,113 @@
-import { GoogleGenAI, Type, Schema } from '@google/genai';
+import { GoogleGenAI, Type, type Schema } from '@google/genai';
+import { z } from 'zod';
+import { CFG } from '../config.js';
 
-export interface VoiceExtractedData {
-  transcription: string;
-  action: 'UPSERT' | 'DELETE';
-  deleteTarget?: 'LAST_TIP' | 'ALL_TIPS' | 'FUEL' | 'HOURS' | 'EARNINGS' | 'ALL_DAY' | null;
-  targetDate?: string | null;
-  fuelPrice?: number | null;
-  fuelLiters?: number | null;
-  fuelDistance?: number | null;
-  grossEarnings?: number | null;
-  workFrom?: string | null;
-  workTo?: string | null;
-  cashTip?: number | null;
-}
+/**
+ * FIX (3.10): odpowiedzi modelu byly rzutowane przez `as`, bez zadnej walidacji.
+ * Przy ucietym albo pustym JSON-ie `extracted.transcription` bylo `undefined`,
+ * a `extracted.grossEarnings.toFixed(2)` wywalalo handler. Teraz kazda odpowiedz
+ * przechodzi przez zod, a przy bledzie parsowania robimy jeden retry.
+ *
+ * FIX (5.6 + 1.2): nazwa modelu tylko z `CFG.GEMINI_MODEL`, typ `Schema`
+ * importowany jako `import type` (wymog `verbatimModuleSyntax`).
+ */
 
-export interface FuelReceiptExtractedData {
-  date?: string | null;
-  fuelPrice?: number | null;
-  fuelLiters?: number | null;
-}
+const nullableNumber = z.number().nullish().transform((v) => v ?? null);
+const nullableString = z.string().nullish().transform((v) => v ?? null);
 
-export interface CourseOfferExtractedData {
-  grossAmount: number;
-  pickupAddress: string;
-  deliveryAddress: string;
-  appDistanceKm?: number | null;
-}
+export const VoiceExtractedSchema = z.object({
+  transcription: z.string().default(''),
+  action: z.enum(['UPSERT', 'DELETE']).default('UPSERT'),
+  deleteTarget: z
+    .enum(['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'DISTANCE', 'ALL_DAY'])
+    .nullish()
+    .transform((v) => v ?? null),
+  targetDate: nullableString,
+  fuelTotalCost: nullableNumber,
+  fuelLiters: nullableNumber,
+  fuelPricePerLiter: nullableNumber,
+  distanceKm: nullableNumber,
+  grossEarnings: nullableNumber,
+  workFrom: nullableString,
+  workTo: nullableString,
+  cashTip: nullableNumber,
+});
+export type VoiceExtractedData = z.infer<typeof VoiceExtractedSchema>;
 
-export interface WalletTransactionItem {
-  date: string; // YYYY-MM-DD
-  time: string; // HH:MM
-  type: 'pobranie' | 'wyplata' | 'wyplata_gotowka' | 'platnosc_punkt' | 'korekta';
-  amount: number;
-  externalId?: string | null;
-}
+export const FuelReceiptSchema = z.object({
+  date: nullableString,
+  totalCost: z.number(),
+  liters: nullableNumber,
+  pricePerLiter: nullableNumber,
+});
+export type FuelReceiptExtractedData = z.infer<typeof FuelReceiptSchema>;
 
-const voiceExtractionSchema: Schema = {
+export const CourseOfferSchema = z.object({
+  grossAmount: z.number(),
+  pickupAddress: z.string().min(1),
+  deliveryAddress: z.string().min(1),
+  appDistanceKm: nullableNumber,
+});
+export type CourseOfferExtractedData = z.infer<typeof CourseOfferSchema>;
+
+export const WalletTransactionItemSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  time: z.string().regex(/^\d{1,2}:\d{2}$/),
+  type: z.enum(['pobranie', 'wyplata', 'wyplata_gotowka', 'platnosc_punkt', 'korekta']),
+  amount: z.number(),
+  externalId: z
+    .string()
+    .nullish()
+    .transform((v) => v ?? ''),
+});
+export type WalletTransactionItem = z.infer<typeof WalletTransactionItemSchema>;
+
+const WalletScreenSchema = z.object({
+  transactions: z.array(WalletTransactionItemSchema).default([]),
+});
+
+const ImageCategorySchema = z.object({
+  category: z.enum(['WALLET', 'FUEL', 'OFFER']).default('OFFER'),
+});
+export type ImageCategory = z.infer<typeof ImageCategorySchema>['category'];
+
+// --- Schematy responseSchema dla Gemini -------------------------------------
+
+const voiceResponseSchema: Schema = {
   type: Type.OBJECT,
   properties: {
-    transcription: {
-      type: Type.STRING,
-      description: 'Dosłowna transkrypcja wypowiedzi w języku polskim.',
-    },
-    action: {
-      type: Type.STRING,
-      enum: ['UPSERT', 'DELETE'],
-    },
+    transcription: { type: Type.STRING, description: 'Dosłowna transkrypcja wypowiedzi po polsku.' },
+    action: { type: Type.STRING, enum: ['UPSERT', 'DELETE'] },
     deleteTarget: {
       type: Type.STRING,
-      enum: ['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'ALL_DAY'],
+      enum: ['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'DISTANCE', 'ALL_DAY'],
       nullable: true,
     },
-    targetDate: {
-      type: Type.STRING,
-      nullable: true,
-    },
-    fuelPrice: { type: Type.NUMBER, nullable: true },
+    targetDate: { type: Type.STRING, nullable: true, description: 'YYYY-MM-DD, TODAY albo YESTERDAY.' },
+    fuelTotalCost: { type: Type.NUMBER, nullable: true, description: 'Łączna kwota tankowania w zł.' },
     fuelLiters: { type: Type.NUMBER, nullable: true },
-    fuelDistance: { type: Type.INTEGER, nullable: true },
+    fuelPricePerLiter: { type: Type.NUMBER, nullable: true, description: 'Cena za litr w zł.' },
+    distanceKm: { type: Type.NUMBER, nullable: true, description: 'Dystans PRZEJECHANY danego dnia, nie stan licznika.' },
     grossEarnings: { type: Type.NUMBER, nullable: true },
-    workFrom: { type: Type.STRING, nullable: true },
-    workTo: { type: Type.STRING, nullable: true },
+    workFrom: { type: Type.STRING, nullable: true, description: 'HH:MM' },
+    workTo: { type: Type.STRING, nullable: true, description: 'HH:MM' },
     cashTip: { type: Type.NUMBER, nullable: true },
   },
   required: ['transcription', 'action'],
 };
 
-const fuelReceiptSchema: Schema = {
+const fuelReceiptResponseSchema: Schema = {
   type: Type.OBJECT,
   properties: {
     date: { type: Type.STRING, nullable: true },
-    fuelPrice: { type: Type.NUMBER, nullable: true },
-    fuelLiters: { type: Type.NUMBER, nullable: true },
+    totalCost: { type: Type.NUMBER, description: 'Kwota do zapłaty za paliwo w zł.' },
+    liters: { type: Type.NUMBER, nullable: true },
+    pricePerLiter: { type: Type.NUMBER, nullable: true, description: 'Cena jednostkowa za litr w zł.' },
   },
-  required: ['fuelPrice'],
+  required: ['totalCost'],
 };
 
-const courseOfferSchema: Schema = {
+const courseOfferResponseSchema: Schema = {
   type: Type.OBJECT,
   properties: {
     grossAmount: { type: Type.NUMBER },
@@ -87,7 +118,7 @@ const courseOfferSchema: Schema = {
   required: ['grossAmount', 'pickupAddress', 'deliveryAddress'],
 };
 
-const walletScreenSchema: Schema = {
+const walletScreenResponseSchema: Schema = {
   type: Type.OBJECT,
   properties: {
     transactions: {
@@ -97,26 +128,20 @@ const walletScreenSchema: Schema = {
         properties: {
           date: {
             type: Type.STRING,
-            description: 'Data w formacie YYYY-MM-DD na podstawie nagłówka sekcji (np. "czw., 6 sierpnia" -> 2026-08-06).',
+            description: 'Data YYYY-MM-DD na podstawie nagłówka sekcji (np. "czw., 6 sierpnia").',
           },
-          time: {
-            type: Type.STRING,
-            description: 'Godzina transakcji w formacie HH:MM (np. 15:50).',
-          },
+          time: { type: Type.STRING, description: 'Godzina transakcji HH:MM (np. 15:50).' },
           type: {
             type: Type.STRING,
             enum: ['pobranie', 'wyplata', 'wyplata_gotowka', 'platnosc_punkt', 'korekta'],
-            description: 'Dokładny typ: "Pobranie gotówki od klienta" -> pobranie, "Wypłata" -> wyplata, "Wypłata w gotówce" -> wyplata_gotowka, "Płatność w punkcie" -> platnosc_punkt, "Korekta" -> korekta.',
+            description:
+              '"Pobranie gotówki od klienta" -> pobranie, "Wypłata" -> wyplata, "Wypłata w gotówce" -> wyplata_gotowka, "Płatność w punkcie" -> platnosc_punkt, "Korekta" -> korekta.',
           },
           amount: {
             type: Type.NUMBER,
-            description: 'Kwota ze znakiem (ujemna jeśli jest minus, np. -180.60 dla wypłaty, 63.34 dla pobrania).',
+            description: 'Kwota ZE ZNAKIEM (ujemna przy minusie, np. -180.60; dodatnia przy pobraniu, np. 63.34).',
           },
-          externalId: {
-            type: Type.STRING,
-            nullable: true,
-            description: 'Identyfikator transakcji (długi ciąg cyfr, np. 101735350998).',
-          },
+          externalId: { type: Type.STRING, nullable: true, description: 'Identyfikator transakcji (ciąg cyfr).' },
         },
         required: ['date', 'time', 'type', 'amount'],
       },
@@ -125,115 +150,119 @@ const walletScreenSchema: Schema = {
   required: ['transactions'],
 };
 
+const imageCategoryResponseSchema: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    category: { type: Type.STRING, enum: ['WALLET', 'FUEL', 'OFFER'] },
+  },
+  required: ['category'],
+};
+
 export class GeminiService {
-  private ai: GoogleGenAI;
-  private model: string;
+  private readonly ai: GoogleGenAI;
+  private readonly model: string;
 
   constructor() {
-    this.ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-    this.model = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error('Brak zmiennej GEMINI_API_KEY w pliku .env!');
+    this.ai = new GoogleGenAI({ apiKey });
+    this.model = CFG.GEMINI_MODEL;
+  }
+
+  /** Jedno wywolanie + walidacja zod. Przy bledzie parsowania jeden retry. */
+  private async generate<T>(
+    schema: z.ZodType<T>,
+    responseSchema: Schema,
+    parts: Array<Record<string, unknown>>,
+    temperature: number,
+    label: string
+  ): Promise<T> {
+    let lastError: unknown = null;
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const response = await this.ai.models.generateContent({
+        model: this.model,
+        contents: [{ role: 'user', parts }],
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema,
+          temperature,
+        },
+      });
+
+      try {
+        return schema.parse(JSON.parse(response.text || '{}'));
+      } catch (err) {
+        lastError = err;
+        console.warn(`[Gemini:${label}] próba ${attempt} — nieprawidłowa odpowiedź:`, err);
+      }
+    }
+
+    throw new Error(`Model zwrócił odpowiedź niezgodną ze schematem (${label}): ${String(lastError)}`);
   }
 
   async parseVoiceNote(audioBuffer: Buffer, mimeType = 'audio/ogg'): Promise<VoiceExtractedData> {
-    const base64Audio = audioBuffer.toString('base64');
     const prompt = `
-Jesteś asystentem kuriera. Przeanalizuj nagranie audio.
+Jesteś asystentem kuriera. Przeanalizuj nagranie audio i zwróć dane w JSON.
 Rozpoznaj akcję:
-- UPSERT: tankowanie (koszt, litry, licznik), godziny od-do, zarobki brutto, napiwek gotówkowy.
-- DELETE: 'LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'ALL_DAY'.
+- UPSERT: tankowanie (łączna kwota, litry, cena za litr), przejechany dystans, godziny od-do, zarobki brutto, napiwek gotówkowy.
+- DELETE: 'LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'DISTANCE', 'ALL_DAY'.
+Uwaga: "distanceKm" to dystans PRZEJECHANY danego dnia, nie stan licznika pojazdu.
+Jeśli kurier poda stan licznika, zostaw distanceKm puste.
 Ignoruj szum wiatru i wydechu motocykla.
 `;
-
-    const response = await this.ai.models.generateContent({
-      model: this.model,
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            { inlineData: { mimeType, data: base64Audio } },
-            { text: prompt },
-          ],
-        },
-      ],
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: voiceExtractionSchema,
-        temperature: 0.1,
-      },
-    });
-
-    return JSON.parse(response.text || '{}') as VoiceExtractedData;
+    return this.generate(
+      VoiceExtractedSchema,
+      voiceResponseSchema,
+      [{ inlineData: { mimeType, data: audioBuffer.toString('base64') } }, { text: prompt }],
+      0.1,
+      'voice'
+    );
   }
 
   async extractFuelReceipt(imageBuffer: Buffer, mimeType = 'image/jpeg'): Promise<FuelReceiptExtractedData> {
-    const base64Image = imageBuffer.toString('base64');
     const prompt = `
-Przeanalizuj paragon paliwowy. Wyciągnij: łączną kwotę w PLN, ilość litrów, datę (YYYY-MM-DD).
+Przeanalizuj paragon paliwowy. Wyciągnij:
+- totalCost: łączną kwotę do zapłaty w PLN,
+- liters: ilość litrów,
+- pricePerLiter: cenę jednostkową za litr w PLN,
+- date: datę w formacie YYYY-MM-DD.
 Ignoruj kody CN, numery stacji i oznaczenia 95/98.
 `;
-
-    const response = await this.ai.models.generateContent({
-      model: this.model,
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            { inlineData: { mimeType, data: base64Image } },
-            { text: prompt },
-          ],
-        },
-      ],
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: fuelReceiptSchema,
-        temperature: 0.1,
-      },
-    });
-
-    return JSON.parse(response.text || '{}') as FuelReceiptExtractedData;
+    return this.generate(
+      FuelReceiptSchema,
+      fuelReceiptResponseSchema,
+      [{ inlineData: { mimeType, data: imageBuffer.toString('base64') } }, { text: prompt }],
+      0.1,
+      'fuel'
+    );
   }
 
   async analyzeCourseOffer(imageBuffer: Buffer, mimeType = 'image/jpeg'): Promise<CourseOfferExtractedData> {
-    const base64Image = imageBuffer.toString('base64');
     const prompt = `
 Przeanalizuj ofertę kursu Glovo.
-Wyciągnij: kwotę brutto za kurs (ignoruj "POTRZEBNA GOTÓWKA" i "ZAPŁAĆ"), adres odbioru, adres klienta, szacowany dystans km.
+Wyciągnij: kwotę brutto za kurs (ignoruj "POTRZEBNA GOTÓWKA" i "ZAPŁAĆ"),
+adres odbioru, adres klienta oraz szacowany dystans całej trasy w km.
 `;
-
-    const response = await this.ai.models.generateContent({
-      model: this.model,
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            { inlineData: { mimeType, data: base64Image } },
-            { text: prompt },
-          ],
-        },
-      ],
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: courseOfferSchema,
-        temperature: 0.1,
-      },
-    });
-
-    return JSON.parse(response.text || '{}') as CourseOfferExtractedData;
+    return this.generate(
+      CourseOfferSchema,
+      courseOfferResponseSchema,
+      [{ inlineData: { mimeType, data: imageBuffer.toString('base64') } }, { text: prompt }],
+      0.1,
+      'offer'
+    );
   }
 
-  /**
-   * Vision: OCR zrzutów ekranu Portfela Glovo (lista transakcji).
-   */
+  /** Vision: OCR zrzutow ekranu Portfela Glovo (lista transakcji). */
   async analyzeWalletScreenshot(
     imageBuffer: Buffer,
-    currentYear = new Date().getFullYear(),
+    currentYear: number,
     mimeType = 'image/jpeg'
   ): Promise<WalletTransactionItem[]> {
-    const base64Image = imageBuffer.toString('base64');
     const prompt = `
 Przeanalizuj zrzut ekranu "Portfel" z aplikacji Glovo. Bieżący rok to ${currentYear}.
 Wyodrębnij wszystkie widoczne transakcje z listy:
-- Nagłówek dnia (np. "Dzisiaj, 11 sierpnia" -> ${currentYear}-08-11, "czw., 6 sierpnia" -> ${currentYear}-08-06, "niedz., 26 lipca" -> ${currentYear}-07-26).
+- Nagłówek dnia (np. "Dzisiaj, 11 sierpnia" -> ${currentYear}-08-11, "czw., 6 sierpnia" -> ${currentYear}-08-06).
 - Typ pozycji:
   • "Pobranie gotówki od klienta" -> pobranie (kwota dodatnia, np. 35.99)
   • "Wypłata" -> wyplata (kwota ujemna, np. -174.89)
@@ -241,75 +270,40 @@ Wyodrębnij wszystkie widoczne transakcje z listy:
   • "Płatność w punkcie" -> platnosc_punkt (kwota ujemna, np. -255.69)
   • "Korekta" -> korekta (kwota ze znakiem, np. -2.78)
 - Godzina: format HH:MM pod nazwą.
-- ID transakcji: ciąg cyfr po kropce obok godziny (np. 101735350998). Jeśli brak, zwróć null.
+- ID transakcji: ciąg cyfr po kropce obok godziny. Jeśli brak, zwróć pusty string.
 - IGNORUJ wiersze podsumowania "Łączna kwota w gotówce".
 `;
-
-    const response = await this.ai.models.generateContent({
-      model: this.model,
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            { inlineData: { mimeType, data: base64Image } },
-            { text: prompt },
-          ],
-        },
-      ],
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: walletScreenSchema,
-        temperature: 0.1,
-      },
-    });
-
-    const parsed = JSON.parse(response.text || '{}') as { transactions?: WalletTransactionItem[] };
-    return parsed.transactions || [];
+    const parsed = await this.generate(
+      WalletScreenSchema,
+      walletScreenResponseSchema,
+      [{ inlineData: { mimeType, data: imageBuffer.toString('base64') } }, { text: prompt }],
+      0.1,
+      'wallet'
+    );
+    return parsed.transactions;
   }
 
-  /**
-   * Automatyczna klasyfikacja rodzaju przesłanego obrazu.
-   */
-  async classifyImage(imageBuffer: Buffer, caption = '', mimeType = 'image/jpeg'): Promise<'WALLET' | 'FUEL' | 'OFFER'> {
-    const lowerCaption = caption.toLowerCase();
-    if (lowerCaption.includes('portfel')) return 'WALLET';
-    if (lowerCaption.includes('paragon') || lowerCaption.includes('paliwo') || lowerCaption.includes('stacja')) return 'FUEL';
+  /** Automatyczna klasyfikacja rodzaju przeslanego obrazu. */
+  async classifyImage(imageBuffer: Buffer, caption = '', mimeType = 'image/jpeg'): Promise<ImageCategory> {
+    const lower = caption.toLowerCase();
+    if (lower.includes('portfel')) return 'WALLET';
+    if (lower.includes('paragon') || lower.includes('paliwo') || lower.includes('stacja')) return 'FUEL';
+    if (lower.includes('oferta') || lower.includes('kurs') || lower.includes('zlecenie')) return 'OFFER';
 
-    const base64Image = imageBuffer.toString('base64');
     const prompt = `
 Rozpoznaj typ ekranu:
-- WALLET (ekran z nagłówkiem "Portfel", listą transakcji: Pobranie gotówki, Wypłata, Płatność w punkcie)
+- WALLET (ekran "Portfel" z listą transakcji: Pobranie gotówki, Wypłata, Płatność w punkcie)
 - FUEL (paragon ze stacji paliw, faktura Orlen/CircleK/itp.)
 - OFFER (nowa oferta zlecenia Glovo z mapą, trasą i zieloną kwotą)
-Zwróć obiekt JSON z polem "category": "WALLET" | "FUEL" | "OFFER".
 `;
-
-    const response = await this.ai.models.generateContent({
-      model: this.model,
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            { inlineData: { mimeType, data: base64Image } },
-            { text: prompt },
-          ],
-        },
-      ],
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            category: { type: Type.STRING, enum: ['WALLET', 'FUEL', 'OFFER'] },
-          },
-          required: ['category'],
-        },
-        temperature: 0.0,
-      },
-    });
-
-    const res = JSON.parse(response.text || '{}') as { category?: 'WALLET' | 'FUEL' | 'OFFER' };
-    return res.category || 'OFFER';
+    const res = await this.generate(
+      ImageCategorySchema,
+      imageCategoryResponseSchema,
+      [{ inlineData: { mimeType, data: imageBuffer.toString('base64') } }, { text: prompt }],
+      0.0,
+      'classify'
+    );
+    return res.category;
   }
 }
 
