@@ -58,6 +58,15 @@ export interface CourseOfferStats {
   totalDistanceKm: number;
 }
 
+export interface ShiftStartResult {
+  date: string;
+  workFrom: string;
+  initialCash: number | null;
+  rollingBalance: number;
+  monthlyTarget: TargetProgress | null;
+  weeklyTarget: TargetProgress | null;
+}
+
 export class FinanceService {
   getEffectiveDate(d = new Date()): string {
     const target = new Date(d);
@@ -126,6 +135,117 @@ export class FinanceService {
       startDate: monday.toISOString().slice(0, 10),
       endDate: sunday.toISOString().slice(0, 10),
     };
+  }
+
+  async startShift(
+    telegramId: string | number,
+    data: {
+      date?: string;
+      workFrom: string;
+      initialCash?: number | null;
+    }
+  ): Promise<ShiftStartResult> {
+    const tId = String(telegramId);
+    const date = data.date || this.getEffectiveDate();
+
+    const [existing] = await db
+      .select()
+      .from(dailyRecords)
+      .where(and(eq(dailyRecords.telegramId, tId), eq(dailyRecords.date, date)))
+      .limit(1);
+
+    let calculatedHours: string | null = null;
+    if (data.workFrom && existing?.workTo) {
+      const h = this.calculateHours(data.workFrom, existing.workTo);
+      if (h > 0) calculatedHours = h.toString();
+    }
+
+    await db
+      .insert(dailyRecords)
+      .values({
+        telegramId: tId,
+        date,
+        workFrom: data.workFrom,
+        workTo: existing?.workTo || null,
+        workHours: calculatedHours || existing?.workHours || null,
+      })
+      .onConflictDoUpdate({
+        target: [dailyRecords.telegramId, dailyRecords.date],
+        set: {
+          workFrom: data.workFrom,
+          ...(calculatedHours && { workHours: calculatedHours }),
+        },
+      });
+
+    if (data.initialCash != null) {
+      await this.setBalanceCheckpoint(tId, date, data.initialCash);
+    }
+
+    const rolling = await this.getRollingBalance(tId, date);
+    const monthlyTarget = await this.getTargetProgress(tId, 'MONTHLY');
+    const weeklyTarget = await this.getTargetProgress(tId, 'WEEKLY');
+
+    return {
+      date,
+      workFrom: data.workFrom,
+      initialCash: data.initialCash ?? null,
+      rollingBalance: rolling.balance,
+      monthlyTarget,
+      weeklyTarget,
+    };
+  }
+
+  async finishShift(
+    telegramId: string | number,
+    data: {
+      date: string;
+      workTo?: string | null;
+      fuelDistance?: number | null;
+      walletCash?: number | null;
+    }
+  ): Promise<DailySummary> {
+    const tId = String(telegramId);
+    const date = data.date;
+
+    const [existing] = await db
+      .select()
+      .from(dailyRecords)
+      .where(and(eq(dailyRecords.telegramId, tId), eq(dailyRecords.date, date)))
+      .limit(1);
+
+    const workFrom = existing?.workFrom || null;
+    const workTo = data.workTo || existing?.workTo || null;
+    let workHoursStr: string | null = existing?.workHours || null;
+
+    if (workFrom && workTo) {
+      const calcH = this.calculateHours(workFrom, workTo);
+      workHoursStr = calcH > 0 ? calcH.toString() : null;
+    }
+
+    await db
+      .insert(dailyRecords)
+      .values({
+        telegramId: tId,
+        date,
+        workFrom,
+        workTo,
+        workHours: workHoursStr,
+        fuelDistance: data.fuelDistance != null ? data.fuelDistance : (existing?.fuelDistance ?? null),
+      })
+      .onConflictDoUpdate({
+        target: [dailyRecords.telegramId, dailyRecords.date],
+        set: {
+          ...(workTo && { workTo }),
+          ...(workHoursStr && { workHours: workHoursStr }),
+          ...(data.fuelDistance != null && { fuelDistance: data.fuelDistance }),
+        },
+      });
+
+    if (data.walletCash != null) {
+      await this.setBalanceCheckpoint(tId, date, data.walletCash);
+    }
+
+    return this.getDailySummary(tId, date);
   }
 
   async saveCashTip(telegramId: string | number, date: string, amount: number): Promise<void> {
@@ -341,59 +461,6 @@ export class FinanceService {
     }
 
     return { date, hasDailyUpdate, hasTip };
-  }
-
-  async finishShift(
-    telegramId: string | number,
-    data: {
-      date: string;
-      workTo?: string | null;
-      fuelDistance?: number | null;
-      walletCash?: number | null;
-    }
-  ): Promise<DailySummary> {
-    const tId = String(telegramId);
-    const date = data.date;
-
-    const [existing] = await db
-      .select()
-      .from(dailyRecords)
-      .where(and(eq(dailyRecords.telegramId, tId), eq(dailyRecords.date, date)))
-      .limit(1);
-
-    const workFrom = existing?.workFrom || null;
-    const workTo = data.workTo || existing?.workTo || null;
-    let workHoursStr: string | null = existing?.workHours || null;
-
-    if (workFrom && workTo) {
-      const calcH = this.calculateHours(workFrom, workTo);
-      workHoursStr = calcH > 0 ? calcH.toString() : null;
-    }
-
-    await db
-      .insert(dailyRecords)
-      .values({
-        telegramId: tId,
-        date,
-        workFrom,
-        workTo,
-        workHours: workHoursStr,
-        fuelDistance: data.fuelDistance != null ? data.fuelDistance : (existing?.fuelDistance ?? null),
-      })
-      .onConflictDoUpdate({
-        target: [dailyRecords.telegramId, dailyRecords.date],
-        set: {
-          ...(workTo && { workTo }),
-          ...(workHoursStr && { workHours: workHoursStr }),
-          ...(data.fuelDistance != null && { fuelDistance: data.fuelDistance }),
-        },
-      });
-
-    if (data.walletCash != null) {
-      await this.setBalanceCheckpoint(tId, date, data.walletCash);
-    }
-
-    return this.getDailySummary(tId, date);
   }
 
   async handleVoiceDeletion(

@@ -1,7 +1,7 @@
 import { Telegraf, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { geminiService, WalletTransactionItem } from './gemini.service';
-import { financeService, TargetProgress, DailySummary } from './finance.service';
+import { financeService, TargetProgress, DailySummary, ShiftStartResult } from './finance.service';
 import { mapsService } from './maps.service';
 import { NETTO_FACTOR, MIN_STAWKA_NETTO_KM } from '../config';
 
@@ -9,6 +9,13 @@ interface CourierLocation {
   latitude: number;
   longitude: number;
   updatedAt: number;
+}
+
+interface StartShiftSession {
+  date: string;
+  step: 'IDLE' | 'AWAITING_TIME' | 'AWAITING_CASH';
+  workFrom?: string | null;
+  initialCash?: number | null;
 }
 
 interface EndShiftSession {
@@ -21,6 +28,7 @@ interface EndShiftSession {
 
 const lastCourierLocation: Map<string, CourierLocation> = new Map();
 const pendingWalletImports: Map<string, { transactions: WalletTransactionItem[]; expiresAt: number }> = new Map();
+const startShiftSessions: Map<string, StartShiftSession> = new Map();
 const endShiftSessions: Map<string, EndShiftSession> = new Map();
 
 function getCurrentWarsawTime(): string {
@@ -69,6 +77,22 @@ function formatTargetCard(progress: TargetProgress): string {
   ].join('\n');
 }
 
+function renderStartShiftCard(session: StartShiftSession, rollingBalance: number): string {
+  const currentTime = getCurrentWarsawTime();
+  const workFromDisplay = session.workFrom || `${currentTime} (kliknij 'Ustaw godz. teraz')`;
+  const cashDisplay = session.initialCash != null ? `${session.initialCash.toFixed(2)} zł` : `${rollingBalance.toFixed(2)} zł (z bazy)`;
+
+  return [
+    '🚀 *Kreator Rozpoczęcia Zmiany*',
+    `📅 *Data:* \`${session.date}\``,
+    '',
+    `⏱️ *Godzina wyjazdu:* *${workFromDisplay}*`,
+    `💵 *Saldo startowe gotówki:* *${cashDisplay}*`,
+    '',
+    'Wybierz akcję poniżej, aby skorygować dane lub wystartować:',
+  ].join('\n');
+}
+
 function renderEndShiftCard(session: EndShiftSession, summary?: DailySummary): string {
   const currentTime = getCurrentWarsawTime();
   const workToDisplay = session.workTo || summary?.workTo || `_Nieustalona_ (kliknij poniżej: ${currentTime})`;
@@ -87,73 +111,332 @@ function renderEndShiftCard(session: EndShiftSession, summary?: DailySummary): s
   ].join('\n');
 }
 
+function formatShiftStartBriefing(result: ShiftStartResult, hasGps: boolean): string {
+  const lines: string[] = [
+    '🚀 *Szerokiej drogi! Zmiana rozpoczęta.*',
+    '',
+    `📅 *Data:* \`${result.date}\``,
+    `⏱️ *Godzina wyjazdu:* *${result.workFrom}*`,
+    `💼 *Saldo gotówki:* *${result.rollingBalance.toFixed(2)} zł*`,
+    hasGps ? '📍 *GPS:* Aktywny (30 min)' : '⚠️ *GPS:* Nieaktywny (kliknij /lokalizacja przed pierwszym kursem)',
+    '',
+    '────────────────',
+  ];
+
+  if (result.weeklyTarget && !result.weeklyTarget.isCompleted) {
+    lines.push(
+      `🎯 *Plan na dziś (cel tygodnia):* *${result.weeklyTarget.dailyRequiredNetto.toFixed(2)} zł netto* (~${result.weeklyTarget.hoursPerDayRequired.toFixed(1)} h)`
+    );
+  } else if (result.monthlyTarget && !result.monthlyTarget.isCompleted) {
+    lines.push(
+      `🎯 *Plan na dziś (cel miesiąca):* *${result.monthlyTarget.dailyRequiredNetto.toFixed(2)} zł netto* (~${result.monthlyTarget.hoursPerDayRequired.toFixed(1)} h)`
+    );
+  } else {
+    lines.push(`💡 *Próg opłacalności kursu:* ≥ *${MIN_STAWKA_NETTO_KM.toFixed(2)} zł netto / km*`);
+  }
+
+  return lines.join('\n');
+}
+
 export function registerBotHandlers(bot: Telegraf): void {
   // 1. Pomoc i Menu
-  bot.command(['start', 'pomoc', 'help'], async (ctx) => {
+  bot.command(['start', 'pomoc', 'help', 'menu'], async (ctx) => {
     const text = [
       '🤖 *GlovoBot – Asystent Kuriera*',
       '',
-      '🏁 *Zakończenie zmiany:*',
-      ' • `/koniec` – interaktywny kreator zjazdu i rozliczenia.',
-      ' • `/koniec 23:15 54 180` – szybki zapis (godz, dystans km, gotówka).',
+      '🛵 *Obsługa zmiany:*',
+      ' • `/startzmiana` lub `/wyjazd` – interaktywny start zmiany.',
+      ' • `/wyjazd 16:00 120` – szybki wyjazd (godzina, stan kasetki).',
+      ' • `/koniec` lub `/zjazd` – interaktywny zjazd i podsumowanie.',
+      ' • `/koniec 23:15 54 180` – szybki zjazd (godz, dystans km, gotówka).',
       '',
       '📍 *Lokalizacja:*',
-      ' • `/lokalizacja` – wywołaj przycisk wysłania pinezki GPS.',
+      ' • `/lokalizacja` – wyślij pinezkę GPS do weryfikacji tras.',
       '',
       '🎯 *Cele zarobkowe:*',
-      ' • `/cel 4500` – ustaw cel miesięczny netto.',
-      ' • `/cel tydzien 1200` – ustaw cel tygodniowy netto.',
+      ' • `/cel 4500` – cel miesięczny netto.',
+      ' • `/cel tydzien 1200` – cel tygodniowy netto.',
       ' • `/cele` – sprawdź postęp i wymagane tempo.',
       '',
       '📊 *Raporty i historia:*',
       ' • `/dzis` – podsumowanie dzisiejszej zmiany.',
-      ' • `/dzien 2026-08-06` – podsumowanie konkretnego dnia.',
-      ' • `/tydzien` – bieżący tydzień (pon–ndz).',
-      ' • `/ptydzien` – poprzedni tydzień (pon–ndz).',
+      ' • `/dzien 2026-08-06` – podsumowanie wybranego dnia.',
+      ' • `/tydzien` / `/ptydzien` – bieżący / poprzedni tydzień.',
       ' • `/miesiac` lub `/miesiac 2026-07` – podsumowanie miesiąca.',
-      ' • `/statystyki` lub `/statystyki 2026-08-06` – statystyki ofert Glovo.',
-      ' • `/saldo` lub `/saldo 150.00` – podgląd / punkt bazowy salda.',
+      ' • `/statystyki` – statystyki zaakceptowanych i odrzuconych kursów.',
+      ' • `/saldo` lub `/saldo 150.00` – stan / checkpoint salda Glovo.',
       '',
       '🎙️ *Głos (Voice-to-Data):* Notatki tankowania, zarobków i cofania.',
       '📸 *Zdjęcia:* Zrzuty Portfela, paragony paliwowe, oferty zleceń.',
     ].join('\n');
 
+    await ctx.reply(text, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback('🚀 Rozpocznij zmianę', 'btn_quick_start_shift'),
+          Markup.button.callback('🏁 Zakończ zmianę', 'btn_quick_end_shift'),
+        ],
+        [
+          Markup.button.callback('📊 Podsumowanie dziś', 'btn_quick_today'),
+          Markup.button.callback('🎯 Moje cele', 'btn_quick_targets'),
+        ],
+      ]),
+    });
+  });
+
+  // Skróty z menu głównego
+  bot.action('btn_quick_start_shift', async (ctx) => {
+    await ctx.answerCbQuery();
+    const effDate = financeService.getEffectiveDate();
+    const rolling = await financeService.getRollingBalance(ctx.from.id, effDate);
+    const session: StartShiftSession = {
+      date: effDate,
+      step: 'IDLE',
+      workFrom: getCurrentWarsawTime(),
+    };
+    startShiftSessions.set(String(ctx.from.id), session);
+
+    await ctx.reply(renderStartShiftCard(session, rolling.balance), {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback(`⏱️ Godzina: ${session.workFrom}`, 'startshift_set_now'),
+          Markup.button.callback('✏️ Wpisz inną', 'startshift_custom_time'),
+        ],
+        [
+          Markup.button.callback('💵 Ustaw stan kasetki', 'startshift_set_cash'),
+        ],
+        [
+          Markup.button.callback('🚀 Ruszaj w trasę!', 'startshift_finalize'),
+          Markup.button.callback('✖️ Anuluj', 'startshift_cancel'),
+        ],
+      ]),
+    });
+  });
+
+  bot.action('btn_quick_end_shift', async (ctx) => {
+    await ctx.answerCbQuery();
+    const effDate = financeService.getEffectiveDate();
+    const currentSummary = await financeService.getDailySummary(ctx.from.id, effDate);
+    const session: EndShiftSession = {
+      date: effDate,
+      step: 'IDLE',
+      workTo: currentSummary.workTo || null,
+      fuelDistance: currentSummary.fuelDistance || null,
+    };
+    endShiftSessions.set(String(ctx.from.id), session);
+
+    const currentTime = getCurrentWarsawTime();
+    await ctx.reply(renderEndShiftCard(session, currentSummary), {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback(`⏱️ Ustaw godz. teraz (${currentTime})`, 'endshift_set_now'),
+          Markup.button.callback('✏️ Wpisz inną', 'endshift_custom_time'),
+        ],
+        [
+          Markup.button.callback('🚗 Podaj stan licznika', 'endshift_set_dist'),
+          Markup.button.callback('💵 Stan gotówki Glovo', 'endshift_set_cash'),
+        ],
+        [
+          Markup.button.callback('✅ Zapisz i podsumuj', 'endshift_finalize'),
+          Markup.button.callback('✖️ Anuluj', 'endshift_cancel'),
+        ],
+      ]),
+    });
+  });
+
+  bot.action('btn_quick_today', async (ctx) => {
+    await ctx.answerCbQuery();
+    const date = financeService.getEffectiveDate();
+    const summary = await financeService.getDailySummary(ctx.from.id, date);
+    const text = [
+      `📅 *Raport dzienny:* \`${summary.date}\``,
+      '',
+      `💰 *Brutto:* *${summary.grossEarnings.toFixed(2)} zł*`,
+      `💵 *Netto ze zleceń (81.4%):* *${summary.netEarnings.toFixed(2)} zł*`,
+      `🪙 *Napiwki gotówka:* *+${summary.cashTipsTotal.toFixed(2)} zł*`,
+      `🏁 *Netto łącznie:* *${summary.totalNetto.toFixed(2)} zł*`,
+      summary.walletPayouts > 0 ? `🏧 *Wypłaty z portfela:* *-${summary.walletPayouts.toFixed(2)} zł*` : '',
+      `💳 *Do przelewu:* *${summary.doPrzelewu.toFixed(2)} zł*`,
+      '',
+      summary.workHours > 0
+        ? `⏱️ *Czas:* *${summary.workHours.toFixed(2)} h* (Stawka: *${summary.hourlyRateNetto.toFixed(2)} zł netto/h*)`
+        : '⏱️ *Czas pracy:* _Brak wpisu_',
+    ]
+      .filter(Boolean)
+      .join('\n');
+
     await ctx.reply(text, { parse_mode: 'Markdown' });
   });
 
-  // 2. Przycisk geolokalizacji na żądanie
-  bot.command('lokalizacja', async (ctx) => {
-    await ctx.reply(
-      '📍 *Kliknij przycisk poniżej*, aby udostępnić lokalizację GPS. Będzie używana do weryfikacji tras ofert Glovo przez 30 minut.',
-      {
-        parse_mode: 'Markdown',
-        ...Markup.keyboard([[Markup.button.locationRequest('📍 Wyślij moją pozycję GPS')]])
-          .resize()
-          .oneTime(),
-      }
-    );
+  bot.action('btn_quick_targets', async (ctx) => {
+    await ctx.answerCbQuery();
+    const mProg = await financeService.getTargetProgress(ctx.from.id, 'MONTHLY');
+    const wProg = await financeService.getTargetProgress(ctx.from.id, 'WEEKLY');
+    if (!mProg && !wProg) {
+      await ctx.reply('🎯 *Brak celów.* Wpisz np. `/cel 4500` lub `/cel tydzien 1200`.', { parse_mode: 'Markdown' });
+      return;
+    }
+    const cards = [mProg && formatTargetCard(mProg), wProg && formatTargetCard(wProg)].filter(Boolean);
+    await ctx.reply(cards.join('\n\n────────────────\n\n'), { parse_mode: 'Markdown' });
   });
 
-  // 3. Obsługa lokalizacji
-  bot.on(message('location'), async (ctx) => {
-    const { latitude, longitude } = ctx.message.location;
-    lastCourierLocation.set(String(ctx.from.id), {
-      latitude,
-      longitude,
-      updatedAt: Date.now(),
-    });
-    await ctx.reply('✅ *Pozycja GPS zapisana.* Weryfikacja tras Glovo aktywna na 30 minut.', {
-      parse_mode: 'Markdown',
-      ...Markup.removeKeyboard(),
-    });
-  });
-
-  // 4. Komenda /koniec – Interaktywne zamykanie zmiany
-  bot.command('koniec', async (ctx) => {
+  // 2. Rozpoczęcie zmiany: /startzmiana, /wyjazd, /poczatek, /start_zmiana
+  bot.command(['startzmiana', 'wyjazd', 'poczatek', 'start_zmiana'], async (ctx) => {
     const parts = ctx.message.text.trim().split(/\s+/);
     const effDate = financeService.getEffectiveDate();
 
-    // Szybka ścieżka z parametrami: /koniec [godzina] [dystans] [gotowka]
+    // Szybka ścieżka z parametrami: /wyjazd [godzina] [gotowka_startowa]
+    if (parts.length > 1) {
+      let workFrom = getCurrentWarsawTime();
+      let initialCash: number | null = null;
+
+      for (let i = 1; i < parts.length; i++) {
+        const p = parts[i]!;
+        if (/^\d{1,2}:\d{2}$/.test(p)) {
+          workFrom = p.length === 4 ? `0${p}` : p;
+        } else {
+          const val = parseFloat(p.replace(',', '.').replace(/zł|zl/i, ''));
+          if (!isNaN(val)) initialCash = val;
+        }
+      }
+
+      const result = await financeService.startShift(ctx.from.id, {
+        date: effDate,
+        workFrom,
+        initialCash,
+      });
+
+      const userLoc = lastCourierLocation.get(String(ctx.from.id));
+      const hasRecentLocation = Boolean(userLoc && Date.now() - userLoc.updatedAt <= 30 * 60 * 1000);
+
+      await ctx.reply(formatShiftStartBriefing(result, hasRecentLocation), {
+        parse_mode: 'Markdown',
+        ...(!hasRecentLocation
+          ? Markup.keyboard([[Markup.button.locationRequest('📍 Wyślij moją pozycję GPS')]])
+              .resize()
+              .oneTime()
+          : Markup.removeKeyboard()),
+      });
+      return;
+    }
+
+    // Ścieżka kreatora interaktywnego
+    const rolling = await financeService.getRollingBalance(ctx.from.id, effDate);
+    const session: StartShiftSession = {
+      date: effDate,
+      step: 'IDLE',
+      workFrom: getCurrentWarsawTime(),
+    };
+    startShiftSessions.set(String(ctx.from.id), session);
+
+    await ctx.reply(renderStartShiftCard(session, rolling.balance), {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback(`⏱️ Godzina: ${session.workFrom}`, 'startshift_set_now'),
+          Markup.button.callback('✏️ Wpisz inną', 'startshift_custom_time'),
+        ],
+        [
+          Markup.button.callback('💵 Ustaw stan kasetki', 'startshift_set_cash'),
+        ],
+        [
+          Markup.button.callback('🚀 Ruszaj w trasę!', 'startshift_finalize'),
+          Markup.button.callback('✖️ Anuluj', 'startshift_cancel'),
+        ],
+      ]),
+    });
+  });
+
+  // Callbacks dla kreatora /wyjazd
+  bot.action(/^startshift_(set_now|custom_time|set_cash|finalize|cancel)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const action = ctx.match[1];
+    const tId = String(ctx.from.id);
+    const session = startShiftSessions.get(tId);
+
+    if (!session) {
+      await ctx.editMessageText('⌛ *Sesja rozpoczęcia zmiany wygasła.* Wpisz ponownie `/wyjazd`.', {
+        parse_mode: 'Markdown',
+      });
+      return;
+    }
+
+    if (action === 'cancel') {
+      startShiftSessions.delete(tId);
+      await ctx.editMessageText('✖️ *Anulowano rozpoczęcie zmiany.*', { parse_mode: 'Markdown' });
+      return;
+    }
+
+    if (action === 'set_now') {
+      session.workFrom = getCurrentWarsawTime();
+      session.step = 'IDLE';
+      const rolling = await financeService.getRollingBalance(tId, session.date);
+
+      await ctx.editMessageText(renderStartShiftCard(session, rolling.balance), {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [
+            Markup.button.callback(`⏱️ Godzina: ${session.workFrom}`, 'startshift_set_now'),
+            Markup.button.callback('✏️ Wpisz inną', 'startshift_custom_time'),
+          ],
+          [
+            Markup.button.callback('💵 Ustaw stan kasetki', 'startshift_set_cash'),
+          ],
+          [
+            Markup.button.callback('🚀 Ruszaj w trasę!', 'startshift_finalize'),
+            Markup.button.callback('✖️ Anuluj', 'startshift_cancel'),
+          ],
+        ]),
+      });
+      return;
+    }
+
+    if (action === 'custom_time') {
+      session.step = 'AWAITING_TIME';
+      await ctx.reply('⏱️ *Wpisz godzinę wyjazdu* w formacie `GG:MM` (np. `15:45`):', { parse_mode: 'Markdown' });
+      return;
+    }
+
+    if (action === 'set_cash') {
+      session.step = 'AWAITING_CASH';
+      await ctx.reply('💵 *Wpisz stan gotówki w portfelu przed wyjazdem* (np. `150.00`):', { parse_mode: 'Markdown' });
+      return;
+    }
+
+    if (action === 'finalize') {
+      startShiftSessions.delete(tId);
+      const result = await financeService.startShift(tId, {
+        date: session.date,
+        workFrom: session.workFrom || getCurrentWarsawTime(),
+        initialCash: session.initialCash,
+      });
+
+      const userLoc = lastCourierLocation.get(tId);
+      const hasRecentLocation = Boolean(userLoc && Date.now() - userLoc.updatedAt <= 30 * 60 * 1000);
+
+      await ctx.editMessageText(formatShiftStartBriefing(result, hasRecentLocation), {
+        parse_mode: 'Markdown',
+      });
+
+      if (!hasRecentLocation) {
+        await ctx.reply('📍 *Nie zapomnij o geolokalizacji!* Wyślij GPS, by weryfikować kursy:', {
+          ...Markup.keyboard([[Markup.button.locationRequest('📍 Wyślij moją pozycję GPS')]])
+            .resize()
+            .oneTime(),
+        });
+      }
+    }
+  });
+
+  // 3. Zakończenie zmiany: /koniec, /zjazd
+  bot.command(['koniec', 'zjazd'], async (ctx) => {
+    const parts = ctx.message.text.trim().split(/\s+/);
+    const effDate = financeService.getEffectiveDate();
+
+    // Szybka ścieżka: /koniec [godzina] [dystans] [gotowka]
     if (parts.length > 1) {
       let workTo: string | null = null;
       let fuelDistance: number | null = null;
@@ -198,7 +481,7 @@ export function registerBotHandlers(bot: Telegraf): void {
       return;
     }
 
-    // Ścieżka kreatora interaktywnego
+    // Ścieżka kreatora
     const currentSummary = await financeService.getDailySummary(ctx.from.id, effDate);
     const session: EndShiftSession = {
       date: effDate,
@@ -214,14 +497,14 @@ export function registerBotHandlers(bot: Telegraf): void {
       ...Markup.inlineKeyboard([
         [
           Markup.button.callback(`⏱️ Ustaw godz. teraz (${currentTime})`, 'endshift_set_now'),
-          Markup.button.callback('✏️ Wpisz godz.', 'endshift_custom_time'),
+          Markup.button.callback('✏️ Wpisz inną', 'endshift_custom_time'),
         ],
         [
           Markup.button.callback('🚗 Podaj stan licznika', 'endshift_set_dist'),
           Markup.button.callback('💵 Stan gotówki Glovo', 'endshift_set_cash'),
         ],
         [
-          Markup.button.callback('✅ Zapisz i podsumuj zmianę', 'endshift_finalize'),
+          Markup.button.callback('✅ Zapisz i podsumuj', 'endshift_finalize'),
           Markup.button.callback('✖️ Anuluj', 'endshift_cancel'),
         ],
       ]),
@@ -266,7 +549,7 @@ export function registerBotHandlers(bot: Telegraf): void {
             Markup.button.callback('💵 Stan gotówki Glovo', 'endshift_set_cash'),
           ],
           [
-            Markup.button.callback('✅ Zapisz i podsumuj zmianę', 'endshift_finalize'),
+            Markup.button.callback('✅ Zapisz i podsumuj', 'endshift_finalize'),
             Markup.button.callback('✖️ Anuluj', 'endshift_cancel'),
           ],
         ]),
@@ -321,6 +604,32 @@ export function registerBotHandlers(bot: Telegraf): void {
 
       await ctx.editMessageText(response, { parse_mode: 'Markdown' });
     }
+  });
+
+  // 4. Przycisk geolokalizacji na żądanie
+  bot.command('lokalizacja', async (ctx) => {
+    await ctx.reply(
+      '📍 *Kliknij przycisk poniżej*, aby udostępnić lokalizację GPS. Będzie używana do weryfikacji tras ofert Glovo przez 30 minut.',
+      {
+        parse_mode: 'Markdown',
+        ...Markup.keyboard([[Markup.button.locationRequest('📍 Wyślij moją pozycję GPS')]])
+          .resize()
+          .oneTime(),
+      }
+    );
+  });
+
+  bot.on(message('location'), async (ctx) => {
+    const { latitude, longitude } = ctx.message.location;
+    lastCourierLocation.set(String(ctx.from.id), {
+      latitude,
+      longitude,
+      updatedAt: Date.now(),
+    });
+    await ctx.reply('✅ *Pozycja GPS zapisana.* Weryfikacja tras Glovo aktywna na 30 minut.', {
+      parse_mode: 'Markdown',
+      ...Markup.removeKeyboard(),
+    });
   });
 
   // 5. Raport: /dzis oraz /dzien [RRRR-MM-DD]
@@ -553,7 +862,7 @@ export function registerBotHandlers(bot: Telegraf): void {
     }
   });
 
-  // 11. Przyciski Inline dla ofert zleceń Glovo (Zaakceptowano / Odrzucono)
+  // 11. Przyciski akcji dla zleceń Glovo
   bot.action(/^offer:(accept|reject):(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const action = ctx.match[1];
@@ -602,41 +911,69 @@ export function registerBotHandlers(bot: Telegraf): void {
     });
   });
 
-  // 13. Tekstowy przechwyt danych dla aktywnego kreatora /koniec
+  // 13. Tekstowy przechwyt danych dla aktywnych kreatorów (/wyjazd oraz /koniec)
   bot.on(message('text'), async (ctx, next) => {
     const tId = String(ctx.from.id);
-    const session = endShiftSessions.get(tId);
     const rawText = ctx.message.text.trim();
 
-    if (session && session.step !== 'IDLE') {
-      if (session.step === 'AWAITING_TIME') {
+    // Przechwyt sesji startu zmiany (/wyjazd)
+    const startSession = startShiftSessions.get(tId);
+    if (startSession && startSession.step !== 'IDLE') {
+      if (startSession.step === 'AWAITING_TIME') {
         if (/^\d{1,2}:\d{2}$/.test(rawText)) {
-          session.workTo = rawText.length === 4 ? `0${rawText}` : rawText;
-          session.step = 'IDLE';
-          await ctx.reply(`✅ *Ustawiono godzinę zjazdu:* \`${session.workTo}\``, { parse_mode: 'Markdown' });
+          startSession.workFrom = rawText.length === 4 ? `0${rawText}` : rawText;
+          startSession.step = 'IDLE';
+          await ctx.reply(`✅ *Ustawiono godzinę wyjazdu:* \`${startSession.workFrom}\``, { parse_mode: 'Markdown' });
+          return;
+        }
+        await ctx.reply('❌ Błędny format godziny. Podaj np. `16:15` lub kliknij `/wyjazd`.');
+        return;
+      }
+
+      if (startSession.step === 'AWAITING_CASH') {
+        const val = parseFloat(rawText.replace(',', '.').replace(/zł|zl/i, '').trim());
+        if (!isNaN(val)) {
+          startSession.initialCash = val;
+          startSession.step = 'IDLE';
+          await ctx.reply(`✅ *Ustawiono gotówkę startową:* *${val.toFixed(2)} zł*`, { parse_mode: 'Markdown' });
+          return;
+        }
+        await ctx.reply('❌ Podaj poprawną kwotę (np. `120.00`).');
+        return;
+      }
+    }
+
+    // Przechwyt sesji zakończenia zmiany (/koniec)
+    const endSession = endShiftSessions.get(tId);
+    if (endSession && endSession.step !== 'IDLE') {
+      if (endSession.step === 'AWAITING_TIME') {
+        if (/^\d{1,2}:\d{2}$/.test(rawText)) {
+          endSession.workTo = rawText.length === 4 ? `0${rawText}` : rawText;
+          endSession.step = 'IDLE';
+          await ctx.reply(`✅ *Ustawiono godzinę zjazdu:* \`${endSession.workTo}\``, { parse_mode: 'Markdown' });
           return;
         }
         await ctx.reply('❌ Błędny format godziny. Podaj np. `23:15` lub kliknij `/koniec`.');
         return;
       }
 
-      if (session.step === 'AWAITING_DISTANCE') {
+      if (endSession.step === 'AWAITING_DISTANCE') {
         const val = parseInt(rawText.replace(/km/i, '').trim(), 10);
         if (!isNaN(val) && val >= 0) {
-          session.fuelDistance = val;
-          session.step = 'IDLE';
+          endSession.fuelDistance = val;
+          endSession.step = 'IDLE';
           await ctx.reply(`✅ *Ustawiono przebieg:* *${val} km*`, { parse_mode: 'Markdown' });
           return;
         }
-        await ctx.reply('❌ Podaj prawidłową liczbę kilometrów (np. `52`).');
+        await ctx.reply('❌ Podaj liczbę kilometrów (np. `52`).');
         return;
       }
 
-      if (session.step === 'AWAITING_CASH') {
+      if (endSession.step === 'AWAITING_CASH') {
         const val = parseFloat(rawText.replace(',', '.').replace(/zł|zl/i, '').trim());
         if (!isNaN(val)) {
-          session.walletCash = val;
-          session.step = 'IDLE';
+          endSession.walletCash = val;
+          endSession.step = 'IDLE';
           await ctx.reply(`✅ *Zanotowano stan portfela:* *${val.toFixed(2)} zł*`, { parse_mode: 'Markdown' });
           return;
         }
@@ -668,7 +1005,7 @@ export function registerBotHandlers(bot: Telegraf): void {
     return next();
   });
 
-  // 14. Przyciski Inline (Potwierdzenie importu Portfela)
+  // 14. Przyciski Inline (Import portfela)
   bot.action(/^wallet_(confirm|cancel)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const action = ctx.match[1];
