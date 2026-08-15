@@ -8,3 +8,7 @@ export const CFG = {
   MAX_PHOTO_BYTES: 20 * 1024 * 1024,
   HISTORY_LEN: 5,
 };
+
+export const TAX_FACTOR = CFG.TAX_FACTOR;
+export const NETTO_FACTOR = CFG.NETTO_FACTOR;
+export const MIN_STAWKA_NETTO_KM = CFG.MIN_STAWKA_NETTO_KM;

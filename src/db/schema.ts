@@ -99,6 +99,7 @@ export const courseOffers = pgTable('course_offers', {
   totalDistance: numeric('total_distance', { precision: 10, scale: 2 }).notNull(),
   netRatePerKm: numeric('net_rate_per_km', { precision: 10, scale: 2 }).notNull(),
   isProfitable: boolean('is_profitable').notNull(),
+  status: text('status').default('PENDING').notNull(), // 'PENDING' | 'ACCEPTED' | 'REJECTED'
   pointsJson: text('points_json'),
   verificationText: text('verification_text'),
   createdAt: timestamp('created_at').defaultNow().notNull(),

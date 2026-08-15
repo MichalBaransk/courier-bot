@@ -7,7 +7,7 @@ import {
   courseOffers,
   earningTargets,
 } from '../db/schema';
-import { eq, and, gte, lte, sql, desc, inArray } from 'drizzle-orm';
+import { eq, and, gte, lte, sql, desc } from 'drizzle-orm';
 import { NETTO_FACTOR } from '../config';
 import { VoiceExtractedData, WalletTransactionItem } from './gemini.service';
 
@@ -20,6 +20,8 @@ export interface DailySummary {
   walletPayouts: number;
   walletCollections: number;
   doPrzelewu: number;
+  workFrom: string | null;
+  workTo: string | null;
   workHours: number;
   hourlyRateNetto: number;
   fuelPrice: number;
@@ -46,6 +48,9 @@ export interface CourseOfferStats {
   totalOffers: number;
   profitable: number;
   unprofitable: number;
+  accepted: number;
+  rejected: number;
+  pending: number;
   avgNetRatePerKm: number;
   bestNetRate: number;
   worstNetRate: number;
@@ -64,7 +69,7 @@ export class FinanceService {
 
   adjustDateForNightShift(dateStr: string, timeStr?: string): string {
     if (!timeStr) return dateStr;
-    const hour = parseInt(timeStr.split(':')[0], 10);
+    const hour = parseInt(timeStr.split(':')[0] || '0', 10);
     if (hour >= 0 && hour < 4) {
       const d = new Date(`${dateStr}T12:00:00`);
       d.setDate(d.getDate() - 1);
@@ -94,6 +99,8 @@ export class FinanceService {
   calculateHours(fromStr: string, toStr: string): number {
     const [fH, fM] = fromStr.split(':').map(Number);
     const [tH, tM] = toStr.split(':').map(Number);
+    if (fH === undefined || fM === undefined || tH === undefined || tM === undefined) return 0;
+
     let diffMinutes = tH * 60 + tM - (fH * 60 + fM);
     if (diffMinutes < 0) diffMinutes += 24 * 60;
     const hours = Math.round((diffMinutes / 60) * 100) / 100;
@@ -160,26 +167,50 @@ export class FinanceService {
       deliveryAddress: string;
       verificationText?: string;
     }
-  ): Promise<void> {
+  ): Promise<number> {
     const now = new Date();
     const date = this.getEffectiveDate(now);
     const time = now.toTimeString().slice(0, 5);
 
-    await db.insert(courseOffers).values({
-      telegramId: String(telegramId),
-      date,
-      time,
-      grossAmount: data.grossAmount.toFixed(2),
-      netAmount: data.netAmount.toFixed(2),
-      totalDistance: data.totalDistance.toFixed(2),
-      netRatePerKm: data.netRatePerKm.toFixed(2),
-      isProfitable: data.isProfitable,
-      pointsJson: JSON.stringify({
-        pickup: data.pickupAddress,
-        delivery: data.deliveryAddress,
-      }),
-      verificationText: data.verificationText || null,
-    });
+    const [inserted] = await db
+      .insert(courseOffers)
+      .values({
+        telegramId: String(telegramId),
+        date,
+        time,
+        grossAmount: data.grossAmount.toFixed(2),
+        netAmount: data.netAmount.toFixed(2),
+        totalDistance: data.totalDistance.toFixed(2),
+        netRatePerKm: data.netRatePerKm.toFixed(2),
+        isProfitable: data.isProfitable,
+        status: 'PENDING',
+        pointsJson: JSON.stringify({
+          pickup: data.pickupAddress,
+          delivery: data.deliveryAddress,
+        }),
+        verificationText: data.verificationText || null,
+      })
+      .returning({ id: courseOffers.id });
+
+    if (!inserted) {
+      throw new Error('Nie udało się zapisać oferty w bazie.');
+    }
+
+    return inserted.id;
+  }
+
+  async updateCourseOfferStatus(
+    offerId: number,
+    telegramId: string | number,
+    status: 'ACCEPTED' | 'REJECTED'
+  ): Promise<boolean> {
+    const result = await db
+      .update(courseOffers)
+      .set({ status })
+      .where(and(eq(courseOffers.id, offerId), eq(courseOffers.telegramId, String(telegramId))))
+      .returning({ id: courseOffers.id });
+
+    return result.length > 0;
   }
 
   async previewWalletImport(
@@ -312,6 +343,59 @@ export class FinanceService {
     return { date, hasDailyUpdate, hasTip };
   }
 
+  async finishShift(
+    telegramId: string | number,
+    data: {
+      date: string;
+      workTo?: string | null;
+      fuelDistance?: number | null;
+      walletCash?: number | null;
+    }
+  ): Promise<DailySummary> {
+    const tId = String(telegramId);
+    const date = data.date;
+
+    const [existing] = await db
+      .select()
+      .from(dailyRecords)
+      .where(and(eq(dailyRecords.telegramId, tId), eq(dailyRecords.date, date)))
+      .limit(1);
+
+    const workFrom = existing?.workFrom || null;
+    const workTo = data.workTo || existing?.workTo || null;
+    let workHoursStr: string | null = existing?.workHours || null;
+
+    if (workFrom && workTo) {
+      const calcH = this.calculateHours(workFrom, workTo);
+      workHoursStr = calcH > 0 ? calcH.toString() : null;
+    }
+
+    await db
+      .insert(dailyRecords)
+      .values({
+        telegramId: tId,
+        date,
+        workFrom,
+        workTo,
+        workHours: workHoursStr,
+        fuelDistance: data.fuelDistance != null ? data.fuelDistance : (existing?.fuelDistance ?? null),
+      })
+      .onConflictDoUpdate({
+        target: [dailyRecords.telegramId, dailyRecords.date],
+        set: {
+          ...(workTo && { workTo }),
+          ...(workHoursStr && { workHours: workHoursStr }),
+          ...(data.fuelDistance != null && { fuelDistance: data.fuelDistance }),
+        },
+      });
+
+    if (data.walletCash != null) {
+      await this.setBalanceCheckpoint(tId, date, data.walletCash);
+    }
+
+    return this.getDailySummary(tId, date);
+  }
+
   async handleVoiceDeletion(
     telegramId: string | number,
     target: 'LAST_TIP' | 'ALL_TIPS' | 'FUEL' | 'HOURS' | 'EARNINGS' | 'ALL_DAY',
@@ -426,6 +510,8 @@ export class FinanceService {
       walletPayouts,
       walletCollections,
       doPrzelewu,
+      workFrom: record?.workFrom || null,
+      workTo: record?.workTo || null,
       workHours,
       hourlyRateNetto,
       fuelPrice: record?.fuelPrice ? parseFloat(record.fuelPrice) : 0,
@@ -521,6 +607,9 @@ export class FinanceService {
 
     let profitable = 0;
     let unprofitable = 0;
+    let accepted = 0;
+    let rejected = 0;
+    let pending = 0;
     let sumRates = 0;
     let bestRate = 0;
     let worstRate = 999;
@@ -530,6 +619,10 @@ export class FinanceService {
     for (const o of offers) {
       if (o.isProfitable) profitable++;
       else unprofitable++;
+
+      if (o.status === 'ACCEPTED') accepted++;
+      else if (o.status === 'REJECTED') rejected++;
+      else pending++;
 
       const rate = parseFloat(o.netRatePerKm);
       sumRates += rate;
@@ -545,6 +638,9 @@ export class FinanceService {
       totalOffers: offers.length,
       profitable,
       unprofitable,
+      accepted,
+      rejected,
+      pending,
       avgNetRatePerKm: offers.length > 0 ? Math.round((sumRates / offers.length) * 100) / 100 : 0,
       bestNetRate: bestRate,
       worstNetRate: worstRate === 999 ? 0 : worstRate,
