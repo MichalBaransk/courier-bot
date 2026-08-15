@@ -1,7 +1,7 @@
 import { Telegraf } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { geminiService } from './gemini.service';
-import { financeService } from './finance.service';
+import { financeService, TargetProgress } from './finance.service';
 import { mapsService } from './maps.service';
 import { NETTO_FACTOR, MIN_STAWKA_NETTO_KM } from '../config';
 
@@ -13,10 +13,52 @@ interface CourierLocation {
 
 const lastCourierLocation: Map<string, CourierLocation> = new Map();
 
+function generateProgressBar(percent: number, totalBlocks = 10): string {
+  const filledBlocks = Math.min(totalBlocks, Math.max(0, Math.round((percent / 100) * totalBlocks)));
+  const emptyBlocks = totalBlocks - filledBlocks;
+  return `[${'█'.repeat(filledBlocks)}${'░'.repeat(emptyBlocks)}]`;
+}
+
+function formatTargetCard(progress: TargetProgress): string {
+  const isMonth = progress.periodType === 'MONTHLY';
+  const header = isMonth ? '🎯 *Miesięczny Cel Zarobkowy*' : '🎯 *Tygodniowy Cel Zarobkowy*';
+  const bar = generateProgressBar(progress.progressPercent);
+
+  if (progress.isCompleted) {
+    return [
+      header,
+      `${bar} *${progress.progressPercent.toFixed(1)}%*`,
+      '',
+      `🏆 *CEL OSIĄGNIĘTY! Gratulacje!*`,
+      `💰 *Zarobione netto:* *${progress.currentNetto.toFixed(2)} zł* / *${progress.targetAmount.toFixed(2)} zł*`,
+      `📈 *Nadwyżka:* *+${(progress.currentNetto - progress.targetAmount).toFixed(2)} zł*`,
+    ].join('\n');
+  }
+
+  return [
+    header,
+    `${bar} *${progress.progressPercent.toFixed(1)}%*`,
+    '',
+    `💰 *Postęp:* *${progress.currentNetto.toFixed(2)} zł* z *${progress.targetAmount.toFixed(2)} zł* netto`,
+    `⏳ *Brakuje:* *${progress.remainingNetto.toFixed(2)} zł*`,
+    `📅 *Pozostało dni:* *${progress.daysRemaining}*`,
+    '',
+    '📊 *Wymagane tempo do domknięcia celu:*',
+    ` • Średnio dziennie: *${progress.dailyRequiredNetto.toFixed(2)} zł netto / dzień*`,
+    ` • Szacowany czas: *~${progress.estimatedHoursRemaining.toFixed(1)} h* łącznie (*${progress.hoursPerDayRequired.toFixed(1)} h / dzień*)`,
+    ` • _Przyjęta stawka bazy:_ \`${progress.avgHourlyRate.toFixed(2)} zł netto/h\``,
+  ].join('\n');
+}
+
 export function registerBotHandlers(bot: Telegraf): void {
   bot.command(['start', 'pomoc', 'help'], async (ctx) => {
     const text = [
       '🤖 *GlovoBot – Asystent Kuriera*',
+      '',
+      '🎯 *Cele zarobkowe (Targets & Gamification):*',
+      ' • `/cel 4500` – ustawia cel miesięczny netto.',
+      ' • `/cel tydzien 1200` – ustawia cel tygodniowy netto.',
+      ' • `/cele` lub `/target` – podgląd pasków postępu i wyliczeń tempa.',
       '',
       '🎙️ *Głosowe wprowadzanie i usuwanie (Voice-to-Data):*',
       ' • *Dodawanie:* _"Zatankowałem za 75 zł, 11 litrów, licznik 24300"_ lub _"Praca 10:00 do 16:30, zarobek 210 zł"_',
@@ -26,16 +68,70 @@ export function registerBotHandlers(bot: Telegraf): void {
       ' • *Oferta Glovo:* Prześlij zrzut ekranu – wyliczę opłacalność (zł netto / km).',
       ' • *Paragon paliwowy:* Prześlij zdjęcie z podpisem _"paragon"_ lub _"paliwo"_.',
       '',
-      '💵 *Szybkie komendy:*',
+      '💵 *Szybkie raporty i skróty:*',
       ' • `n 5` / `np 10.50` – natychmiastowy zapis napiwku bez AI.',
-      ' • `/dzis` – podsumowanie dzisiejszej zmiany.',
-      ' • `/tydzien` – podsumowanie bieżącego tygodnia.',
-      ' • `/miesiac` – podsumowanie miesiąca.',
-      ' • `/saldo` – aktualny stan portfela Glovo.',
+      ' • `/dzis`, `/tydzien`, `/miesiac`, `/saldo`',
       ' • 📍 *Lokalizacja:* Wyślij pinezkę GPS – bot uwzględni realny dojazd do restauracji przez 30 min.',
     ].join('\n');
 
     await ctx.reply(text, { parse_mode: 'Markdown' });
+  });
+
+  // Komenda definiowania i podglądu celów: /cel, /cel 4000, /cel tydzien 1000, /cel miesiac 4500
+  bot.command(['cel', 'target', 'cele'], async (ctx) => {
+    const textParts = ctx.message.text.trim().split(/\s+/);
+
+    // Przypadek 1: Sam podgląd (/cele lub /cel bez argumentów)
+    if (textParts.length === 1) {
+      const monthlyProgress = await financeService.getTargetProgress(ctx.from.id, 'MONTHLY');
+      const weeklyProgress = await financeService.getTargetProgress(ctx.from.id, 'WEEKLY');
+
+      if (!monthlyProgress && !weeklyProgress) {
+        await ctx.reply(
+          '🎯 *Brak aktywnych celów.*\nUstaw cel wpisując np. `/cel 4000` (miesięczny) lub `/cel tydzien 1200` (tygodniowy).',
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const cards: string[] = [];
+      if (monthlyProgress) cards.push(formatTargetCard(monthlyProgress));
+      if (weeklyProgress) cards.push(formatTargetCard(weeklyProgress));
+
+      await ctx.reply(cards.join('\n\n────────────────\n\n'), { parse_mode: 'Markdown' });
+      return;
+    }
+
+    // Przypadek 2: Ustawianie celu
+    let periodType: 'MONTHLY' | 'WEEKLY' = 'MONTHLY';
+    let amountStr = '';
+
+    if (textParts.length === 2) {
+      amountStr = textParts[1];
+    } else if (textParts.length >= 3) {
+      const typeArg = textParts[1].toLowerCase();
+      if (typeArg === 'tydzien' || typeArg === 'week' || typeArg === 'w') {
+        periodType = 'WEEKLY';
+      }
+      amountStr = textParts[2];
+    }
+
+    const targetAmount = parseFloat(amountStr.replace(',', '.'));
+    if (isNaN(targetAmount) || targetAmount <= 0) {
+      await ctx.reply('❌ *Błędna kwota.* Użyj np. `/cel 4000` lub `/cel tydzien 1200`.', {
+        parse_mode: 'Markdown',
+      });
+      return;
+    }
+
+    await financeService.setEarningTarget(ctx.from.id, periodType, targetAmount);
+    const progress = await financeService.getTargetProgress(ctx.from.id, periodType);
+
+    if (progress) {
+      await ctx.reply(`✅ *Cel zapisany!*\n\n${formatTargetCard(progress)}`, {
+        parse_mode: 'Markdown',
+      });
+    }
   });
 
   bot.command('dzis', async (ctx) => {
@@ -74,6 +170,7 @@ export function registerBotHandlers(bot: Telegraf): void {
     const endDate = financeService.getEffectiveDate(now);
 
     const summary = await financeService.getPeriodSummary(ctx.from.id, startDate, endDate);
+    const weeklyTarget = await financeService.getTargetProgress(ctx.from.id, 'WEEKLY');
 
     const text = [
       `📊 *Podsumowanie tygodnia (${summary.startDate} - ${summary.endDate}):*`,
@@ -86,6 +183,14 @@ export function registerBotHandlers(bot: Telegraf): void {
       `⏱️ *Przepracowane godziny:* *${summary.totalWorkHours.toFixed(2)} h*`,
       `📈 *Średnia stawka:* *${summary.avgHourlyRateNetto.toFixed(2)} zł netto/h*`,
       `⛽ *Koszty paliwa:* *${summary.totalFuelCost.toFixed(2)} zł*`,
+      ...(weeklyTarget
+        ? [
+            '',
+            '────────────────',
+            `🎯 *Cel tygodniowy:* ${generateProgressBar(weeklyTarget.progressPercent)} *${weeklyTarget.progressPercent.toFixed(1)}%*`,
+            `⏳ Brakuje: *${weeklyTarget.remainingNetto.toFixed(2)} zł* (wymagane: *${weeklyTarget.dailyRequiredNetto.toFixed(2)} zł/dzień*)`,
+          ]
+        : []),
     ].join('\n');
 
     await ctx.reply(text, { parse_mode: 'Markdown' });
@@ -97,6 +202,7 @@ export function registerBotHandlers(bot: Telegraf): void {
     const endDate = financeService.getEffectiveDate(now);
 
     const summary = await financeService.getPeriodSummary(ctx.from.id, startDate, endDate);
+    const monthlyTarget = await financeService.getTargetProgress(ctx.from.id, 'MONTHLY');
 
     const text = [
       `🗓️ *Podsumowanie miesiąca (${summary.startDate} - ${summary.endDate}):*`,
@@ -109,6 +215,14 @@ export function registerBotHandlers(bot: Telegraf): void {
       `⏱️ *Godziny łączone:* *${summary.totalWorkHours.toFixed(2)} h*`,
       `📈 *Średnia netto/h:* *${summary.avgHourlyRateNetto.toFixed(2)} zł/h*`,
       `⛽ *Wydatki na paliwo:* *${summary.totalFuelCost.toFixed(2)} zł*`,
+      ...(monthlyTarget
+        ? [
+            '',
+            '────────────────',
+            `🎯 *Cel miesiąca:* ${generateProgressBar(monthlyTarget.progressPercent)} *${monthlyTarget.progressPercent.toFixed(1)}%*`,
+            `⏳ Brakuje: *${monthlyTarget.remainingNetto.toFixed(2)} zł* (wymagane: *${monthlyTarget.dailyRequiredNetto.toFixed(2)} zł/dzień*)`,
+          ]
+        : []),
     ].join('\n');
 
     await ctx.reply(text, { parse_mode: 'Markdown' });
@@ -171,7 +285,6 @@ export function registerBotHandlers(bot: Telegraf): void {
       const mimeType = ('mime_type' in voiceMsg && voiceMsg.mime_type) ? voiceMsg.mime_type : 'audio/ogg';
       const extracted = await geminiService.parseVoiceNote(audioBuffer, mimeType);
 
-      // Ścieżka 1: Usuwanie / Cofanie wpisów głosem
       if (extracted.action === 'DELETE' && extracted.deleteTarget) {
         const delResult = await financeService.handleVoiceDeletion(
           ctx.from.id,
@@ -195,7 +308,6 @@ export function registerBotHandlers(bot: Telegraf): void {
         return;
       }
 
-      // Ścieżka 2: Dodawanie / Aktualizacja danych (UPSERT)
       const result = await financeService.saveVoiceEvent(ctx.from.id, extracted);
 
       const lines: string[] = [

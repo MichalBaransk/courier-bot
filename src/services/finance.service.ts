@@ -5,6 +5,7 @@ import {
   walletTransactions,
   balanceCheckpoints,
   courseOffers,
+  earningTargets,
 } from '../db/schema';
 import { eq, and, gte, lte, sql, desc } from 'drizzle-orm';
 import { NETTO_FACTOR } from '../config';
@@ -21,6 +22,20 @@ export interface DailySummary {
   fuelPrice: number;
   fuelLiters: number;
   fuelDistance: number | null;
+}
+
+export interface TargetProgress {
+  periodType: 'MONTHLY' | 'WEEKLY';
+  targetAmount: number;
+  currentNetto: number;
+  remainingNetto: number;
+  progressPercent: number;
+  daysRemaining: number;
+  dailyRequiredNetto: number;
+  avgHourlyRate: number;
+  estimatedHoursRemaining: number;
+  hoursPerDayRequired: number;
+  isCompleted: boolean;
 }
 
 export class FinanceService {
@@ -63,6 +78,14 @@ export class FinanceService {
     if (diffMinutes < 0) diffMinutes += 24 * 60;
     const hours = Math.round((diffMinutes / 60) * 100) / 100;
     return hours >= 0.25 ? hours : 0;
+  }
+
+  getWeekNumber(d: Date): number {
+    const target = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+    const dayNum = target.getUTCDay() || 7;
+    target.setUTCDate(target.getUTCDate() + 4 - dayNum);
+    const yearStart = new Date(Date.UTC(target.getUTCFullYear(), 0, 1));
+    return Math.ceil(((target.getTime() - yearStart.getTime()) / 86400000 + 1) / 7);
   }
 
   async saveCashTip(telegramId: string | number, date: string, amount: number): Promise<void> {
@@ -218,7 +241,7 @@ export class FinanceService {
           await db.delete(cashTips).where(eq(cashTips.id, anyLastTip.id));
           return {
             success: true,
-            message: `Usunięto ostatni zarejestrowany napiwek: *${parseFloat(anyLastTip.amount).toFixed(2)} zł* (z dnia \`${anyLastTip.date}\`).`,
+            message: `Usunięto ostatni napiwek: *${parseFloat(anyLastTip.amount).toFixed(2)} zł* z dnia \`${anyLastTip.date}\`.`,
             date: anyLastTip.date,
           };
         }
@@ -438,6 +461,113 @@ export class FinanceService {
       totalWorkHours,
       avgHourlyRateNetto,
       totalFuelCost,
+    };
+  }
+
+  async setEarningTarget(
+    telegramId: string | number,
+    periodType: 'MONTHLY' | 'WEEKLY',
+    targetAmount: number
+  ): Promise<{ year: number; periodValue: number; targetAmount: number }> {
+    const tId = String(telegramId);
+    const effDate = new Date(this.getEffectiveDate());
+    const year = effDate.getFullYear();
+    const periodValue =
+      periodType === 'MONTHLY' ? effDate.getMonth() + 1 : this.getWeekNumber(effDate);
+
+    await db
+      .insert(earningTargets)
+      .values({
+        telegramId: tId,
+        periodType,
+        targetAmount: targetAmount.toFixed(2),
+        year,
+        periodValue,
+      })
+      .onConflictDoUpdate({
+        target: [
+          earningTargets.telegramId,
+          earningTargets.periodType,
+          earningTargets.year,
+          earningTargets.periodValue,
+        ],
+        set: {
+          targetAmount: targetAmount.toFixed(2),
+        },
+      });
+
+    return { year, periodValue, targetAmount };
+  }
+
+  async getTargetProgress(
+    telegramId: string | number,
+    periodType: 'MONTHLY' | 'WEEKLY'
+  ): Promise<TargetProgress | null> {
+    const tId = String(telegramId);
+    const effDateStr = this.getEffectiveDate();
+    const effDate = new Date(effDateStr);
+    const year = effDate.getFullYear();
+    const periodValue =
+      periodType === 'MONTHLY' ? effDate.getMonth() + 1 : this.getWeekNumber(effDate);
+
+    const [target] = await db
+      .select()
+      .from(earningTargets)
+      .where(
+        and(
+          eq(earningTargets.telegramId, tId),
+          eq(earningTargets.periodType, periodType),
+          eq(earningTargets.year, year),
+          eq(earningTargets.periodValue, periodValue)
+        )
+      )
+      .limit(1);
+
+    if (!target) return null;
+
+    const targetAmount = parseFloat(target.targetAmount);
+    let startDate = '';
+    let daysRemaining = 1;
+
+    if (periodType === 'MONTHLY') {
+      startDate = `${year}-${String(periodValue).padStart(2, '0')}-01`;
+      const lastDayOfMonth = new Date(year, periodValue, 0).getDate();
+      const currentDay = effDate.getDate();
+      daysRemaining = Math.max(1, lastDayOfMonth - currentDay + 1);
+    } else {
+      const dayOfWeek = effDate.getDay() === 0 ? 7 : effDate.getDay();
+      const monday = new Date(effDate);
+      monday.setDate(monday.getDate() - (dayOfWeek - 1));
+      startDate = monday.toISOString().slice(0, 10);
+      daysRemaining = Math.max(1, 7 - dayOfWeek + 1);
+    }
+
+    const summary = await this.getPeriodSummary(tId, startDate, effDateStr);
+    const currentNetto = summary.grandTotalNetto;
+    const remainingNetto = Math.max(0, Math.round((targetAmount - currentNetto) * 100) / 100);
+    const progressPercent = Math.min(100, Math.round((currentNetto / targetAmount) * 1000) / 10);
+    const dailyRequiredNetto =
+      remainingNetto > 0 ? Math.round((remainingNetto / daysRemaining) * 100) / 100 : 0;
+    const avgHourlyRate = summary.avgHourlyRateNetto > 0 ? summary.avgHourlyRateNetto : 35.0; // Domyślna stawka 35 zł/h jeśli brak godzin
+    const estimatedHoursRemaining =
+      remainingNetto > 0 ? Math.round((remainingNetto / avgHourlyRate) * 10) / 10 : 0;
+    const hoursPerDayRequired =
+      estimatedHoursRemaining > 0
+        ? Math.round((estimatedHoursRemaining / daysRemaining) * 10) / 10
+        : 0;
+
+    return {
+      periodType,
+      targetAmount,
+      currentNetto,
+      remainingNetto,
+      progressPercent,
+      daysRemaining,
+      dailyRequiredNetto,
+      avgHourlyRate,
+      estimatedHoursRemaining,
+      hoursPerDayRequired,
+      isCompleted: currentNetto >= targetAmount,
     };
   }
 
