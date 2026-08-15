@@ -131,8 +131,13 @@ export function endShiftCard(summary: DailySummary, balance: number, currentTime
     '',
     `⏱️ ${b('Godziny pracy:')} ${code(`${summary.workFrom ?? '--:--'} - ${summary.workTo ?? '--:--'}`)} (${b(`${summary.workHours.toFixed(2)} h`)})`,
     `🚗 ${b('Dystans dnia:')} ${summary.distanceKm != null ? b(km(summary.distanceKm)) : i('brak')}`,
-    `💰 ${b('Zarobek brutto:')} ${b(zl(summary.grossEarnings))}`,
+    `💰 ${b('Zarobek brutto:')} ${summary.grossEarnings > 0 ? b(zl(summary.grossEarnings)) : i('brak wpisu')}`,
     `💵 ${b('Zarobek łącznie netto:')} ${b(zl(summary.totalNetto))} (stawka ${b(`${summary.hourlyRateNetto.toFixed(2)} zł/h`)})`,
+    `⛽ ${b('Paliwo dziś:')} ${
+      summary.fuelCost > 0
+        ? b(zl(summary.fuelCost)) + (summary.fuelReceiptCount > 1 ? ` ${i(`(${summary.fuelReceiptCount} paragony)`)}` : '')
+        : i('brak wpisu')
+    }`,
     `💼 ${b('Portfel Glovo:')} ${b(zl(balance))}`,
     '',
     summary.workTo ? i('Godzina zjazdu i rozliczenie są zapisane.') : i(`Ustaw godzinę zjazdu (teraz ${currentTime}) lub podaj dystans.`),
@@ -267,6 +272,11 @@ export function helpCard(): string {
     ` • ${code('/koniec 23:15 54km 180')} – szybki zjazd (godzina, dystans, stan portfela).`,
     ` • ${code('/anuluj')} – przerwij oczekiwanie na wpis.`,
     '',
+    `💰 ${b('Zarobek i koszty:')}`,
+    ` • ${code('/brutto 438.60')} – zarobek brutto z aplikacji Glovo.`,
+    ` • ${code('/paliwo 312.40 48.2')} – paragon: kwota, litry (opcjonalnie cena/L i data).`,
+    ` • ${code('n 5.50')} – szybki napiwek gotówkowy.`,
+    '',
     `📍 ${b('Lokalizacja:')}`,
     ` • ${code('/lokalizacja')} – wyślij GPS do weryfikacji tras (ważny 30 min).`,
     '',
@@ -283,8 +293,7 @@ export function helpCard(): string {
     ` • ${code('/statystyki')} – statystyki ofert kursów.`,
     ` • ${code('/saldo')} – stan portfela Glovo (suma transakcji).`,
     '',
-    `🪙 ${b('Szybki napiwek:')} wpisz ${code('n 5.50')}`,
     `🎙️ ${b('Głos:')} tankowanie, dystans, godziny, zarobki, napiwki.`,
-    `📸 ${b('Zdjęcia:')} zrzuty Portfela, paragony paliwowe, oferty zleceń.`,
+    `📸 ${b('Zdjęcia:')} zrzuty Portfela, paragony paliwowe, oferty zleceń — rozpoznaję automatycznie.`,
   ]);
 }

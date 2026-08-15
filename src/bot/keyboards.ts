@@ -44,6 +44,10 @@ export const endShiftKeyboard = (currentTime: string, alreadySaved: boolean) =>
       Markup.button.callback('✏️ Inna godzina', 'endshift_custom_time'),
       Markup.button.callback('🚗 Dystans dnia', 'endshift_set_dist'),
     ],
+    [
+      Markup.button.callback('💰 Zarobek brutto', 'endshift_set_gross'),
+      Markup.button.callback('⛽ Paliwo', 'endshift_add_fuel'),
+    ],
     [Markup.button.callback('💵 Stan portfela Glovo', 'endshift_set_cash')],
   ]);
 

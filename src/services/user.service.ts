@@ -5,10 +5,14 @@ import { sql } from 'drizzle-orm';
 /**
  * FIX (4.2): tabela `users` byla martwa. Teraz kazda interakcja z botem robi
  * upsert, dzieki czemu klucze obce z pozostalych tabel maja na czym stac.
- * Cache w pamieci ogranicza zapis do jednego na uzytkownika na godzine.
+ *
+ * Bez cache'a w pamieci — swiadomie.
+ * Pierwsza wersja pomijala zapis, jesli widziala tego uzytkownika w ciagu
+ * ostatniej godziny. Wystarczylo jednak, ze wiersz zniknal z bazy przy zywym
+ * procesie (reset schematu, przywracanie dumpa) i `ensureUser` po cichu nic
+ * nie robil, a kazdy kolejny insert lecial na naruszeniu klucza obcego.
+ * Jeden upsert na wiadomosc to przy tej skali koszt bez znaczenia.
  */
-const RECENTLY_TOUCHED_MS = 60 * 60 * 1000;
-const touchedAt = new Map<string, number>();
 
 export interface TelegramUserInfo {
   id: number | string;
@@ -17,14 +21,10 @@ export interface TelegramUserInfo {
 }
 
 export async function ensureUser(from: TelegramUserInfo): Promise<void> {
-  const telegramId = String(from.id);
-  const last = touchedAt.get(telegramId);
-  if (last && Date.now() - last < RECENTLY_TOUCHED_MS) return;
-
   await db
     .insert(users)
     .values({
-      telegramId,
+      telegramId: String(from.id),
       username: from.username ?? null,
       firstName: from.first_name ?? null,
     })
@@ -36,8 +36,6 @@ export async function ensureUser(from: TelegramUserInfo): Promise<void> {
         lastSeenAt: sql`now()`,
       },
     });
-
-  touchedAt.set(telegramId, Date.now());
 }
 
 /** Uzywane przez skrypty CLI, ktore pisza do bazy poza kontekstem bota. */

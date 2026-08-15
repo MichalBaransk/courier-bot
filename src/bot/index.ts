@@ -46,7 +46,9 @@ type AwaitedInput =
   | 'START_WALLET_BALANCE'
   | 'END_CUSTOM_TIME'
   | 'END_DISTANCE'
-  | 'END_WALLET_BALANCE';
+  | 'END_GROSS'
+  | 'END_WALLET_BALANCE'
+  | 'FUEL_MANUAL';
 
 interface PendingInput {
   kind: AwaitedInput;
@@ -119,6 +121,45 @@ function parseDistance(raw: string): number | null {
   return Number.isFinite(value) && value >= 0 && value < 2000 ? value : null;
 }
 
+interface FuelInput {
+  date: string | null;
+  totalCost: number;
+  liters: number | null;
+  pricePerLiter: number | null;
+}
+
+/**
+ * Reczny wpis paragonu paliwowego z jednej linii.
+ *
+ * Akceptuje kolejno: kwota [litry] [cena/L], z opcjonalna data YYYY-MM-DD
+ * w dowolnym miejscu. Przecinki dziesietne i jednostki sa ignorowane, wiec
+ * "312,40 zl 48,2 L" znaczy to samo co "312.40 48.2".
+ */
+export function parseFuelInput(raw: string): FuelInput | string {
+  let text = raw.trim();
+
+  let date: string | null = null;
+  const dateMatch = text.match(/\d{4}-\d{2}-\d{2}/);
+  if (dateMatch) {
+    if (!isValidDateStr(dateMatch[0])) return 'Nieprawidłowa data — użyj formatu RRRR-MM-DD.';
+    date = dateMatch[0];
+    text = text.replace(dateMatch[0], ' ');
+  }
+
+  const numbers = (text.replace(/,/g, '.').match(/\d+(?:\.\d+)?/g) ?? []).map(Number);
+  const [cost, liters, price] = numbers;
+
+  if (cost == null || !(cost > 0)) return 'Nie znalazłem kwoty. Podaj np. `312.40` albo `312.40 48.2`.';
+  if (cost > 5000) return `Kwota ${cost.toFixed(2)} zł wygląda na pomyłkę — sprawdź paragon.`;
+
+  return {
+    date,
+    totalCost: cost,
+    liters: liters != null && liters > 0 && liters <= 500 ? liters : null,
+    pricePerLiter: price != null && price > 0 && price <= 50 ? price : null,
+  };
+}
+
 /**
  * FIX (3.9): `CFG.MAX_*_BYTES` byly zadeklarowane i nigdy nieuzywane.
  * Plik byl pobierany w calosci do pamieci i kodowany base64 (+33%),
@@ -145,6 +186,37 @@ async function downloadTelegramFile(
     throw new Error(`${label} przekracza limit ${(maxBytes / 1024 / 1024).toFixed(0)} MB.`);
   }
   return buffer;
+}
+
+function fuelPromptText(): string {
+  return joinLines([
+    `⛽ ${b('Wpisz dane z paragonu w jednej linii:')}`,
+    ` • sama kwota: ${code('312.40')}`,
+    ` • kwota i litry: ${code('312.40 48.2')}`,
+    ` • kwota, litry, cena/L: ${code('312.40 48.2 6.48')}`,
+    '',
+    i('Cenę za litr policzę sam, jeśli jej nie podasz. Możesz dopisać datę RRRR-MM-DD.'),
+    i('Możesz też po prostu wysłać zdjęcie paragonu — odczytam je automatycznie.'),
+  ]);
+}
+
+/** Wspolne potwierdzenie zapisu paliwa — dla wpisu recznego i dla OCR-a. */
+async function fuelSavedText(tId: string, date: string, data: FuelInput): Promise<string> {
+  const summary = await financeService.getDailySummary(tId, date);
+  const computedPrice =
+    data.pricePerLiter ?? (data.liters && data.liters > 0 ? data.totalCost / data.liters : null);
+
+  return joinLines([
+    `⛽ ${b('Zapisano tankowanie')}`,
+    `📅 ${b('Data:')} ${code(date)}`,
+    `💰 ${b('Kwota:')} ${b(zl(data.totalCost))}`,
+    data.liters != null && `🛢️ ${b('Litry:')} ${b(`${data.liters.toFixed(2)} L`)}`,
+    computedPrice != null &&
+      `🏷️ ${b('Cena za litr:')} ${b(`${computedPrice.toFixed(2)} zł/L`)}` +
+        (data.pricePerLiter == null ? ` ${i('(wyliczona)')}` : ''),
+    summary.fuelReceiptCount > 1 &&
+      `\n📊 ${i(`Tego dnia masz już ${summary.fuelReceiptCount} paragony — razem ${zl(summary.fuelCost)}.`)}`,
+  ]);
 }
 
 async function shiftCardPayload(tId: string, date: string, mode: 'START' | 'END') {
@@ -366,7 +438,7 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.reply(text, { ...HTML, ...keyboard });
   });
 
-  bot.action(/^endshift_(set_now|custom_time|set_dist|set_cash)$/, async (ctx) => {
+  bot.action(/^endshift_(set_now|custom_time|set_dist|set_gross|add_fuel|set_cash)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const action = ctx.match[1];
     const tId = String(ctx.from.id);
@@ -397,6 +469,24 @@ export function registerBotHandlers(bot: Telegraf): void {
       return;
     }
 
+    if (action === 'set_gross') {
+      setAwaiting(tId, 'END_GROSS');
+      await ctx.reply(
+        joinLines([
+          `💰 ${b('Wpisz zarobek BRUTTO z aplikacji Glovo')} (np. ${code('438.60')}).`,
+          i(`Netto policzy się samo: ${(CFG.NETTO_FACTOR * 100).toFixed(1)}% kwoty brutto.`),
+        ]),
+        { ...HTML, ...cancelInputKeyboard() }
+      );
+      return;
+    }
+
+    if (action === 'add_fuel') {
+      setAwaiting(tId, 'FUEL_MANUAL');
+      await ctx.reply(fuelPromptText(), { ...HTML, ...cancelInputKeyboard() });
+      return;
+    }
+
     setAwaiting(tId, 'END_WALLET_BALANCE');
     await ctx.reply(
       `💵 ${b('Wpisz aktualny stan portfela z aplikacji Glovo')} (np. ${code('142.50')}).\n${i('Różnica zapisze się jako korekta.')}`,
@@ -408,6 +498,65 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.answerCbQuery('Anulowano.');
     awaitingInput.delete(String(ctx.from.id));
     await ctx.editMessageText('✖️ Anulowano oczekiwanie na wpis.');
+  });
+
+  // === 3b. Zarobek brutto i paliwo — komendy skrótowe ========================
+
+  bot.command(['brutto', 'zarobek'], async (ctx) => {
+    const param = ctx.message.text.trim().split(/\s+/)[1];
+    const tId = String(ctx.from.id);
+    const date = financeService.getEffectiveDate();
+
+    if (!param) {
+      setAwaiting(tId, 'END_GROSS');
+      await ctx.reply(`💰 ${b('Wpisz zarobek brutto')} (np. ${code('438.60')}):`, {
+        ...HTML,
+        ...cancelInputKeyboard(),
+      });
+      return;
+    }
+
+    const value = parseAmount(param);
+    if (value == null || value < 0) {
+      await ctx.reply(`❌ Nieprawidłowa kwota. Użyj np. ${code('/brutto 438.60')}.`, HTML);
+      return;
+    }
+
+    await financeService.setGrossEarnings(tId, date, value);
+    const summary = await financeService.getDailySummary(tId, date);
+    await ctx.reply(
+      joinLines([
+        `✅ ${b('Zarobek brutto zapisany:')} ${b(zl(value))}`,
+        `💵 ${b('Netto ze zleceń:')} ${b(zl(summary.netEarnings))}`,
+        `🏁 ${b('Netto łącznie:')} ${b(zl(summary.totalNetto))}`,
+      ]),
+      HTML
+    );
+  });
+
+  bot.command(['paliwo', 'tankowanie'], async (ctx) => {
+    const rest = ctx.message.text.trim().split(/\s+/).slice(1).join(' ');
+    const tId = String(ctx.from.id);
+
+    if (!rest) {
+      setAwaiting(tId, 'FUEL_MANUAL');
+      await ctx.reply(fuelPromptText(), { ...HTML, ...cancelInputKeyboard() });
+      return;
+    }
+
+    const parsed = parseFuelInput(rest);
+    if (typeof parsed === 'string') {
+      await ctx.reply(`❌ ${h(parsed)}`, HTML);
+      return;
+    }
+
+    const fuelDate = parsed.date ?? financeService.getEffectiveDate();
+    await financeService.saveFuelReceipt(tId, fuelDate, {
+      totalCost: parsed.totalCost,
+      liters: parsed.liters,
+      pricePerLiter: parsed.pricePerLiter,
+    });
+    await ctx.reply(await fuelSavedText(tId, fuelDate, parsed), HTML);
   });
 
   // === 4. Lokalizacja ========================================================
@@ -636,6 +785,43 @@ export function registerBotHandlers(bot: Telegraf): void {
           awaitingInput.delete(tId);
           await financeService.setDailyDistance(tId, date, distance);
           await ctx.reply(`✅ ${b(`Dystans dnia ${distance.toFixed(1)} km zapisany.`)}`, HTML);
+          return;
+        }
+
+        case 'END_GROSS': {
+          const value = parseAmount(rawText);
+          if (value == null || value < 0) {
+            await ctx.reply(`❌ Podaj kwotę brutto (np. ${code('438.60')}) albo ${code('/anuluj')}.`, HTML);
+            return;
+          }
+          awaitingInput.delete(tId);
+          await financeService.setGrossEarnings(tId, date, value);
+          const summary = await financeService.getDailySummary(tId, date);
+          await ctx.reply(
+            joinLines([
+              `✅ ${b('Zarobek brutto zapisany:')} ${b(zl(value))}`,
+              `💵 ${b('Netto ze zleceń:')} ${b(zl(summary.netEarnings))}`,
+              summary.workHours > 0 && `⏱️ ${b('Stawka:')} ${b(`${summary.hourlyRateNetto.toFixed(2)} zł netto/h`)}`,
+            ]),
+            HTML
+          );
+          return;
+        }
+
+        case 'FUEL_MANUAL': {
+          const parsed = parseFuelInput(rawText);
+          if (typeof parsed === 'string') {
+            await ctx.reply(`❌ ${h(parsed)} Albo ${code('/anuluj')}.`, HTML);
+            return;
+          }
+          awaitingInput.delete(tId);
+          const fuelDate = parsed.date ?? date;
+          await financeService.saveFuelReceipt(tId, fuelDate, {
+            totalCost: parsed.totalCost,
+            liters: parsed.liters,
+            pricePerLiter: parsed.pricePerLiter,
+          });
+          await ctx.reply(await fuelSavedText(tId, fuelDate, parsed), HTML);
           return;
         }
 
@@ -927,18 +1113,15 @@ export function registerBotHandlers(bot: Telegraf): void {
           pricePerLiter: receipt.pricePerLiter,
         });
 
-        const summary = await financeService.getDailySummary(tId, date);
-
+        // Ta sama tresc potwierdzenia co przy wpisie recznym.
         await editProcessing(
-          joinLines([
-            `🧾 ${b('Zarejestrowano paragon paliwowy:')}`,
-            `📅 ${b('Data:')} ${code(date)}`,
-            `💰 ${b('Kwota:')} ${b(zl(receipt.totalCost))}`,
-            receipt.liters != null && `⛽ ${b('Litry:')} ${b(`${receipt.liters.toFixed(2)} L`)}`,
-            receipt.pricePerLiter != null && `🏷️ ${b('Cena za litr:')} ${b(`${receipt.pricePerLiter.toFixed(2)} zł/L`)}`,
-            summary.fuelReceiptCount > 1 &&
-              `\n📊 ${i(`Tego dnia zapisano już ${summary.fuelReceiptCount} paragony — razem ${zl(summary.fuelCost)}.`)}`,
-          ])
+          `🧾 ${i('odczytano z paragonu')}\n` +
+            (await fuelSavedText(tId, date, {
+              date,
+              totalCost: receipt.totalCost,
+              liters: receipt.liters,
+              pricePerLiter: receipt.pricePerLiter,
+            }))
         );
         return;
       }
