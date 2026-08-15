@@ -27,64 +27,41 @@ export interface CourseOfferExtractedData {
   appDistanceKm?: number | null;
 }
 
+export interface WalletTransactionItem {
+  date: string; // YYYY-MM-DD
+  time: string; // HH:MM
+  type: 'pobranie' | 'wyplata' | 'wyplata_gotowka' | 'platnosc_punkt' | 'korekta';
+  amount: number;
+  externalId?: string | null;
+}
+
 const voiceExtractionSchema: Schema = {
   type: Type.OBJECT,
   properties: {
     transcription: {
       type: Type.STRING,
-      description: 'Precyzyjna, dosłowna transkrypcja wypowiedzi kuriera w języku polskim.',
+      description: 'Dosłowna transkrypcja wypowiedzi w języku polskim.',
     },
     action: {
       type: Type.STRING,
       enum: ['UPSERT', 'DELETE'],
-      description: 'Określa, czy kurier dodaje/aktualizuje dane (UPSERT), czy chce usunąć/skasować/cofnąć wpis (DELETE).',
     },
     deleteTarget: {
       type: Type.STRING,
       enum: ['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'ALL_DAY'],
       nullable: true,
-      description: 'Obiekt do usunięcia: LAST_TIP (ostatni napiwek), ALL_TIPS (wszystkie napiwki z danego dnia), FUEL (dane tankowania i licznik), HOURS (godziny pracy), EARNINGS (zarobki brutto), ALL_DAY (cały rekord dnia i powiązane napiwki).',
     },
     targetDate: {
       type: Type.STRING,
       nullable: true,
-      description: 'Dzień, którego dotyczy akcja: "TODAY" (dzisiaj), "YESTERDAY" (wczoraj) lub data w formacie YYYY-MM-DD.',
     },
-    fuelPrice: {
-      type: Type.NUMBER,
-      nullable: true,
-      description: 'Kwota zapłacona za paliwo w PLN (np. 75 dla 75 zł).',
-    },
-    fuelLiters: {
-      type: Type.NUMBER,
-      nullable: true,
-      description: 'Liczba zatankowanych litrów paliwa (np. 11.2).',
-    },
-    fuelDistance: {
-      type: Type.INTEGER,
-      nullable: true,
-      description: 'Stan licznika / całkowity przebieg pojazdu w km (np. 24300).',
-    },
-    grossEarnings: {
-      type: Type.NUMBER,
-      nullable: true,
-      description: 'Zarobek brutto w PLN jeśli podano.',
-    },
-    workFrom: {
-      type: Type.STRING,
-      nullable: true,
-      description: 'Godzina rozpoczęcia pracy w formacie HH:MM.',
-    },
-    workTo: {
-      type: Type.STRING,
-      nullable: true,
-      description: 'Godzina zakończenia pracy w formacie HH:MM.',
-    },
-    cashTip: {
-      type: Type.NUMBER,
-      nullable: true,
-      description: 'Kwota napiwku gotówkowego w PLN.',
-    },
+    fuelPrice: { type: Type.NUMBER, nullable: true },
+    fuelLiters: { type: Type.NUMBER, nullable: true },
+    fuelDistance: { type: Type.INTEGER, nullable: true },
+    grossEarnings: { type: Type.NUMBER, nullable: true },
+    workFrom: { type: Type.STRING, nullable: true },
+    workTo: { type: Type.STRING, nullable: true },
+    cashTip: { type: Type.NUMBER, nullable: true },
   },
   required: ['transcription', 'action'],
 };
@@ -92,21 +69,9 @@ const voiceExtractionSchema: Schema = {
 const fuelReceiptSchema: Schema = {
   type: Type.OBJECT,
   properties: {
-    date: {
-      type: Type.STRING,
-      nullable: true,
-      description: 'Data transakcji z paragonu w formacie YYYY-MM-DD.',
-    },
-    fuelPrice: {
-      type: Type.NUMBER,
-      nullable: true,
-      description: 'Łączna kwota do zapłaty (Suma PLN) za paliwo.',
-    },
-    fuelLiters: {
-      type: Type.NUMBER,
-      nullable: true,
-      description: 'Ilość zatankowanego paliwa w litrach.',
-    },
+    date: { type: Type.STRING, nullable: true },
+    fuelPrice: { type: Type.NUMBER, nullable: true },
+    fuelLiters: { type: Type.NUMBER, nullable: true },
   },
   required: ['fuelPrice'],
 };
@@ -114,25 +79,50 @@ const fuelReceiptSchema: Schema = {
 const courseOfferSchema: Schema = {
   type: Type.OBJECT,
   properties: {
-    grossAmount: {
-      type: Type.NUMBER,
-      description: 'Kwota wynagrodzenia brutto dla kuriera za realizację zlecenia. Ignoruj kwoty "POTRZEBNA GOTÓWKA", "ZAPŁAĆ" i "ODBIERZ".',
-    },
-    pickupAddress: {
-      type: Type.STRING,
-      description: 'Adres lub nazwa punktu odbioru (restauracja / sklep).',
-    },
-    deliveryAddress: {
-      type: Type.STRING,
-      description: 'Adres doręczenia do klienta.',
-    },
-    appDistanceKm: {
-      type: Type.NUMBER,
-      nullable: true,
-      description: 'Szacowany dystans w kilometrach, jeśli jest podany na zrzucie ekranu.',
-    },
+    grossAmount: { type: Type.NUMBER },
+    pickupAddress: { type: Type.STRING },
+    deliveryAddress: { type: Type.STRING },
+    appDistanceKm: { type: Type.NUMBER, nullable: true },
   },
   required: ['grossAmount', 'pickupAddress', 'deliveryAddress'],
+};
+
+const walletScreenSchema: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    transactions: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          date: {
+            type: Type.STRING,
+            description: 'Data w formacie YYYY-MM-DD na podstawie nagłówka sekcji (np. "czw., 6 sierpnia" -> 2026-08-06).',
+          },
+          time: {
+            type: Type.STRING,
+            description: 'Godzina transakcji w formacie HH:MM (np. 15:50).',
+          },
+          type: {
+            type: Type.STRING,
+            enum: ['pobranie', 'wyplata', 'wyplata_gotowka', 'platnosc_punkt', 'korekta'],
+            description: 'Dokładny typ: "Pobranie gotówki od klienta" -> pobranie, "Wypłata" -> wyplata, "Wypłata w gotówce" -> wyplata_gotowka, "Płatność w punkcie" -> platnosc_punkt, "Korekta" -> korekta.',
+          },
+          amount: {
+            type: Type.NUMBER,
+            description: 'Kwota ze znakiem (ujemna jeśli jest minus, np. -180.60 dla wypłaty, 63.34 dla pobrania).',
+          },
+          externalId: {
+            type: Type.STRING,
+            nullable: true,
+            description: 'Identyfikator transakcji (długi ciąg cyfr, np. 101735350998).',
+          },
+        },
+        required: ['date', 'time', 'type', 'amount'],
+      },
+    },
+  },
+  required: ['transactions'],
 };
 
 export class GeminiService {
@@ -147,22 +137,11 @@ export class GeminiService {
   async parseVoiceNote(audioBuffer: Buffer, mimeType = 'audio/ogg'): Promise<VoiceExtractedData> {
     const base64Audio = audioBuffer.toString('base64');
     const prompt = `
-Jesteś asystentem kuriera dostarczającego zamówienia. Przeanalizuj nagranie audio nagrane podczas jazdy.
-Rozpoznaj intencję kuriera:
-1. DODANIE/AKTUALIZACJA (action: 'UPSERT'):
-   - Tankowanie: koszt PLN, litry, licznik km.
-   - Godziny pracy: zakres od-do (HH:MM).
-   - Finanse: zarobek brutto lub napiwek gotówkowy.
-2. USUWANIE/COFANIE (action: 'DELETE'):
-   - "Cofnij / usuń ostatni napiwek" -> deleteTarget: 'LAST_TIP'
-   - "Usuń wszystkie napiwki z dzisiaj/wczoraj" -> deleteTarget: 'ALL_TIPS'
-   - "Skasuj / usuń tankowanie / wyczyść paliwo" -> deleteTarget: 'FUEL'
-   - "Usuń godziny / czas pracy" -> deleteTarget: 'HOURS'
-   - "Cofnij / skasuj zarobek" -> deleteTarget: 'EARNINGS'
-   - "Usuń cały dzisiejszy / wczorajszy wpis" -> deleteTarget: 'ALL_DAY'
-   - targetDate: 'TODAY', 'YESTERDAY' lub konkretna data w formacie YYYY-MM-DD, jeśli podano.
-
-Ignoruj hałas otoczenia, wiatr i wydech. Przypisz wartości do właściwych pól schematu JSON.
+Jesteś asystentem kuriera. Przeanalizuj nagranie audio.
+Rozpoznaj akcję:
+- UPSERT: tankowanie (koszt, litry, licznik), godziny od-do, zarobki brutto, napiwek gotówkowy.
+- DELETE: 'LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'ALL_DAY'.
+Ignoruj szum wiatru i wydechu motocykla.
 `;
 
     const response = await this.ai.models.generateContent({
@@ -183,20 +162,14 @@ Ignoruj hałas otoczenia, wiatr i wydech. Przypisz wartości do właściwych pó
       },
     });
 
-    const text = response.text;
-    if (!text) throw new Error('Gemini API zwróciło pustą odpowiedź dla pliku audio.');
-    return JSON.parse(text) as VoiceExtractedData;
+    return JSON.parse(response.text || '{}') as VoiceExtractedData;
   }
 
   async extractFuelReceipt(imageBuffer: Buffer, mimeType = 'image/jpeg'): Promise<FuelReceiptExtractedData> {
     const base64Image = imageBuffer.toString('base64');
     const prompt = `
-Przeanalizuj zdjęcie paragonu/faktury za paliwo.
-Wyciągnij:
-- Łączną kwotę do zapłaty (PLN)
-- Ilość zatankowanych litrów
-- Datę transakcji (YYYY-MM-DD)
-Ignoruj kody CN, numery stacji benzynowej, numery dystrybutorów oraz oznaczenia oktanowe (PB95, ON, 98).
+Przeanalizuj paragon paliwowy. Wyciągnij: łączną kwotę w PLN, ilość litrów, datę (YYYY-MM-DD).
+Ignoruj kody CN, numery stacji i oznaczenia 95/98.
 `;
 
     const response = await this.ai.models.generateContent({
@@ -217,21 +190,14 @@ Ignoruj kody CN, numery stacji benzynowej, numery dystrybutorów oraz oznaczenia
       },
     });
 
-    const text = response.text;
-    if (!text) throw new Error('Gemini API zwróciło pustą odpowiedź dla paragonu.');
-    return JSON.parse(text) as FuelReceiptExtractedData;
+    return JSON.parse(response.text || '{}') as FuelReceiptExtractedData;
   }
 
   async analyzeCourseOffer(imageBuffer: Buffer, mimeType = 'image/jpeg'): Promise<CourseOfferExtractedData> {
     const base64Image = imageBuffer.toString('base64');
     const prompt = `
-Przeanalizuj zrzut ekranu oferty kursu z aplikacji kurierskiej Glovo.
-Wyciągnij:
-1. Kwotę wynagrodzenia brutto dla kuriera za realizację zlecenia.
-   Pomiń etykiety "POTRZEBNA GOTÓWKA" i "ZAPŁAĆ" (pobrania gotówkowe od klienta).
-2. Adres/nazwę punktu odbioru (restauracja / sklep).
-3. Adres doręczenia do klienta.
-4. Szacowany dystans w km, jeśli występuje.
+Przeanalizuj ofertę kursu Glovo.
+Wyciągnij: kwotę brutto za kurs (ignoruj "POTRZEBNA GOTÓWKA" i "ZAPŁAĆ"), adres odbioru, adres klienta, szacowany dystans km.
 `;
 
     const response = await this.ai.models.generateContent({
@@ -252,9 +218,98 @@ Wyciągnij:
       },
     });
 
-    const text = response.text;
-    if (!text) throw new Error('Gemini API zwróciło pustą odpowiedź dla zrzutu ekranu.');
-    return JSON.parse(text) as CourseOfferExtractedData;
+    return JSON.parse(response.text || '{}') as CourseOfferExtractedData;
+  }
+
+  /**
+   * Vision: OCR zrzutów ekranu Portfela Glovo (lista transakcji).
+   */
+  async analyzeWalletScreenshot(
+    imageBuffer: Buffer,
+    currentYear = new Date().getFullYear(),
+    mimeType = 'image/jpeg'
+  ): Promise<WalletTransactionItem[]> {
+    const base64Image = imageBuffer.toString('base64');
+    const prompt = `
+Przeanalizuj zrzut ekranu "Portfel" z aplikacji Glovo. Bieżący rok to ${currentYear}.
+Wyodrębnij wszystkie widoczne transakcje z listy:
+- Nagłówek dnia (np. "Dzisiaj, 11 sierpnia" -> ${currentYear}-08-11, "czw., 6 sierpnia" -> ${currentYear}-08-06, "niedz., 26 lipca" -> ${currentYear}-07-26).
+- Typ pozycji:
+  • "Pobranie gotówki od klienta" -> pobranie (kwota dodatnia, np. 35.99)
+  • "Wypłata" -> wyplata (kwota ujemna, np. -174.89)
+  • "Wypłata w gotówce" -> wyplata_gotowka (kwota ujemna, np. -100.00)
+  • "Płatność w punkcie" -> platnosc_punkt (kwota ujemna, np. -255.69)
+  • "Korekta" -> korekta (kwota ze znakiem, np. -2.78)
+- Godzina: format HH:MM pod nazwą.
+- ID transakcji: ciąg cyfr po kropce obok godziny (np. 101735350998). Jeśli brak, zwróć null.
+- IGNORUJ wiersze podsumowania "Łączna kwota w gotówce".
+`;
+
+    const response = await this.ai.models.generateContent({
+      model: this.model,
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { inlineData: { mimeType, data: base64Image } },
+            { text: prompt },
+          ],
+        },
+      ],
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: walletScreenSchema,
+        temperature: 0.1,
+      },
+    });
+
+    const parsed = JSON.parse(response.text || '{}') as { transactions?: WalletTransactionItem[] };
+    return parsed.transactions || [];
+  }
+
+  /**
+   * Automatyczna klasyfikacja rodzaju przesłanego obrazu.
+   */
+  async classifyImage(imageBuffer: Buffer, caption = '', mimeType = 'image/jpeg'): Promise<'WALLET' | 'FUEL' | 'OFFER'> {
+    const lowerCaption = caption.toLowerCase();
+    if (lowerCaption.includes('portfel')) return 'WALLET';
+    if (lowerCaption.includes('paragon') || lowerCaption.includes('paliwo') || lowerCaption.includes('stacja')) return 'FUEL';
+
+    const base64Image = imageBuffer.toString('base64');
+    const prompt = `
+Rozpoznaj typ ekranu:
+- WALLET (ekran z nagłówkiem "Portfel", listą transakcji: Pobranie gotówki, Wypłata, Płatność w punkcie)
+- FUEL (paragon ze stacji paliw, faktura Orlen/CircleK/itp.)
+- OFFER (nowa oferta zlecenia Glovo z mapą, trasą i zieloną kwotą)
+Zwróć obiekt JSON z polem "category": "WALLET" | "FUEL" | "OFFER".
+`;
+
+    const response = await this.ai.models.generateContent({
+      model: this.model,
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { inlineData: { mimeType, data: base64Image } },
+            { text: prompt },
+          ],
+        },
+      ],
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            category: { type: Type.STRING, enum: ['WALLET', 'FUEL', 'OFFER'] },
+          },
+          required: ['category'],
+        },
+        temperature: 0.0,
+      },
+    });
+
+    const res = JSON.parse(response.text || '{}') as { category?: 'WALLET' | 'FUEL' | 'OFFER' };
+    return res.category || 'OFFER';
   }
 }
 

@@ -55,14 +55,18 @@ export const walletTransactions = pgTable(
     telegramId: text('telegram_id').notNull(),
     date: date('date').notNull(),
     time: text('time'),
-    type: text('type').notNull(),
+    type: text('type').notNull(), // 'pobranie' | 'wyplata' | 'wyplata_gotowka' | 'platnosc_punkt' | 'korekta'
     amount: numeric('amount', { precision: 10, scale: 2 }).notNull(),
     externalId: text('external_id'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
   },
   (table) => ({
-    extIdIdx: uniqueIndex('wallet_tx_user_ext_idx').on(
+    walletTxDedupIdx: uniqueIndex('wallet_tx_dedup_idx').on(
       table.telegramId,
+      table.date,
+      table.time,
+      table.type,
+      table.amount,
       table.externalId
     ),
   })
@@ -108,7 +112,7 @@ export const earningTargets = pgTable(
     periodType: text('period_type').notNull(), // 'MONTHLY' | 'WEEKLY'
     targetAmount: numeric('target_amount', { precision: 10, scale: 2 }).notNull(),
     year: integer('year').notNull(),
-    periodValue: integer('period_value').notNull(), // Miesiąc (1-12) lub Tydzień (1-53)
+    periodValue: integer('period_value').notNull(),
     createdAt: timestamp('created_at').defaultNow().notNull(),
   },
   (table) => ({
