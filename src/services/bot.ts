@@ -2,7 +2,7 @@ import { Telegraf, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { geminiService, WalletTransactionItem } from './gemini.service.js';
 import { financeService, TargetProgress, DailySummary } from './finance.service.js';
-import { mapsService } from './maps.service.js';
+import { verifyOfferDistance } from './maps.service.js';
 import { CFG } from '../config.js';
 
 interface CourierLocation {
@@ -13,8 +13,6 @@ interface CourierLocation {
 
 const lastCourierLocation: Map<string, CourierLocation> = new Map();
 const pendingWalletImports: Map<string, { transactions: WalletTransactionItem[]; expiresAt: number }> = new Map();
-
-// Trzymamy tylko oczekujące wpisy tekstowe (proste flagi)
 const awaitingInput: Map<string, 'START_CUSTOM_TIME' | 'START_CASH' | 'END_CUSTOM_TIME' | 'END_DIST' | 'END_CASH'> = new Map();
 
 function getCurrentWarsawTime(): string {
@@ -83,6 +81,7 @@ async function renderStartShiftCard(telegramId: string | number, date: string): 
 
 async function renderEndShiftCard(telegramId: string | number, date: string): Promise<string> {
   const summary = await financeService.getDailySummary(telegramId, date);
+  const rolling = await financeService.getRollingBalance(telegramId, date);
   const currentTime = getCurrentWarsawTime();
 
   return [
@@ -90,12 +89,13 @@ async function renderEndShiftCard(telegramId: string | number, date: string): Pr
     `📅 *Data zmiany:* \`${date}\``,
     '',
     `⏱️ *Godziny pracy:* \`${summary.workFrom || '--:--'} - ${summary.workTo || '--:--'}\` (*${summary.workHours.toFixed(2)} h*)`,
-    `🚗 *Stan licznika / Dystans:* *${summary.fuelDistance ? summary.fuelDistance + ' km' : '_Brak_'}*`,
+    `🚗 *Stan licznika / Dystans:* *${summary.fuelDistance != null ? summary.fuelDistance + ' km' : '_Brak_'}*`,
     `💰 *Zarobek brutto:* *${summary.grossEarnings.toFixed(2)} zł*`,
     `💵 *Czyste Netto:* *${summary.totalNetto.toFixed(2)} zł* (Stawka: *${summary.hourlyRateNetto.toFixed(2)} zł/h*)`,
+    `💼 *Stan portfela Glovo:* *${rolling.balance.toFixed(2)} zł*`,
     '',
     summary.workTo
-      ? '✅ _Godzina zjazdu została zapisana w bazie._'
+      ? '✅ _Godzina zjazdu i rozliczenie są zapisane w bazie._'
       : `⏱️ _Ustaw godzinę zjazdu (teraz: ${currentTime}) lub podaj przebieg:_`,
   ].join('\n');
 }
@@ -178,11 +178,13 @@ export function registerBotHandlers(bot: Telegraf): void {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
         [
-          Markup.button.callback(`⏱️ Ustaw zjazd teraz (${currentTime})`, 'endshift_set_now'),
-          Markup.button.callback('✏️ Inna godzina', 'endshift_custom_time'),
+          Markup.button.callback(`⏱️ Zapisz zjazd teraz (${currentTime})`, 'endshift_set_now'),
         ],
         [
-          Markup.button.callback('🚗 Podaj dystans / licznik', 'endshift_set_dist'),
+          Markup.button.callback('✏️ Inna godzina', 'endshift_custom_time'),
+          Markup.button.callback('🚗 Dystans / licznik', 'endshift_set_dist'),
+        ],
+        [
           Markup.button.callback('💵 Stan gotówki Glovo', 'endshift_set_cash'),
         ],
       ]),
@@ -230,7 +232,6 @@ export function registerBotHandlers(bot: Telegraf): void {
     const parts = ctx.message.text.trim().split(/\s+/);
     const effDate = financeService.getEffectiveDate();
 
-    // Szybka ścieżka: /wyjazd 17:30 150
     if (parts.length > 1) {
       let workFrom = getCurrentWarsawTime();
       let initialCash: number | null = null;
@@ -267,7 +268,6 @@ export function registerBotHandlers(bot: Telegraf): void {
       return;
     }
 
-    // Panel startu
     const currentTime = getCurrentWarsawTime();
     const text = await renderStartShiftCard(ctx.from.id, effDate);
     await ctx.reply(text, {
@@ -326,7 +326,6 @@ export function registerBotHandlers(bot: Telegraf): void {
     const parts = ctx.message.text.trim().split(/\s+/);
     const effDate = financeService.getEffectiveDate();
 
-    // Szybka ścieżka: /koniec 23:15 54 180
     if (parts.length > 1) {
       let workTo: string | null = null;
       let fuelDistance: number | null = null;
@@ -351,7 +350,7 @@ export function registerBotHandlers(bot: Telegraf): void {
       });
 
       const response = [
-        '🏁 *Zmiana została zamknięta!*',
+        '🏁 *Zmiana została pomyślnie zamknięta!*',
         '',
         `📅 *Data:* \`${summary.date}\``,
         summary.workFrom && summary.workTo ? `⏱️ *Godziny:* \`${summary.workFrom} - ${summary.workTo}\` (*${summary.workHours.toFixed(2)} h*)` : '',
@@ -361,7 +360,7 @@ export function registerBotHandlers(bot: Telegraf): void {
         `🪙 *Napiwki gotówka:* *+${summary.cashTipsTotal.toFixed(2)} zł*`,
         summary.walletPayouts > 0 ? `🏧 *Wypłaty portfel:* *-${summary.walletPayouts.toFixed(2)} zł*` : '',
         `💳 *Do przelewu:* *${summary.doPrzelewu.toFixed(2)} zł*`,
-        walletCash != null ? `💼 *Portfel Glovo:* *${walletCash.toFixed(2)} zł*` : '',
+        walletCash != null ? `💼 *Ustawiono stan portfela:* *${walletCash.toFixed(2)} zł*` : '',
       ]
         .filter(Boolean)
         .join('\n');
@@ -370,18 +369,19 @@ export function registerBotHandlers(bot: Telegraf): void {
       return;
     }
 
-    // Panel zjazdu
     const currentTime = getCurrentWarsawTime();
     const text = await renderEndShiftCard(ctx.from.id, effDate);
     await ctx.reply(text, {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
         [
-          Markup.button.callback(`⏱️ Ustaw zjazd teraz (${currentTime})`, 'endshift_set_now'),
-          Markup.button.callback('✏️ Inna godzina', 'endshift_custom_time'),
+          Markup.button.callback(`⏱️ Zapisz zjazd teraz (${currentTime})`, 'endshift_set_now'),
         ],
         [
-          Markup.button.callback('🚗 Podaj dystans / licznik', 'endshift_set_dist'),
+          Markup.button.callback('✏️ Inna godzina', 'endshift_custom_time'),
+          Markup.button.callback('🚗 Dystans / licznik', 'endshift_set_dist'),
+        ],
+        [
           Markup.button.callback('💵 Stan gotówki Glovo', 'endshift_set_cash'),
         ],
       ]),
@@ -404,11 +404,13 @@ export function registerBotHandlers(bot: Telegraf): void {
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([
           [
-            Markup.button.callback(`⏱️ Odśwież (${getCurrentWarsawTime()})`, 'endshift_set_now'),
-            Markup.button.callback('✏️ Inna godzina', 'endshift_custom_time'),
+            Markup.button.callback(`⏱️ Odśwież zjazd (${getCurrentWarsawTime()})`, 'endshift_set_now'),
           ],
           [
-            Markup.button.callback('🚗 Podaj dystans', 'endshift_set_dist'),
+            Markup.button.callback('✏️ Popraw godzinę', 'endshift_custom_time'),
+            Markup.button.callback('🚗 Dystans / licznik', 'endshift_set_dist'),
+          ],
+          [
             Markup.button.callback('💵 Stan gotówki Glovo', 'endshift_set_cash'),
           ],
         ]),
@@ -424,18 +426,18 @@ export function registerBotHandlers(bot: Telegraf): void {
 
     if (action === 'set_dist') {
       awaitingInput.set(tId, 'END_DIST');
-      await ctx.reply('🚗 *Wpisz stan licznika lub dystans w km* (np. `48`):', { parse_mode: 'Markdown' });
+      await ctx.reply('🚗 *Wpisz stan licznika lub przejechany dystans w km* (np. `48`):', { parse_mode: 'Markdown' });
       return;
     }
 
     if (action === 'set_cash') {
       awaitingInput.set(tId, 'END_CASH');
-      await ctx.reply('💵 *Wpisz stan gotówki w aplikacji Glovo* (np. `142.50`):', { parse_mode: 'Markdown' });
+      await ctx.reply('💵 *Wpisz aktualny stan gotówki z aplikacji Glovo* (np. `142.50`):', { parse_mode: 'Markdown' });
       return;
     }
   });
 
-  // 4. Obsługa wpisów tekstowych z klawiatury
+  // 4. Obsługa wpisów tekstowych z klawiatury (Rozwiązanie problemu braku reakcji)
   bot.on(message('text'), async (ctx, next) => {
     const tId = String(ctx.from.id);
     const rawText = ctx.message.text.trim();
@@ -475,7 +477,7 @@ export function registerBotHandlers(bot: Telegraf): void {
           awaitingInput.delete(tId);
           const summary = await financeService.setShiftEnd(tId, effDate, { workTo: time });
           await ctx.reply(
-            `✅ *Godzina zjazdu ${time} zapisana!* Czas pracy dzisiaj: *${summary.workHours.toFixed(2)} h*`,
+            `✅ *Godzina zjazdu ${time} zapisana w bazie!* Czas pracy dzisiaj: *${summary.workHours.toFixed(2)} h*`,
             { parse_mode: 'Markdown' }
           );
           return;
@@ -532,7 +534,7 @@ export function registerBotHandlers(bot: Telegraf): void {
     return next();
   });
 
-  // 5. Lokalizacja GPS
+  // 5. Geolokalizacja
   bot.command('lokalizacja', async (ctx) => {
     await ctx.reply(
       '📍 *Kliknij przycisk poniżej*, aby udostępnić lokalizację GPS. Będzie używana do weryfikacji tras ofert Glovo przez 30 minut.',
@@ -576,8 +578,8 @@ export function registerBotHandlers(bot: Telegraf): void {
       `💳 *Do przelewu (bez gotówki):* *${summary.doPrzelewu.toFixed(2)} zł*`,
       '',
       summary.workHours > 0
-        ? `⏱ *Czas pracy:* \`${summary.workFrom || '--:--'} - ${summary.workTo || '--:--'}\` (*${summary.workHours.toFixed(2)} h*) — Stawka: *${summary.hourlyRateNetto.toFixed(2)} zł/h*`
-        : '⏱ *Czas pracy:* _Brak pełnego wpisu_',
+        ? `⏱️ *Czas pracy:* \`${summary.workFrom || '--:--'} - ${summary.workTo || '--:--'}\` (*${summary.workHours.toFixed(2)} h*) — Stawka: *${summary.hourlyRateNetto.toFixed(2)} zł/h*`
+        : '⏱️ *Czas pracy:* _Brak pełnego wpisu_',
       '',
       summary.fuelPrice > 0
         ? `⛽ *Paliwo:* *${summary.fuelPrice.toFixed(2)} zł* (${summary.fuelLiters.toFixed(2)} L)`
@@ -764,17 +766,17 @@ export function registerBotHandlers(bot: Telegraf): void {
     }
 
     let periodType: 'MONTHLY' | 'WEEKLY' = 'MONTHLY';
-    let amountStr = textParts[1] || '';
+    let amountStr = textParts[1];
 
     if (textParts.length >= 3) {
       const sub = textParts[1]?.toLowerCase();
       if (sub && ['tydzien', 'week', 'w'].includes(sub)) {
         periodType = 'WEEKLY';
       }
-      amountStr = textParts[2] || '';
+      amountStr = textParts[2];
     }
 
-    const targetAmount = parseFloat(amountStr.replace(',', '.'));
+    const targetAmount = parseFloat(amountStr ? amountStr.replace(',', '.') : '0');
     if (isNaN(targetAmount) || targetAmount <= 0) {
       await ctx.reply('❌ Błędna kwota. Użyj np. `/cel 4000` lub `/cel tydzien 1200`.');
       return;
@@ -824,7 +826,8 @@ export function registerBotHandlers(bot: Telegraf): void {
 
   // 13. Szybkie napiwki (Regex: "n 5.5", "np 3", "napiwek 10")
   bot.hears(/^(?:n|np|napiwek)\s+(\d+(?:[.,]\d+)?)$/i, async (ctx) => {
-    const rawAmount = ctx.match[1]?.replace(',', '.') || '0';
+    const match = ctx.match[1];
+    const rawAmount = match ? match.replace(',', '.') : '0';
     const tipAmount = parseFloat(rawAmount);
 
     if (isNaN(tipAmount) || tipAmount <= 0) return;
@@ -932,7 +935,7 @@ export function registerBotHandlers(bot: Telegraf): void {
     }
   });
 
-  // 16. Vision: Zdjęcia
+  // 16. Vision: Zdjęcia (Portfel Glovo, Paragony Paliwowe, Oferty Zleceń)
   bot.on(message('photo'), async (ctx) => {
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
     if (!photo) return;
@@ -1038,18 +1041,17 @@ export function registerBotHandlers(bot: Telegraf): void {
       // Oferta kursu Glovo
       const offer = await geminiService.analyzeCourseOffer(imageBuffer);
       const userLoc = lastCourierLocation.get(String(ctx.from.id));
-      const hasRecentLocation = userLoc && Date.now() - userLoc.updatedAt <= 30 * 60 * 1000;
+      const hasRecentLocation = Boolean(userLoc && Date.now() - userLoc.updatedAt <= 30 * 60 * 1000);
 
       let totalKm = offer.appDistanceKm || 0;
       let calculatedViaMaps = false;
 
       if (hasRecentLocation && userLoc) {
-        const origin = `${userLoc.latitude},${userLoc.longitude}`;
-        const routeData = await mapsService.verifyOfferDistance(
+        const routeData = await verifyOfferDistance(
           { lat: userLoc.latitude, lng: userLoc.longitude, ts: userLoc.updatedAt },
           [
             { rodzaj: 'odbior', adres: offer.pickupAddress, dystans_km: offer.appDistanceKm },
-            { rodzaj: 'dostawa', adres: offer.deliveryAddress }
+            { rodzaj: 'dostawa', adres: offer.deliveryAddress },
           ]
         );
         if (routeData && routeData.available && routeData.results[0]?.actual != null) {
@@ -1110,13 +1112,3 @@ export function registerBotHandlers(bot: Telegraf): void {
     }
   });
 }
-
-export const mapsService = {
-  verifyOfferDistance: async (
-    userLoc: { lat: number; lng: number; ts: number } | null,
-    points: Array<{ rodzaj: string; nazwa?: string | null; adres?: string | null; dystans_km?: number | null }>
-  ) => {
-    const { verifyOfferDistance } = await import('./maps.service.js');
-    return verifyOfferDistance(userLoc, points);
-  },
-};
