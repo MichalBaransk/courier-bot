@@ -39,9 +39,6 @@ export interface TargetProgress {
 }
 
 export class FinanceService {
-  /**
-   * Reguła nocnej zmiany (00:00 - 03:59 -> wczorajsza data).
-   */
   getEffectiveDate(d = new Date()): string {
     const target = new Date(d);
     if (target.getHours() < 4) {
@@ -548,7 +545,7 @@ export class FinanceService {
     const progressPercent = Math.min(100, Math.round((currentNetto / targetAmount) * 1000) / 10);
     const dailyRequiredNetto =
       remainingNetto > 0 ? Math.round((remainingNetto / daysRemaining) * 100) / 100 : 0;
-    const avgHourlyRate = summary.avgHourlyRateNetto > 0 ? summary.avgHourlyRateNetto : 35.0; // Domyślna stawka 35 zł/h jeśli brak godzin
+    const avgHourlyRate = summary.avgHourlyRateNetto > 0 ? summary.avgHourlyRateNetto : 35.0;
     const estimatedHoursRemaining =
       remainingNetto > 0 ? Math.round((remainingNetto / avgHourlyRate) * 10) / 10 : 0;
     const hoursPerDayRequired =
