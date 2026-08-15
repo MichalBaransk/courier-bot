@@ -14,13 +14,13 @@ interface CourierLocation {
 const lastCourierLocation: Map<string, CourierLocation> = new Map();
 
 export function registerBotHandlers(bot: Telegraf): void {
-  // 1. Start / Pomoc
   bot.command(['start', 'pomoc', 'help'], async (ctx) => {
     const text = [
       '🤖 *GlovoBot – Asystent Kuriera*',
       '',
-      '🎙️ *Głosowe wprowadzanie zdarzeń:*',
-      ' • Wyślij notatkę głosową w trasie (np. _"Zatankowałem za 75 zł, 11 litrów, licznik 24300"_ lub _"Praca 10:00 do 16:30, zarobek 210 zł"_).',
+      '🎙️ *Głosowe wprowadzanie i usuwanie (Voice-to-Data):*',
+      ' • *Dodawanie:* _"Zatankowałem za 75 zł, 11 litrów, licznik 24300"_ lub _"Praca 10:00 do 16:30, zarobek 210 zł"_',
+      ' • *Usuwanie/Cofanie:* _"Cofnij ostatni napiwek"_, _"Usuń dzisiejsze paliwo"_, _"Wyczyść godziny"_, _"Usuń cały wczorajszy wpis"_',
       '',
       '📸 *Analiza zdjęć i zrzutów:*',
       ' • *Oferta Glovo:* Prześlij zrzut ekranu – wyliczę opłacalność (zł netto / km).',
@@ -38,7 +38,6 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.reply(text, { parse_mode: 'Markdown' });
   });
 
-  // 2. Podsumowanie dzisiejszego dnia
   bot.command('dzis', async (ctx) => {
     const date = financeService.getEffectiveDate();
     const summary = await financeService.getDailySummary(ctx.from.id, date);
@@ -65,7 +64,6 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.reply(text, { parse_mode: 'Markdown' });
   });
 
-  // 3. Podsumowanie tygodnia
   bot.command('tydzien', async (ctx) => {
     const now = new Date();
     const dayOfWeek = now.getDay() === 0 ? 7 : now.getDay();
@@ -93,7 +91,6 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.reply(text, { parse_mode: 'Markdown' });
   });
 
-  // 4. Podsumowanie miesiąca
   bot.command('miesiac', async (ctx) => {
     const now = new Date();
     const startDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
@@ -117,7 +114,6 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.reply(text, { parse_mode: 'Markdown' });
   });
 
-  // 5. Saldo portfela Glovo
   bot.command('saldo', async (ctx) => {
     const balanceInfo = await financeService.getRollingBalance(ctx.from.id);
     const text = [
@@ -131,7 +127,6 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.reply(text, { parse_mode: 'Markdown' });
   });
 
-  // 6. Lokalizacja GPS kuriera (ważna 30 minut)
   bot.on(message('location'), async (ctx) => {
     const { latitude, longitude } = ctx.message.location;
     lastCourierLocation.set(String(ctx.from.id), {
@@ -144,7 +139,6 @@ export function registerBotHandlers(bot: Telegraf): void {
     });
   });
 
-  // 7. Szybka ścieżka napiwków (Regex: "n 5.5", "np 3", "napiwek 10")
   bot.hears(/^(?:n|np|napiwek)\s+(\d+(?:[.,]\d+)?)$/i, async (ctx) => {
     const rawAmount = ctx.match[1].replace(',', '.');
     const tipAmount = parseFloat(rawAmount);
@@ -162,7 +156,6 @@ export function registerBotHandlers(bot: Telegraf): void {
     });
   });
 
-  // 8. Voice-to-Data: Nagrania audio i notatki głosowe z trasy
   bot.on([message('voice'), message('audio')], async (ctx) => {
     const voiceMsg = 'voice' in ctx.message ? ctx.message.voice : ctx.message.audio;
     if (!voiceMsg) return;
@@ -177,6 +170,32 @@ export function registerBotHandlers(bot: Telegraf): void {
 
       const mimeType = ('mime_type' in voiceMsg && voiceMsg.mime_type) ? voiceMsg.mime_type : 'audio/ogg';
       const extracted = await geminiService.parseVoiceNote(audioBuffer, mimeType);
+
+      // Ścieżka 1: Usuwanie / Cofanie wpisów głosem
+      if (extracted.action === 'DELETE' && extracted.deleteTarget) {
+        const delResult = await financeService.handleVoiceDeletion(
+          ctx.from.id,
+          extracted.deleteTarget,
+          extracted.targetDate
+        );
+
+        const lines = [
+          `🗣️ *Transkrypcja:* _"${extracted.transcription}"_`,
+          '',
+          delResult.success ? `🗑️ *Sukces:* ${delResult.message}` : `⚠️ *Informacja:* ${delResult.message}`,
+        ];
+
+        await ctx.telegram.editMessageText(
+          ctx.chat.id,
+          processingMsg.message_id,
+          undefined,
+          lines.join('\n'),
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      // Ścieżka 2: Dodawanie / Aktualizacja danych (UPSERT)
       const result = await financeService.saveVoiceEvent(ctx.from.id, extracted);
 
       const lines: string[] = [
@@ -227,7 +246,6 @@ export function registerBotHandlers(bot: Telegraf): void {
     }
   });
 
-  // 9. Vision: Zdjęcia paragonów paliwowych oraz zrzuty ekranu zleceń Glovo
   bot.on(message('photo'), async (ctx) => {
     const photos = ctx.message.photo;
     const photo = photos[photos.length - 1];
@@ -241,7 +259,6 @@ export function registerBotHandlers(bot: Telegraf): void {
       const arrayBuffer = await res.arrayBuffer();
       const imageBuffer = Buffer.from(arrayBuffer);
 
-      // Ścieżka A: Paragon paliwowy
       if (caption.includes('paragon') || caption.includes('paliwo') || caption.includes('stacja')) {
         const receipt = await geminiService.extractFuelReceipt(imageBuffer);
         const effectiveDate = receipt.date || financeService.getEffectiveDate();
@@ -270,7 +287,6 @@ export function registerBotHandlers(bot: Telegraf): void {
         return;
       }
 
-      // Ścieżka B: Analiza oferty kursu Glovo
       const offer = await geminiService.analyzeCourseOffer(imageBuffer);
       const userLoc = lastCourierLocation.get(String(ctx.from.id));
       const hasRecentLocation = userLoc && Date.now() - userLoc.updatedAt <= 30 * 60 * 1000;

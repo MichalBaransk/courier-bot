@@ -2,6 +2,9 @@ import { GoogleGenAI, Type, Schema } from '@google/genai';
 
 export interface VoiceExtractedData {
   transcription: string;
+  action: 'UPSERT' | 'DELETE';
+  deleteTarget?: 'LAST_TIP' | 'ALL_TIPS' | 'FUEL' | 'HOURS' | 'EARNINGS' | 'ALL_DAY' | null;
+  targetDate?: string | null;
   fuelPrice?: number | null;
   fuelLiters?: number | null;
   fuelDistance?: number | null;
@@ -30,6 +33,22 @@ const voiceExtractionSchema: Schema = {
     transcription: {
       type: Type.STRING,
       description: 'Precyzyjna, dosłowna transkrypcja wypowiedzi kuriera w języku polskim.',
+    },
+    action: {
+      type: Type.STRING,
+      enum: ['UPSERT', 'DELETE'],
+      description: 'Określa, czy kurier dodaje/aktualizuje dane (UPSERT), czy chce usunąć/skasować/cofnąć wpis (DELETE).',
+    },
+    deleteTarget: {
+      type: Type.STRING,
+      enum: ['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'ALL_DAY'],
+      nullable: true,
+      description: 'Obiekt do usunięcia: LAST_TIP (ostatni napiwek), ALL_TIPS (wszystkie napiwki z danego dnia), FUEL (dane tankowania i licznik), HOURS (godziny pracy), EARNINGS (zarobki brutto), ALL_DAY (cały rekord dnia i powiązane napiwki).',
+    },
+    targetDate: {
+      type: Type.STRING,
+      nullable: true,
+      description: 'Dzień, którego dotyczy akcja: "TODAY" (dzisiaj), "YESTERDAY" (wczoraj) lub data w formacie YYYY-MM-DD.',
     },
     fuelPrice: {
       type: Type.NUMBER,
@@ -67,7 +86,7 @@ const voiceExtractionSchema: Schema = {
       description: 'Kwota napiwku gotówkowego w PLN.',
     },
   },
-  required: ['transcription'],
+  required: ['transcription', 'action'],
 };
 
 const fuelReceiptSchema: Schema = {
@@ -125,18 +144,25 @@ export class GeminiService {
     this.model = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
   }
 
-  /**
-   * Voice-to-Data: Przetwarzanie notatek głosowych nagranych podczas jazdy.
-   */
   async parseVoiceNote(audioBuffer: Buffer, mimeType = 'audio/ogg'): Promise<VoiceExtractedData> {
     const base64Audio = audioBuffer.toString('base64');
     const prompt = `
-Jesteś asystentem kuriera dostarczającego zamówienia. Przeanalizuj notatkę głosową nagraną w trasie.
-Wyodrębnij parametry:
-1. Tankowanie: koszt całkowity w PLN, ilość litrów, stan licznika kilometrów (przebieg całkowity).
-2. Czas pracy: zakres godzin (od-do w formacie HH:MM).
-3. Finanse: zarobek brutto lub napiwek gotówkowy.
-Ignoruj szum wiatru, silnika i odgłosy uliczne. Przypisz wartości do odpowiednich pól schematu JSON.
+Jesteś asystentem kuriera dostarczającego zamówienia. Przeanalizuj nagranie audio nagrane podczas jazdy.
+Rozpoznaj intencję kuriera:
+1. DODANIE/AKTUALIZACJA (action: 'UPSERT'):
+   - Tankowanie: koszt PLN, litry, licznik km.
+   - Godziny pracy: zakres od-do (HH:MM).
+   - Finanse: zarobek brutto lub napiwek gotówkowy.
+2. USUWANIE/COFANIE (action: 'DELETE'):
+   - "Cofnij / usuń ostatni napiwek" -> deleteTarget: 'LAST_TIP'
+   - "Usuń wszystkie napiwki z dzisiaj/wczoraj" -> deleteTarget: 'ALL_TIPS'
+   - "Skasuj / usuń tankowanie / wyczyść paliwo" -> deleteTarget: 'FUEL'
+   - "Usuń godziny / czas pracy" -> deleteTarget: 'HOURS'
+   - "Cofnij / skasuj zarobek" -> deleteTarget: 'EARNINGS'
+   - "Usuń cały dzisiejszy / wczorajszy wpis" -> deleteTarget: 'ALL_DAY'
+   - targetDate: 'TODAY', 'YESTERDAY' lub konkretna data w formacie YYYY-MM-DD, jeśli podano.
+
+Ignoruj hałas otoczenia, wiatr i wydech. Przypisz wartości do właściwych pól schematu JSON.
 `;
 
     const response = await this.ai.models.generateContent({
@@ -158,13 +184,10 @@ Ignoruj szum wiatru, silnika i odgłosy uliczne. Przypisz wartości do odpowiedn
     });
 
     const text = response.text;
-    if (!text) throw new Error('Gemini API zwróciło pustą odpowiedź dla notatki audio.');
+    if (!text) throw new Error('Gemini API zwróciło pustą odpowiedź dla pliku audio.');
     return JSON.parse(text) as VoiceExtractedData;
   }
 
-  /**
-   * Vision: Odczyt danych z paragonu/faktury za paliwo.
-   */
   async extractFuelReceipt(imageBuffer: Buffer, mimeType = 'image/jpeg'): Promise<FuelReceiptExtractedData> {
     const base64Image = imageBuffer.toString('base64');
     const prompt = `
@@ -199,9 +222,6 @@ Ignoruj kody CN, numery stacji benzynowej, numery dystrybutorów oraz oznaczenia
     return JSON.parse(text) as FuelReceiptExtractedData;
   }
 
-  /**
-   * Vision: Analiza zrzutu ekranu oferty kursu Glovo.
-   */
   async analyzeCourseOffer(imageBuffer: Buffer, mimeType = 'image/jpeg'): Promise<CourseOfferExtractedData> {
     const base64Image = imageBuffer.toString('base64');
     const prompt = `

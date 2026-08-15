@@ -35,21 +35,36 @@ export class FinanceService {
     return target.toISOString().slice(0, 10);
   }
 
-  /**
-   * Obliczanie godzin pracy z uwzględnieniem przejścia przez północ (próg >= 0.25h).
-   */
+  resolveTargetDate(targetDateStr?: string | null): string {
+    if (!targetDateStr) return this.getEffectiveDate();
+    const upper = targetDateStr.toUpperCase();
+    if (upper === 'TODAY' || upper === 'DZISIAJ' || upper === 'DZIŚ') {
+      return this.getEffectiveDate();
+    }
+    if (upper === 'YESTERDAY' || upper === 'WCZORAJ') {
+      const d = new Date();
+      if (d.getHours() < 4) {
+        d.setDate(d.getDate() - 2);
+      } else {
+        d.setDate(d.getDate() - 1);
+      }
+      return d.toISOString().slice(0, 10);
+    }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(targetDateStr)) {
+      return targetDateStr;
+    }
+    return this.getEffectiveDate();
+  }
+
   calculateHours(fromStr: string, toStr: string): number {
     const [fH, fM] = fromStr.split(':').map(Number);
     const [tH, tM] = toStr.split(':').map(Number);
-    let diffMinutes = (tH * 60 + tM) - (fH * 60 + fM);
+    let diffMinutes = tH * 60 + tM - (fH * 60 + fM);
     if (diffMinutes < 0) diffMinutes += 24 * 60;
     const hours = Math.round((diffMinutes / 60) * 100) / 100;
     return hours >= 0.25 ? hours : 0;
   }
 
-  /**
-   * Zapis napiwku gotówkowego do tabeli cash_tips.
-   */
   async saveCashTip(telegramId: string | number, date: string, amount: number): Promise<void> {
     await db.insert(cashTips).values({
       telegramId: String(telegramId),
@@ -58,9 +73,6 @@ export class FinanceService {
     });
   }
 
-  /**
-   * Zapis / aktualizacja danych paliwowych w daily_records.
-   */
   async saveFuelReceipt(
     telegramId: string | number,
     date: string,
@@ -85,9 +97,6 @@ export class FinanceService {
       });
   }
 
-  /**
-   * Zapis oferty kursu Glovo do tabeli course_offers.
-   */
   async saveCourseOffer(
     telegramId: string | number,
     data: {
@@ -122,25 +131,20 @@ export class FinanceService {
     });
   }
 
-  /**
-   * Zapis zdarzenia głosowego (Voice-to-Data) bezpośrednio do daily_records oraz cash_tips.
-   */
   async saveVoiceEvent(
     telegramId: string | number,
     data: VoiceExtractedData
   ): Promise<{ date: string; hasDailyUpdate: boolean; hasTip: boolean }> {
     const tId = String(telegramId);
-    const date = this.getEffectiveDate();
+    const date = this.resolveTargetDate(data.targetDate);
     let hasDailyUpdate = false;
     let hasTip = false;
 
-    // 1. Zapis napiwku gotówkowego
     if (data.cashTip && data.cashTip > 0) {
       await this.saveCashTip(tId, date, data.cashTip);
       hasTip = true;
     }
 
-    // 2. Aktualizacja rekordu dziennego
     const hasFuel = data.fuelPrice != null || data.fuelLiters != null || data.fuelDistance != null;
     const hasEarnings = data.grossEarnings != null;
     const hasShift = Boolean(data.workFrom && data.workTo);
@@ -182,9 +186,158 @@ export class FinanceService {
     return { date, hasDailyUpdate, hasTip };
   }
 
-  /**
-   * Pobiera pełne podsumowanie dnia dla kuriera.
-   */
+  async handleVoiceDeletion(
+    telegramId: string | number,
+    target: 'LAST_TIP' | 'ALL_TIPS' | 'FUEL' | 'HOURS' | 'EARNINGS' | 'ALL_DAY',
+    targetDateStr?: string | null
+  ): Promise<{ success: boolean; message: string; date: string }> {
+    const tId = String(telegramId);
+    const date = this.resolveTargetDate(targetDateStr);
+
+    switch (target) {
+      case 'LAST_TIP': {
+        const [lastTip] = await db
+          .select()
+          .from(cashTips)
+          .where(and(eq(cashTips.telegramId, tId), eq(cashTips.date, date)))
+          .orderBy(desc(cashTips.createdAt))
+          .limit(1);
+
+        if (!lastTip) {
+          const [anyLastTip] = await db
+            .select()
+            .from(cashTips)
+            .where(eq(cashTips.telegramId, tId))
+            .orderBy(desc(cashTips.createdAt))
+            .limit(1);
+
+          if (!anyLastTip) {
+            return { success: false, message: 'Nie znaleziono żadnych napiwków do usunięcia.', date };
+          }
+
+          await db.delete(cashTips).where(eq(cashTips.id, anyLastTip.id));
+          return {
+            success: true,
+            message: `Usunięto ostatni zarejestrowany napiwek: *${parseFloat(anyLastTip.amount).toFixed(2)} zł* (z dnia \`${anyLastTip.date}\`).`,
+            date: anyLastTip.date,
+          };
+        }
+
+        await db.delete(cashTips).where(eq(cashTips.id, lastTip.id));
+        return {
+          success: true,
+          message: `Usunięto ostatni napiwek: *${parseFloat(lastTip.amount).toFixed(2)} zł* z dnia \`${date}\`.`,
+          date,
+        };
+      }
+
+      case 'ALL_TIPS': {
+        const deleted = await db
+          .delete(cashTips)
+          .where(and(eq(cashTips.telegramId, tId), eq(cashTips.date, date)))
+          .returning();
+
+        if (deleted.length === 0) {
+          return { success: false, message: `Brak napiwków do skasowania w dniu \`${date}\`.`, date };
+        }
+
+        const totalAmount = deleted.reduce((sum, item) => sum + parseFloat(item.amount), 0);
+        return {
+          success: true,
+          message: `Skasowano wszystkie napiwki (${deleted.length} szt., łącznie *${totalAmount.toFixed(2)} zł*) z dnia \`${date}\`.`,
+          date,
+        };
+      }
+
+      case 'FUEL': {
+        const [existing] = await db
+          .select()
+          .from(dailyRecords)
+          .where(and(eq(dailyRecords.telegramId, tId), eq(dailyRecords.date, date)))
+          .limit(1);
+
+        if (!existing || (!existing.fuelPrice && !existing.fuelLiters && !existing.fuelDistance)) {
+          return { success: false, message: `Brak wpisów paliwowych do wyczyszczenia w dniu \`${date}\`.`, date };
+        }
+
+        await db
+          .update(dailyRecords)
+          .set({ fuelPrice: null, fuelLiters: null, fuelDistance: null })
+          .where(and(eq(dailyRecords.telegramId, tId), eq(dailyRecords.date, date)));
+
+        return {
+          success: true,
+          message: `Wyczyszczono dane tankowania i licznika z dnia \`${date}\`.`,
+          date,
+        };
+      }
+
+      case 'HOURS': {
+        const [existing] = await db
+          .select()
+          .from(dailyRecords)
+          .where(and(eq(dailyRecords.telegramId, tId), eq(dailyRecords.date, date)))
+          .limit(1);
+
+        if (!existing || (!existing.workFrom && !existing.workTo && !existing.workHours)) {
+          return { success: false, message: `Brak wpisów godzin pracy w dniu \`${date}\`.`, date };
+        }
+
+        await db
+          .update(dailyRecords)
+          .set({ workFrom: null, workTo: null, workHours: null })
+          .where(and(eq(dailyRecords.telegramId, tId), eq(dailyRecords.date, date)));
+
+        return {
+          success: true,
+          message: `Wyczyszczono godziny pracy z dnia \`${date}\`.`,
+          date,
+        };
+      }
+
+      case 'EARNINGS': {
+        const [existing] = await db
+          .select()
+          .from(dailyRecords)
+          .where(and(eq(dailyRecords.telegramId, tId), eq(dailyRecords.date, date)))
+          .limit(1);
+
+        if (!existing || !existing.grossEarnings) {
+          return { success: false, message: `Brak wpisu zarobków brutto w dniu \`${date}\`.`, date };
+        }
+
+        await db
+          .update(dailyRecords)
+          .set({ grossEarnings: null })
+          .where(and(eq(dailyRecords.telegramId, tId), eq(dailyRecords.date, date)));
+
+        return {
+          success: true,
+          message: `Wyczyszczono zarobek brutto z dnia \`${date}\`.`,
+          date,
+        };
+      }
+
+      case 'ALL_DAY': {
+        await db
+          .delete(dailyRecords)
+          .where(and(eq(dailyRecords.telegramId, tId), eq(dailyRecords.date, date)));
+        await db
+          .delete(cashTips)
+          .where(and(eq(cashTips.telegramId, tId), eq(cashTips.date, date)));
+
+        return {
+          success: true,
+          message: `Usunięto cały rekord dzienny oraz powiązane napiwki z dnia \`${date}\`.`,
+          date,
+        };
+      }
+
+      default:
+        return { success: false, message: 'Nie rozpoznano elementu do usunięcia.', date };
+    }
+  }
+
   async getDailySummary(telegramId: string | number, date: string): Promise<DailySummary> {
     const tId = String(telegramId);
 
@@ -220,9 +373,6 @@ export class FinanceService {
     };
   }
 
-  /**
-   * Pobiera zagregowane podsumowanie za dany okres (tydzień, miesiąc).
-   */
   async getPeriodSummary(
     telegramId: string | number,
     startDate: string,
@@ -291,9 +441,6 @@ export class FinanceService {
     };
   }
 
-  /**
-   * Oblicza kroczące saldo Portfela Glovo od ostatniego checkpointu.
-   */
   async getRollingBalance(
     telegramId: string | number,
     targetDate = this.getEffectiveDate()
