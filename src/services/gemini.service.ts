@@ -24,33 +24,32 @@ export interface CourseOfferExtractedData {
   appDistanceKm?: number | null;
 }
 
-// 1. Schemat ekstrakcji głosu (Voice-to-Data)
 const voiceExtractionSchema: Schema = {
   type: Type.OBJECT,
   properties: {
     transcription: {
       type: Type.STRING,
-      description: 'Dosłowna transkrypcja słów kuriera w języku polskim.',
+      description: 'Precyzyjna, dosłowna transkrypcja wypowiedzi kuriera w języku polskim.',
     },
     fuelPrice: {
       type: Type.NUMBER,
       nullable: true,
-      description: 'Kwota zapłacona za paliwo w PLN (np. 75.00).',
+      description: 'Kwota zapłacona za paliwo w PLN (np. 75 dla 75 zł).',
     },
     fuelLiters: {
       type: Type.NUMBER,
       nullable: true,
-      description: 'Liczba zatankowanych litrów paliwa (np. 11.00).',
+      description: 'Liczba zatankowanych litrów paliwa (np. 11.2).',
     },
     fuelDistance: {
       type: Type.INTEGER,
       nullable: true,
-      description: 'Aktualny stan licznika / całkowity przebieg w km (np. 24300).',
+      description: 'Stan licznika / całkowity przebieg pojazdu w km (np. 24300).',
     },
     grossEarnings: {
       type: Type.NUMBER,
       nullable: true,
-      description: 'Zarobek brutto w PLN jeśli podano w nagraniu.',
+      description: 'Zarobek brutto w PLN jeśli podano.',
     },
     workFrom: {
       type: Type.STRING,
@@ -71,7 +70,6 @@ const voiceExtractionSchema: Schema = {
   required: ['transcription'],
 };
 
-// 2. Schemat ekstrakcji paragonu paliwowego (Vision)
 const fuelReceiptSchema: Schema = {
   type: Type.OBJECT,
   properties: {
@@ -94,7 +92,6 @@ const fuelReceiptSchema: Schema = {
   required: ['fuelPrice'],
 };
 
-// 3. Schemat oferty kursu Glovo (Vision)
 const courseOfferSchema: Schema = {
   type: Type.OBJECT,
   properties: {
@@ -136,7 +133,7 @@ export class GeminiService {
     const prompt = `
 Jesteś asystentem kuriera dostarczającego zamówienia. Przeanalizuj notatkę głosową nagraną w trasie.
 Wyodrębnij parametry:
-1. Tankowanie: koszt całkowity w PLN, ilość litrów, stan licznika kilometrów (przebieg).
+1. Tankowanie: koszt całkowity w PLN, ilość litrów, stan licznika kilometrów (przebieg całkowity).
 2. Czas pracy: zakres godzin (od-do w formacie HH:MM).
 3. Finanse: zarobek brutto lub napiwek gotówkowy.
 Ignoruj szum wiatru, silnika i odgłosy uliczne. Przypisz wartości do odpowiednich pól schematu JSON.
@@ -160,7 +157,7 @@ Ignoruj szum wiatru, silnika i odgłosy uliczne. Przypisz wartości do odpowiedn
       },
     });
 
-    const text = response.text();
+    const text = response.text;
     if (!text) throw new Error('Gemini API zwróciło pustą odpowiedź dla notatki audio.');
     return JSON.parse(text) as VoiceExtractedData;
   }
@@ -197,7 +194,7 @@ Ignoruj kody CN, numery stacji benzynowej, numery dystrybutorów oraz oznaczenia
       },
     });
 
-    const text = response.text();
+    const text = response.text;
     if (!text) throw new Error('Gemini API zwróciło pustą odpowiedź dla paragonu.');
     return JSON.parse(text) as FuelReceiptExtractedData;
   }
@@ -235,7 +232,7 @@ Wyciągnij:
       },
     });
 
-    const text = response.text();
+    const text = response.text;
     if (!text) throw new Error('Gemini API zwróciło pustą odpowiedź dla zrzutu ekranu.');
     return JSON.parse(text) as CourseOfferExtractedData;
   }
