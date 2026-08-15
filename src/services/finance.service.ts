@@ -1,4 +1,4 @@
-import { db } from '../db';
+import { db } from '../db/index.js';
 import {
   dailyRecords,
   cashTips,
@@ -6,10 +6,10 @@ import {
   balanceCheckpoints,
   courseOffers,
   earningTargets,
-} from '../db/schema';
+} from '../db/schema.js';
 import { eq, and, gte, lte, sql, desc } from 'drizzle-orm';
-import { NETTO_FACTOR } from '../config';
-import { VoiceExtractedData, WalletTransactionItem } from './gemini.service';
+import { CFG } from '../config.js';
+import { VoiceExtractedData, WalletTransactionItem } from './gemini.service.js';
 
 export interface DailySummary {
   date: string;
@@ -56,15 +56,6 @@ export interface CourseOfferStats {
   worstNetRate: number;
   totalGross: number;
   totalDistanceKm: number;
-}
-
-export interface ShiftStartResult {
-  date: string;
-  workFrom: string;
-  initialCash: number | null;
-  rollingBalance: number;
-  monthlyTarget: TargetProgress | null;
-  weeklyTarget: TargetProgress | null;
 }
 
 export class FinanceService {
@@ -137,17 +128,12 @@ export class FinanceService {
     };
   }
 
-  async startShift(
+  async setShiftStart(
     telegramId: string | number,
-    data: {
-      date?: string;
-      workFrom: string;
-      initialCash?: number | null;
-    }
-  ): Promise<ShiftStartResult> {
+    date: string,
+    workFrom: string
+  ): Promise<DailySummary> {
     const tId = String(telegramId);
-    const date = data.date || this.getEffectiveDate();
-
     const [existing] = await db
       .select()
       .from(dailyRecords)
@@ -155,8 +141,8 @@ export class FinanceService {
       .limit(1);
 
     let calculatedHours: string | null = null;
-    if (data.workFrom && existing?.workTo) {
-      const h = this.calculateHours(data.workFrom, existing.workTo);
+    if (existing?.workTo) {
+      const h = this.calculateHours(workFrom, existing.workTo);
       if (h > 0) calculatedHours = h.toString();
     }
 
@@ -165,48 +151,31 @@ export class FinanceService {
       .values({
         telegramId: tId,
         date,
-        workFrom: data.workFrom,
+        workFrom,
         workTo: existing?.workTo || null,
         workHours: calculatedHours || existing?.workHours || null,
       })
       .onConflictDoUpdate({
         target: [dailyRecords.telegramId, dailyRecords.date],
         set: {
-          workFrom: data.workFrom,
+          workFrom,
           ...(calculatedHours && { workHours: calculatedHours }),
         },
       });
 
-    if (data.initialCash != null) {
-      await this.setBalanceCheckpoint(tId, date, data.initialCash);
-    }
-
-    const rolling = await this.getRollingBalance(tId, date);
-    const monthlyTarget = await this.getTargetProgress(tId, 'MONTHLY');
-    const weeklyTarget = await this.getTargetProgress(tId, 'WEEKLY');
-
-    return {
-      date,
-      workFrom: data.workFrom,
-      initialCash: data.initialCash ?? null,
-      rollingBalance: rolling.balance,
-      monthlyTarget,
-      weeklyTarget,
-    };
+    return this.getDailySummary(tId, date);
   }
 
-  async finishShift(
+  async setShiftEnd(
     telegramId: string | number,
+    date: string,
     data: {
-      date: string;
       workTo?: string | null;
       fuelDistance?: number | null;
       walletCash?: number | null;
     }
   ): Promise<DailySummary> {
     const tId = String(telegramId);
-    const date = data.date;
-
     const [existing] = await db
       .select()
       .from(dailyRecords)
@@ -215,11 +184,11 @@ export class FinanceService {
 
     const workFrom = existing?.workFrom || null;
     const workTo = data.workTo || existing?.workTo || null;
-    let workHoursStr: string | null = existing?.workHours || null;
+    let calculatedHours: string | null = existing?.workHours || null;
 
     if (workFrom && workTo) {
-      const calcH = this.calculateHours(workFrom, workTo);
-      workHoursStr = calcH > 0 ? calcH.toString() : null;
+      const h = this.calculateHours(workFrom, workTo);
+      calculatedHours = h > 0 ? h.toString() : null;
     }
 
     await db
@@ -229,14 +198,14 @@ export class FinanceService {
         date,
         workFrom,
         workTo,
-        workHours: workHoursStr,
+        workHours: calculatedHours,
         fuelDistance: data.fuelDistance != null ? data.fuelDistance : (existing?.fuelDistance ?? null),
       })
       .onConflictDoUpdate({
         target: [dailyRecords.telegramId, dailyRecords.date],
         set: {
           ...(workTo && { workTo }),
-          ...(workHoursStr && { workHours: workHoursStr }),
+          ...(calculatedHours && { workHours: calculatedHours }),
           ...(data.fuelDistance != null && { fuelDistance: data.fuelDistance }),
         },
       });
@@ -313,7 +282,7 @@ export class FinanceService {
       .returning({ id: courseOffers.id });
 
     if (!inserted) {
-      throw new Error('Nie udało się zapisać oferty w bazie.');
+      throw new Error('Błąd zapisu oferty kursu.');
     }
 
     return inserted.id;
@@ -561,7 +530,7 @@ export class FinanceService {
     }
 
     const gross = record?.grossEarnings ? parseFloat(record.grossEarnings) : 0;
-    const netEarnings = Math.round(gross * NETTO_FACTOR * 100) / 100;
+    const netEarnings = Math.round(gross * CFG.NETTO_FACTOR * 100) / 100;
     const cashTipsTotal = tips[0]?.total ? parseFloat(tips[0].total) : 0;
     const totalNetto = Math.round((netEarnings + cashTipsTotal) * 100) / 100;
     const doPrzelewu = Math.max(0, Math.round((totalNetto - cashTipsTotal - walletPayouts) * 100) / 100);
@@ -643,7 +612,7 @@ export class FinanceService {
       }
     }
 
-    const totalNettoEarnings = Math.round(totalGross * NETTO_FACTOR * 100) / 100;
+    const totalNettoEarnings = Math.round(totalGross * CFG.NETTO_FACTOR * 100) / 100;
     const totalCashTips = tips[0]?.total ? parseFloat(tips[0].total) : 0;
     const grandTotalNetto = Math.round((totalNettoEarnings + totalCashTips) * 100) / 100;
     const totalDoPrzelewu = Math.max(0, Math.round((grandTotalNetto - totalCashTips - totalWalletPayouts) * 100) / 100);
