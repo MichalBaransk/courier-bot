@@ -7,16 +7,37 @@ interface LatLng {
 }
 
 export interface RouteVerification {
+  /** Czy udalo sie policzyc cokolwiek. */
   available: boolean;
-  /** Powod niedostepnosci: brak klucza, przestarzaly GPS, blad geokodowania... */
+  /** Powod braku danych: brak klucza, przestarzaly GPS, blad geokodowania... */
   reason: string | null;
   /** Kurier -> punkt odbioru. */
   pickupKm: number | null;
-  /** Punkt odbioru -> klient. */
+  /** Punkt odbioru -> klient. `null`, gdy oferta nie podaje adresu klienta. */
   deliveryKm: number | null;
-  /** Suma odcinkow. `null`, gdy ktorykolwiek sie nie policzyl. */
+  /** Dlaczego nie ma odcinka dostawy. */
+  deliveryReason: string | null;
+  /** Suma odcinkow. `null`, gdy ktoregokolwiek brakuje. */
   totalKm: number | null;
+  /** Wiek uzytej pozycji GPS w minutach. */
   ageMin: number;
+}
+
+/**
+ * Czy adres jest na tyle konkretny, zeby geokodowanie mialo sens.
+ *
+ * Ekran oferty Glovo NIE pokazuje adresu klienta przed akceptacja — Gemini
+ * wyciaga z niego zwykle sama nazwe miasta ("Katowice"). Geokoder zwraca wtedy
+ * centroid miasta, a dystans do niego to liczba bez zadnego zwiazku
+ * z rzeczywistoscia. Lepiej nie podac nic niz podac zmyslone 1,83 km.
+ */
+export function isSpecificAddress(address: string): boolean {
+  const trimmed = address.trim();
+  if (trimmed.length < 6) return false;
+  // Numer budynku albo kod pocztowy.
+  if (/\d/.test(trimmed)) return true;
+  // Prefiks ulicy bez numeru — te potraktujemy jako zbyt ogolne.
+  return false;
 }
 
 const geoCache = new Map<string, LatLng>();
@@ -75,57 +96,60 @@ export async function getRoadDistanceKm(origin: LatLng, dest: LatLng): Promise<n
 }
 
 /**
- * FIX (2.3): liczymy OBA odcinki trasy.
+ * Niezalezna kontrola dystansu przez Google Maps.
  *
- * Stara wersja miala `if (p.rodzaj !== 'odbior') continue`, wiec zwracala wylacznie
- * dojazd kuriera do restauracji. Ta wartosc trafiala potem do `totalKm` i dzielila
- * kwote netto - stawka zl/km byla sztucznie zawyzona, a kursy oznaczane jako
- * oplacalne bez pokrycia. Teraz zwracamy Odbior, Dostawe i Sume osobno.
+ * FIX (2.3): liczymy OBA odcinki, nie tylko dojazd do restauracji.
+ *
+ * Ograniczenia, o ktorych trzeba pamietac czytajac wynik:
+ *  • odcinek odbioru liczy sie od OSTATNIEJ wyslanej pozycji GPS, nie od
+ *    biezacej — jesli kurier ruszyl sie od czasu `/lokalizacja`, bedzie
+ *    rozbieznosc wzgledem aplikacji Glovo, ktora zna pozycje na zywo;
+ *  • odcinek dostawy da sie policzyc tylko wtedy, gdy oferta podaje konkretny
+ *    adres klienta — przed akceptacja Glovo go nie pokazuje.
  */
 export async function verifyOfferDistance(
   userLoc: { lat: number; lng: number; ts: number } | null,
   pickupAddress: string,
   deliveryAddress: string
 ): Promise<RouteVerification> {
-  const empty = (reason: string): RouteVerification => ({
+  const empty = (reason: string, ageMin = 0): RouteVerification => ({
     available: false,
     reason,
     pickupKm: null,
     deliveryKm: null,
+    deliveryReason: reason,
     totalKm: null,
-    ageMin: 0,
+    ageMin,
   });
 
-  if (!apiKey()) return empty('Brak GOOGLE_MAPS_API_KEY');
-  if (!userLoc) return empty('Brak lokalizacji GPS');
+  if (!apiKey()) return empty('brak GOOGLE_MAPS_API_KEY');
+  if (!userLoc) return empty('brak pozycji GPS — wyślij /lokalizacja');
 
   const ageMs = Date.now() - userLoc.ts;
-  if (ageMs > CFG.LOCATION_MAX_AGE_MS) return empty('Lokalizacja GPS jest przestarzała');
+  if (ageMs > CFG.LOCATION_MAX_AGE_MS) return empty('pozycja GPS jest przestarzała');
 
   const ageMin = Math.max(0, Math.round(ageMs / 60_000));
 
-  const [pickupGeo, deliveryGeo] = await Promise.all([
-    geocodeAddress(pickupAddress),
-    geocodeAddress(deliveryAddress),
-  ]);
+  const pickupGeo = await geocodeAddress(pickupAddress);
+  if (!pickupGeo) return empty('nie udało się zgeokodować adresu odbioru', ageMin);
 
-  if (!pickupGeo) return { ...empty('Nie udało się zgeokodować adresu odbioru'), ageMin };
-  if (!deliveryGeo) return { ...empty('Nie udało się zgeokodować adresu dostawy'), ageMin };
+  const pickupKm = await getRoadDistanceKm({ lat: userLoc.lat, lng: userLoc.lng }, pickupGeo);
+  if (pickupKm === null) return empty('nie udało się wyznaczyć dojazdu', ageMin);
 
-  const [pickupKm, deliveryKm] = await Promise.all([
-    getRoadDistanceKm({ lat: userLoc.lat, lng: userLoc.lng }, pickupGeo),
-    getRoadDistanceKm(pickupGeo, deliveryGeo),
-  ]);
+  // Odcinek dostawy — tylko gdy adres klienta jest konkretny.
+  let deliveryKm: number | null = null;
+  let deliveryReason: string | null = null;
 
-  if (pickupKm === null || deliveryKm === null) {
-    return {
-      available: false,
-      reason: 'Nie udało się wyznaczyć trasy',
-      pickupKm,
-      deliveryKm,
-      totalKm: null,
-      ageMin,
-    };
+  if (!isSpecificAddress(deliveryAddress)) {
+    deliveryReason = 'oferta nie podaje adresu klienta';
+  } else {
+    const deliveryGeo = await geocodeAddress(deliveryAddress);
+    if (!deliveryGeo) {
+      deliveryReason = 'nie udało się zgeokodować adresu klienta';
+    } else {
+      deliveryKm = await getRoadDistanceKm(pickupGeo, deliveryGeo);
+      if (deliveryKm === null) deliveryReason = 'nie udało się wyznaczyć trasy do klienta';
+    }
   }
 
   return {
@@ -133,7 +157,8 @@ export async function verifyOfferDistance(
     reason: null,
     pickupKm,
     deliveryKm,
-    totalKm: Math.round((pickupKm + deliveryKm) * 100) / 100,
+    deliveryReason,
+    totalKm: deliveryKm !== null ? Math.round((pickupKm + deliveryKm) * 100) / 100 : null,
     ageMin,
   };
 }

@@ -108,6 +108,11 @@ function parseAmount(raw: string): number | null {
   return Number.isFinite(value) ? value : null;
 }
 
+/** `numeric` z Postgresa przychodzi jako string albo null. */
+function dec(value: string | null): number | null {
+  return value != null ? parseFloat(value) : null;
+}
+
 function parseDistance(raw: string): number | null {
   const cleaned = raw.trim().replace(',', '.').replace(/km/gi, '');
   const value = Number.parseFloat(cleaned);
@@ -727,11 +732,17 @@ export function registerBotHandlers(bot: Telegraf): void {
         netAmount: parseFloat(offer.netAmount),
         pickupAddress: offer.pickupAddress ?? '—',
         deliveryAddress: offer.deliveryAddress ?? '—',
-        pickupKm: offer.distancePickupKm ? parseFloat(offer.distancePickupKm) : null,
-        deliveryKm: offer.distanceDeliveryKm ? parseFloat(offer.distanceDeliveryKm) : null,
+        appPickupKm: dec(offer.appPickupKm),
+        appDeliveryKm: dec(offer.appDeliveryKm),
+        appTotalKm: dec(offer.appTotalKm),
+        mapsPickupKm: dec(offer.mapsPickupKm),
+        mapsDeliveryKm: dec(offer.mapsDeliveryKm),
+        mapsTotalKm: dec(offer.mapsTotalKm),
+        mapsReason: offer.mapsPickupKm ? null : 'brak danych z Google Maps',
+        mapsDeliveryReason: 'oferta nie podaje adresu klienta',
+        mapsAgeMin: 0,
         totalKm: parseFloat(offer.distanceTotalKm),
-        source: offer.distanceSource === 'MAPS' ? 'MAPS' : 'APP',
-        sourceNote: null,
+        rateBasis: offer.rateBasis === 'MAPS' ? 'MAPS' : offer.rateBasis === 'NONE' ? 'NONE' : 'APP',
         netRatePerKm: parseFloat(offer.netRatePerKm),
         status: accepted ? 'ACCEPTED' : 'REJECTED',
       }),
@@ -942,10 +953,29 @@ export function registerBotHandlers(bot: Telegraf): void {
         offer.deliveryAddress
       );
 
-      const useMaps = route.available && route.totalKm != null && route.totalKm > 0;
-      const totalKm = useMaps && route.totalKm != null ? route.totalKm : (offer.appDistanceKm ?? 0);
+      // Suma z aplikacji: oba odcinki widoczne na ekranie oferty.
+      const appTotalKm =
+        offer.appPickupKm != null && offer.appDeliveryKm != null
+          ? Math.round((offer.appPickupKm + offer.appDeliveryKm) * 100) / 100
+          : null;
 
-      // Stawka zawsze z CALEJ trasy (dojazd + dostawa) — FIX (2.3).
+      /**
+       * Podstawa stawki: dystans z APLIKACJI, nie z Google Maps.
+       *
+       * Glovo liczy oba odcinki od biezacej pozycji kuriera i zna prawdziwy
+       * adres klienta. Maps liczy od ostatniego wyslanego GPS-a, a odcinka
+       * do klienta w ogole nie policzy, bo oferta go nie ujawnia. Wczesniej
+       * bot dzielil kwote przez zmyslona liczbe i kazal odrzucac oplacalne kursy.
+       */
+      const rateBasis: 'APP' | 'MAPS' | 'NONE' =
+        appTotalKm != null && appTotalKm > 0
+          ? 'APP'
+          : route.totalKm != null && route.totalKm > 0
+            ? 'MAPS'
+            : 'NONE';
+
+      const totalKm = rateBasis === 'APP' ? appTotalKm! : rateBasis === 'MAPS' ? route.totalKm! : 0;
+
       const { netAmount, netRatePerKm, isProfitable } = computeOfferRate({
         grossAmount: offer.grossAmount,
         totalKm,
@@ -954,10 +984,14 @@ export function registerBotHandlers(bot: Telegraf): void {
       const offerId = await financeService.saveCourseOffer(tId, {
         grossAmount: offer.grossAmount,
         netAmount,
-        distancePickupKm: useMaps ? route.pickupKm : null,
-        distanceDeliveryKm: useMaps ? route.deliveryKm : null,
+        appPickupKm: offer.appPickupKm,
+        appDeliveryKm: offer.appDeliveryKm,
+        appTotalKm,
+        mapsPickupKm: route.pickupKm,
+        mapsDeliveryKm: route.deliveryKm,
+        mapsTotalKm: route.totalKm,
         distanceTotalKm: totalKm,
-        distanceSource: useMaps ? 'MAPS' : 'APP',
+        rateBasis,
         netRatePerKm,
         isProfitable,
         pickupAddress: offer.pickupAddress,
@@ -971,11 +1005,17 @@ export function registerBotHandlers(bot: Telegraf): void {
           netAmount,
           pickupAddress: offer.pickupAddress,
           deliveryAddress: offer.deliveryAddress,
-          pickupKm: useMaps ? route.pickupKm : null,
-          deliveryKm: useMaps ? route.deliveryKm : null,
+          appPickupKm: offer.appPickupKm,
+          appDeliveryKm: offer.appDeliveryKm,
+          appTotalKm,
+          mapsPickupKm: route.pickupKm,
+          mapsDeliveryKm: route.deliveryKm,
+          mapsTotalKm: route.totalKm,
+          mapsReason: route.reason,
+          mapsDeliveryReason: route.deliveryReason,
+          mapsAgeMin: route.ageMin,
           totalKm,
-          source: useMaps ? 'MAPS' : 'APP',
-          sourceNote: useMaps ? null : route.reason,
+          rateBasis,
           netRatePerKm,
           status: 'PENDING',
         }),

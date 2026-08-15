@@ -24,6 +24,8 @@ export const CFG = {
 
   /** Waznosc lokalizacji GPS do weryfikacji tras (30 min). */
   LOCATION_MAX_AGE_MS: 30 * 60 * 1000,
+  /** Od jakiej roznicy miedzy aplikacja a Google Maps ostrzegac (km). */
+  DISTANCE_DIVERGENCE_KM: 1.5,
   /** Jak dlugo czeka potwierdzenie importu Portfela. */
   WALLET_IMPORT_TTL_MS: 15 * 60 * 1000,
   /** Jak dlugo bot czeka na wpisanie wartosci z klawiatury. */

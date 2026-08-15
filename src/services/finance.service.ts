@@ -450,16 +450,22 @@ export class FinanceService {
     data: {
       grossAmount: number;
       netAmount: number;
-      distancePickupKm: number | null;
-      distanceDeliveryKm: number | null;
+      appPickupKm: number | null;
+      appDeliveryKm: number | null;
+      appTotalKm: number | null;
+      mapsPickupKm: number | null;
+      mapsDeliveryKm: number | null;
+      mapsTotalKm: number | null;
       distanceTotalKm: number;
-      distanceSource: 'MAPS' | 'APP';
+      rateBasis: 'APP' | 'MAPS' | 'NONE';
       netRatePerKm: number;
       isProfitable: boolean;
       pickupAddress: string;
       deliveryAddress: string;
     }
   ): Promise<number> {
+    const dec = (v: number | null): string | null => (v != null ? v.toFixed(2) : null);
+
     const [inserted] = await db
       .insert(courseOffers)
       .values({
@@ -468,10 +474,14 @@ export class FinanceService {
         time: nowTimeWarsaw(),
         grossAmount: data.grossAmount.toFixed(2),
         netAmount: data.netAmount.toFixed(2),
-        distancePickupKm: data.distancePickupKm != null ? data.distancePickupKm.toFixed(2) : null,
-        distanceDeliveryKm: data.distanceDeliveryKm != null ? data.distanceDeliveryKm.toFixed(2) : null,
+        appPickupKm: dec(data.appPickupKm),
+        appDeliveryKm: dec(data.appDeliveryKm),
+        appTotalKm: dec(data.appTotalKm),
+        mapsPickupKm: dec(data.mapsPickupKm),
+        mapsDeliveryKm: dec(data.mapsDeliveryKm),
+        mapsTotalKm: dec(data.mapsTotalKm),
         distanceTotalKm: data.distanceTotalKm.toFixed(2),
-        distanceSource: data.distanceSource,
+        rateBasis: data.rateBasis,
         netRatePerKm: data.netRatePerKm.toFixed(2),
         isProfitable: data.isProfitable,
         status: 'PENDING',

@@ -152,14 +152,23 @@ export const courseOffers = pgTable(
     time: text('time').notNull(),
     grossAmount: numeric('gross_amount', { precision: 10, scale: 2 }).notNull(),
     netAmount: numeric('net_amount', { precision: 10, scale: 2 }).notNull(),
-    /** Kurier -> punkt odbioru. */
-    distancePickupKm: numeric('distance_pickup_km', { precision: 10, scale: 2 }),
-    /** Punkt odbioru -> klient. */
-    distanceDeliveryKm: numeric('distance_delivery_km', { precision: 10, scale: 2 }),
-    /** Suma odcinkow - podstawa wyliczenia stawki zl/km. */
+
+    // --- Dystans deklarowany przez aplikacje Glovo (z ekranu oferty) ---------
+    appPickupKm: numeric('app_pickup_km', { precision: 10, scale: 2 }),
+    appDeliveryKm: numeric('app_delivery_km', { precision: 10, scale: 2 }),
+    appTotalKm: numeric('app_total_km', { precision: 10, scale: 2 }),
+
+    // --- Dystans policzony niezaleznie przez Google Maps --------------------
+    // Odcinek dostawy zwykle zostaje pusty: przed akceptacja Glovo nie podaje
+    // adresu klienta, wiec nie ma czego geokodowac.
+    mapsPickupKm: numeric('maps_pickup_km', { precision: 10, scale: 2 }),
+    mapsDeliveryKm: numeric('maps_delivery_km', { precision: 10, scale: 2 }),
+    mapsTotalKm: numeric('maps_total_km', { precision: 10, scale: 2 }),
+
+    /** Dystans faktycznie uzyty do wyliczenia stawki zl/km. */
     distanceTotalKm: numeric('distance_total_km', { precision: 10, scale: 2 }).notNull(),
-    /** 'MAPS' = zweryfikowane Google Maps, 'APP' = deklaracja z aplikacji Glovo. */
-    distanceSource: text('distance_source').notNull().default('APP'),
+    /** Skad wziety `distance_total_km`: 'APP' | 'MAPS' | 'NONE'. */
+    rateBasis: text('rate_basis').notNull().default('APP'),
     netRatePerKm: numeric('net_rate_per_km', { precision: 10, scale: 2 }).notNull(),
     isProfitable: boolean('is_profitable').notNull(),
     /** 'PENDING' | 'ACCEPTED' | 'REJECTED' */

@@ -46,7 +46,10 @@ export const CourseOfferSchema = z.object({
   grossAmount: z.number(),
   pickupAddress: z.string().min(1),
   deliveryAddress: z.string().min(1),
-  appDistanceKm: nullableNumber,
+  /** Dystans z aplikacji Glovo: kurier -> punkt odbioru (przy wierszu restauracji). */
+  appPickupKm: nullableNumber,
+  /** Dystans z aplikacji Glovo: odbior -> klient (przy wierszu "Dostawa"). */
+  appDeliveryKm: nullableNumber,
 });
 export type CourseOfferExtractedData = z.infer<typeof CourseOfferSchema>;
 
@@ -113,7 +116,16 @@ const courseOfferResponseSchema: Schema = {
     grossAmount: { type: Type.NUMBER },
     pickupAddress: { type: Type.STRING },
     deliveryAddress: { type: Type.STRING },
-    appDistanceKm: { type: Type.NUMBER, nullable: true },
+    appPickupKm: {
+      type: Type.NUMBER,
+      nullable: true,
+      description: 'Kilometry po PRAWEJ stronie wiersza z nazwą i adresem punktu odbioru (np. 3,37 km).',
+    },
+    appDeliveryKm: {
+      type: Type.NUMBER,
+      nullable: true,
+      description: 'Kilometry po PRAWEJ stronie wiersza "Dostawa" (np. 3,01 km).',
+    },
   },
   required: ['grossAmount', 'pickupAddress', 'deliveryAddress'],
 };
@@ -240,9 +252,17 @@ Ignoruj kody CN, numery stacji i oznaczenia 95/98.
 
   async analyzeCourseOffer(imageBuffer: Buffer, mimeType = 'image/jpeg'): Promise<CourseOfferExtractedData> {
     const prompt = `
-Przeanalizuj ofertę kursu Glovo.
-Wyciągnij: kwotę brutto za kurs (ignoruj "POTRZEBNA GOTÓWKA" i "ZAPŁAĆ"),
-adres odbioru, adres klienta oraz szacowany dystans całej trasy w km.
+Przeanalizuj ofertę kursu Glovo. Ekran ma układ pionowej osi z dwoma punktami.
+
+- grossAmount: duża zielona kwota u góry. IGNORUJ "POTRZEBNA GOTÓWKA" i przycisk "ZAPŁAĆ ... zł"
+  (to gotówka do pobrania od klienta, nie zarobek).
+- pickupAddress: nazwa i adres pierwszego punktu (ikona sklepu).
+- deliveryAddress: opis drugiego punktu (ikona osoby, zwykle podpisany "Dostawa").
+  Często jest to sama nazwa miasta — przepisz dokładnie to, co widzisz, nie zgaduj adresu.
+- appPickupKm: liczba kilometrów wyrównana do PRAWEJ w wierszu punktu odbioru (np. 3,37 km).
+- appDeliveryKm: liczba kilometrów wyrównana do PRAWEJ w wierszu "Dostawa" (np. 3,01 km).
+
+Kilometry zapisuj jako liczby, przecinek zamień na kropkę. Jeśli któregoś nie widać, zwróć null.
 `;
     return this.generate(
       CourseOfferSchema,

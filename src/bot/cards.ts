@@ -170,11 +170,20 @@ export interface OfferCardData {
   netAmount: number;
   pickupAddress: string;
   deliveryAddress: string;
-  pickupKm: number | null;
-  deliveryKm: number | null;
+  /** Dystans deklarowany przez aplikacje Glovo. */
+  appPickupKm: number | null;
+  appDeliveryKm: number | null;
+  appTotalKm: number | null;
+  /** Niezalezna kontrola Google Maps. */
+  mapsPickupKm: number | null;
+  mapsDeliveryKm: number | null;
+  mapsTotalKm: number | null;
+  mapsReason: string | null;
+  mapsDeliveryReason: string | null;
+  mapsAgeMin: number;
+  /** Dystans uzyty do stawki i jego zrodlo. */
   totalKm: number;
-  source: 'MAPS' | 'APP';
-  sourceNote: string | null;
+  rateBasis: 'APP' | 'MAPS' | 'NONE';
   netRatePerKm: number;
   status?: 'PENDING' | 'ACCEPTED' | 'REJECTED';
 }
@@ -191,8 +200,29 @@ const STATUS_LINE: Record<'PENDING' | 'ACCEPTED' | 'REJECTED', string> = {
  * co nigdy nie trafialo (faktyczna linia miala gwiazdki: `🔘 *Status:*`),
  * wiec karta konczyla z dwiema liniami statusu.
  */
+const leg = (value: number | null, note?: string | null): string =>
+  value != null ? b(km(value, 2)) : i(note ?? 'brak');
+
+/**
+ * Karta oferty z ROZDZIELONYMI zrodlami dystansu.
+ *
+ * Aplikacja Glovo podaje oba odcinki i liczy je od biezacej pozycji kuriera —
+ * to jest podstawa stawki. Google Maps sluzy wylacznie za kontrole dojazdu;
+ * odcinka do klienta zwykle nie policzy, bo oferta nie ujawnia jego adresu.
+ */
 export function offerCard(data: OfferCardData): string {
   const status = data.status ?? 'PENDING';
+
+  // Rozbieznosc dojazdu ma sens tylko gdy sa obie liczby.
+  const pickupDelta =
+    data.appPickupKm != null && data.mapsPickupKm != null ? data.mapsPickupKm - data.appPickupKm : null;
+  const divergent = pickupDelta != null && Math.abs(pickupDelta) >= CFG.DISTANCE_DIVERGENCE_KM;
+
+  const basisLabel: Record<OfferCardData['rateBasis'], string> = {
+    APP: 'z aplikacji Glovo',
+    MAPS: 'z Google Maps',
+    NONE: 'brak danych o dystansie',
+  };
 
   return joinLines([
     data.isProfitable ? b('✅ KURS OPŁACALNY') : b('❌ KURS SŁABY / ODRZUĆ'),
@@ -201,14 +231,26 @@ export function offerCard(data: OfferCardData): string {
     `📍 ${b('Odbiór:')} ${code(data.pickupAddress)}`,
     `🏠 ${b('Dostawa:')} ${code(data.deliveryAddress)}`,
     '',
-    // FIX (2.3): trzy osobne pozycje zamiast jednej mylacej liczby.
-    `🛣️ ${b('Dystans:')}`,
-    ` • Odbiór: ${data.pickupKm != null ? b(km(data.pickupKm, 2)) : i('brak')}`,
-    ` • Dostawa: ${data.deliveryKm != null ? b(km(data.deliveryKm, 2)) : i('brak')}`,
-    ` • ${b('Suma:')} ${b(km(data.totalKm, 2))} ${i(data.source === 'MAPS' ? '(Google Maps)' : '(z aplikacji Glovo)')}`,
-    data.sourceNote && ` ${i(`⚠️ ${data.sourceNote}`)}`,
+    `📱 ${b('Dystans z aplikacji Glovo:')}`,
+    ` • Odbiór: ${leg(data.appPickupKm)}`,
+    ` • Dostawa: ${leg(data.appDeliveryKm)}`,
+    ` • ${b('Suma:')} ${leg(data.appTotalKm)}`,
+    '',
+    `🗺️ ${b('Kontrola Google Maps:')}`,
+    data.mapsReason
+      ? ` • ${i(data.mapsReason)}`
+      : joinLines([
+          ` • Odbiór: ${leg(data.mapsPickupKm)}` +
+            (pickupDelta != null ? ` ${i(`(${pickupDelta > 0 ? '+' : ''}${pickupDelta.toFixed(2)} km)`)}` : ''),
+          ` • Dostawa: ${leg(data.mapsDeliveryKm, data.mapsDeliveryReason)}`,
+          data.mapsTotalKm != null ? ` • ${b('Suma:')} ${b(km(data.mapsTotalKm, 2))}` : '',
+          data.mapsAgeMin > 0 ? ` • ${i(`pozycja GPS sprzed ${data.mapsAgeMin} min`)}` : '',
+        ]),
+    divergent &&
+      ` ⚠️ ${i('Duża różnica na dojeździe — sprawdź, czy GPS jest aktualny (/lokalizacja).')}`,
     '',
     `📊 ${b('Stawka netto/km:')} ${b(`${data.netRatePerKm.toFixed(2)} zł/km`)} (min. ${CFG.MIN_STAWKA_NETTO_KM.toFixed(2)} zł)`,
+    ` ${i(`liczona z ${data.totalKm.toFixed(2)} km — ${basisLabel[data.rateBasis]}`)}`,
     '',
     STATUS_LINE[status],
   ]);
