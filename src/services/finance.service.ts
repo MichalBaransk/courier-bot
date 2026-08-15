@@ -1,320 +1,337 @@
-import { db } from '../db/index.js';
-import { dailyRecords, cashTips, walletTransactions, balanceCheckpoints, courseOffers } from '../db/schema.js';
-import { CFG } from '../config.js';
-import { eq, and, sql, desc, gte, lte } from 'drizzle-orm';
+import { db } from '../db';
+import {
+  dailyRecords,
+  cashTips,
+  walletTransactions,
+  balanceCheckpoints,
+  courseOffers,
+} from '../db/schema';
+import { eq, and, gte, lte, sql, desc } from 'drizzle-orm';
+import { NETTO_FACTOR } from '../config';
+import { VoiceExtractedData } from './gemini.service';
 
-export function round2(n: number): number {
-  return Math.round(n * 100) / 100;
-}
-
-export function fmt(n: number | string | null | undefined): string {
-  if (n === null || n === undefined || n === '') return '';
-  const num = typeof n === 'string' ? parseFloat(n) : n;
-  if (isNaN(num)) return '';
-  const r = round2(num);
-  return (r % 1 === 0 ? String(r) : r.toFixed(2)).replace('.', ',');
-}
-
-export function getWorkDate(date: Date = new Date()): string {
-  const d = new Date(date);
-  const hour = d.getHours();
-  // Reguła nocna: wpis między 00:00 a 03:59 należy do poprzedniego dnia roboczego
-  if (hour >= 0 && hour < 4) {
-    d.setDate(d.getDate() - 1);
-  }
-  return d.toISOString().slice(0, 10);
-}
-
-export function normalizeTime(timeStr: string | null | undefined): string | null {
-  if (!timeStr) return null;
-  const s = timeStr.trim();
-  const m1 = s.match(/^(\d{1,2})[:.](\d{2})$/);
-  if (m1) {
-    const h = parseInt(m1[1], 10), min = parseInt(m1[2], 10);
-    if (h >= 0 && h <= 23 && min >= 0 && min <= 59) {
-      return ('0' + h).slice(-2) + ':' + ('0' + min).slice(-2);
-    }
-  }
-  const m2 = s.match(/^(\d{1,2})$/);
-  if (m2) {
-    const h = parseInt(m2[1], 10);
-    if (h >= 0 && h <= 23) return ('0' + h).slice(-2) + ':00';
-  }
-  return null;
-}
-
-export function calculateHoursFromRange(from: string, to: string): number | null {
-  const normFrom = normalizeTime(from);
-  const normTo = normalizeTime(to);
-  if (!normFrom || !normTo) return null;
-
-  const [h1, m1] = normFrom.split(':').map(Number);
-  const [h2, m2] = normTo.split(':').map(Number);
-  let diffMin = (h2 * 60 + m2) - (h1 * 60 + m1);
-  if (diffMin <= 0) diffMin += 24 * 60; // Praca przez północ
-  return round2(diffMin / 60);
-}
-
-export function parseQuickTip(text: string): number | null {
-  const s = text.trim();
-  const m = s.match(/^(?:n|np|nap|napiwek|napiwki)\s*[:=]?\s*(\d{1,4}(?:[.,]\d{1,2})?)\s*(?:z[łl]|pln)?\s*$/i);
-  if (!m) return null;
-  const kwota = parseFloat(m[1].replace(',', '.'));
-  return isNaN(kwota) || kwota <= 0 ? null : round2(kwota);
-}
-
-export function parseQuickWorkRange(text: string): { from: string; to: string } | null {
-  const m = text.match(/(?:od\s+)?(\d{1,2}(?:[:.]\d{2})?)\s*(?:-|–|do)\s*(\d{1,2}(?:[:.]\d{2})?)/i);
-  if (!m) return null;
-  const from = normalizeTime(m[1]);
-  const to = normalizeTime(m[2]);
-  return from && to ? { from, to } : null;
-}
-
-export async function saveCashTip(telegramId: number, amount: number, dateStr: string) {
-  await db.insert(cashTips).values({
-    telegramId,
-    date: dateStr,
-    amount: amount.toString(),
-  });
-
-  const tips = await db.select().from(cashTips).where(
-    and(eq(cashTips.telegramId, telegramId), eq(cashTips.date, dateStr))
-  );
-
-  const total = tips.reduce((acc, curr) => acc + parseFloat(curr.amount), 0);
-  return { sum: round2(total), count: tips.length };
-}
-
-export async function undoLastCashTip(telegramId: number) {
-  const [last] = await db.select().from(cashTips)
-    .where(eq(cashTips.telegramId, telegramId))
-    .orderBy(desc(cashTips.id))
-    .limit(1);
-
-  if (!last) return 'ℹ️ Brak zapisanych napiwków do cofnięcia.';
-
-  await db.delete(cashTips).where(eq(cashTips.id, last.id));
-  const remaining = await db.select().from(cashTips).where(
-    and(eq(cashTips.telegramId, telegramId), eq(cashTips.date, last.date))
-  );
-  const sum = remaining.reduce((acc, curr) => acc + parseFloat(curr.amount), 0);
-
-  return `↩️ Cofnięto ostatni napiwek: ${fmt(last.amount)} zł z ${last.date}.\nPozostało w tym dniu: ${fmt(sum)} zł.`;
-}
-
-export async function getTipsForDay(telegramId: number, dateStr: string) {
-  const tips = await db.select().from(cashTips).where(
-    and(eq(cashTips.telegramId, telegramId), eq(cashTips.date, dateStr))
-  );
-  if (!tips.length) return `ℹ️ Brak napiwków na ${dateStr}.`;
-
-  const total = tips.reduce((acc, curr) => acc + parseFloat(curr.amount), 0);
-  const list = tips.map(t => `• ${fmt(t.amount)} zł`).join('\n');
-  return `💸 Napiwki ${dateStr}\n\n${list}\n\nRazem: ${fmt(total)} zł (${tips.length} szt.)`;
-}
-
-export async function saveDailyRecord(
-  telegramId: number,
-  dateStr: string,
-  data: {
-    grossEarnings?: number | null;
-    fuelPrice?: number | null;
-    fuelLiters?: number | null;
-    fuelDistance?: number | null;
-    workFrom?: string | null;
-    workTo?: string | null;
-    workHours?: number | null;
-  }
-) {
-  const existing = await db.select().from(dailyRecords).where(
-    and(eq(dailyRecords.telegramId, telegramId), eq(dailyRecords.date, dateStr))
-  );
-
-  const payload = {
-    telegramId,
-    date: dateStr,
-    grossEarnings: data.grossEarnings !== undefined ? (data.grossEarnings?.toString() || null) : existing[0]?.grossEarnings,
-    fuelPrice: data.fuelPrice !== undefined ? (data.fuelPrice?.toString() || null) : existing[0]?.fuelPrice,
-    fuelLiters: data.fuelLiters !== undefined ? (data.fuelLiters?.toString() || null) : existing[0]?.fuelLiters,
-    fuelDistance: data.fuelDistance !== undefined ? (data.fuelDistance?.toString() || null) : existing[0]?.fuelDistance,
-    workFrom: data.workFrom !== undefined ? data.workFrom : existing[0]?.workFrom,
-    workTo: data.workTo !== undefined ? data.workTo : existing[0]?.workTo,
-    workHours: data.workHours !== undefined ? (data.workHours?.toString() || null) : existing[0]?.workHours,
-  };
-
-  if (existing.length > 0) {
-    await db.update(dailyRecords).set(payload).where(eq(dailyRecords.id, existing[0].id));
-  } else {
-    await db.insert(dailyRecords).values(payload);
-  }
-}
-
-export async function calculateBalance(telegramId: number, targetDate: string): Promise<number | null> {
-  const [checkpoint] = await db.select().from(balanceCheckpoints)
-    .where(and(eq(balanceCheckpoints.telegramId, telegramId), lte(balanceCheckpoints.date, targetDate)))
-    .orderBy(desc(balanceCheckpoints.date))
-    .limit(1);
-
-  if (!checkpoint) return null;
-
-  const baseVal = parseFloat(checkpoint.balanceValue);
-  const txs = await db.select().from(walletTransactions).where(
-    and(
-      eq(walletTransactions.telegramId, telegramId),
-      gte(walletTransactions.date, checkpoint.date),
-      lte(walletTransactions.date, targetDate)
-    )
-  );
-
-  const movement = txs.reduce((acc, curr) => acc + parseFloat(curr.amount), 0);
-  return round2(baseVal + movement);
-}
-
-export async function getDaySummaryText(telegramId: number, dateStr: string): Promise<string> {
-  const [record] = await db.select().from(dailyRecords).where(
-    and(eq(dailyRecords.telegramId, telegramId), eq(dailyRecords.date, dateStr))
-  );
-
-  const tips = await db.select().from(cashTips).where(
-    and(eq(cashTips.telegramId, telegramId), eq(cashTips.date, dateStr))
-  );
-  const tipSum = tips.reduce((acc, curr) => acc + parseFloat(curr.amount), 0);
-
-  const walletTxs = await db.select().from(walletTransactions).where(
-    and(eq(walletTransactions.telegramId, telegramId), eq(walletTransactions.date, dateStr))
-  );
-  const payoutPf = Math.abs(walletTxs.filter(t => t.type === 'wyplata').reduce((a, c) => a + parseFloat(c.amount), 0));
-
-  const gross = record?.grossEarnings ? parseFloat(record.grossEarnings) : null;
-  const distance = record?.fuelDistance ? parseFloat(record.fuelDistance) : null;
-  const fuelPrice = record?.fuelPrice ? parseFloat(record.fuelPrice) : null;
-  const fuelLiters = record?.fuelLiters ? parseFloat(record.fuelLiters) : null;
-  const hours = record?.workHours ? parseFloat(record.workHours) : null;
-
-  const tax = gross !== null ? round2(gross * CFG.TAX_FACTOR) : null;
-  const netEarnings = gross !== null ? round2(gross * CFG.NETTO_FACTOR) : 0;
-  const netWithTips = (gross !== null || tipSum > 0) ? round2(netEarnings + tipSum) : null;
-  const toTransfer = netWithTips !== null ? round2(netWithTips - tipSum - payoutPf) : null;
-  const burn = (fuelLiters && distance && distance > 0) ? round2((fuelLiters / distance) * 100) : null;
-
-  const balance = await calculateBalance(telegramId, dateStr);
-
-  const lines: string[] = [`📅 *Stan dnia: ${dateStr}*`, ''];
-
-  if (gross !== null) {
-    lines.push(`• *Brutto:* ${fmt(gross)} zł (podatek 18,6%: ${fmt(tax)} zł) → *netto:* ${fmt(netWithTips)} zł`);
-    if (tipSum > 0) lines.push(`• *Napiwki (gotówka):* ${fmt(tipSum)} zł (wliczone w netto)`);
-    if (distance && distance > 0) {
-      lines.push(`• *Stawka/km:* ${fmt(gross / distance)} zł brutto | ${fmt(netWithTips! / distance)} zł netto`);
-    }
-    if (hours && hours > 0) {
-      const range = (record?.workFrom && record?.workTo) ? ` (${record.workFrom}–${record.workTo})` : '';
-      lines.push(`• *Czas pracy:* ${fmt(hours)} h${range} → ${fmt(gross / hours)} zł brutto/h | ${fmt(netWithTips! / hours)} zł netto/h`);
-    }
-    if (toTransfer !== null) lines.push(`• *Do przelewu (Glovo):* ${fmt(toTransfer)} zł`);
-  } else if (tipSum > 0) {
-    lines.push(`• *Napiwki (gotówka):* ${fmt(tipSum)} zł`);
-  }
-
-  if (balance !== null) {
-    lines.push(`• *Saldo Glovo:* ${fmt(balance)} zł${balance < 0 ? ' (Glovo jest Ci winne)' : ''}`);
-  }
-
-  if (fuelPrice !== null || fuelLiters !== null || distance !== null) {
-    const parts = [];
-    if (fuelPrice !== null) parts.push(`${fmt(fuelPrice)} zł`);
-    if (fuelLiters !== null) parts.push(`${fmt(fuelLiters)} l`);
-    if (distance !== null) parts.push(`${fmt(distance)} km`);
-    lines.push(`• *Paliwo:* ${parts.join(' / ')}`);
-  }
-  if (burn !== null) lines.push(`• *Spalanie:* ${fmt(burn)} l/100km`);
-
-  if (walletTxs.length > 0) {
-    lines.push('', '📥 *Portfel Glovo:*');
-    walletTxs.forEach(t => lines.push(`• ${t.type}: ${fmt(t.amount)} zł (${t.time})`));
-  }
-
-  return lines.length > 2 ? lines.join('\n') : `ℹ️ Brak wpisów na dzień ${dateStr}.`;
-}
-
-export async function getWeekSummaryText(telegramId: number, offsetWeeks: number = 0): Promise<string> {
-  const now = new Date();
-  const day = (now.getDay() + 6) % 7; // Poniedziałek = 0
-  const monday = new Date(now);
-  monday.setDate(monday.getDate() - day + offsetWeeks * 7);
-  const sunday = new Date(monday);
-  sunday.setDate(sunday.getDate() + 6);
-
-  const fromStr = monday.toISOString().slice(0, 10);
-  const toStr = sunday.toISOString().slice(0, 10);
-
-  const records = await db.select().from(dailyRecords).where(
-    and(eq(dailyRecords.telegramId, telegramId), gte(dailyRecords.date, fromStr), lte(dailyRecords.date, toStr))
-  );
-
-  const tips = await db.select().from(cashTips).where(
-    and(eq(cashTips.telegramId, telegramId), gte(cashTips.date, fromStr), lte(cashTips.date, toStr))
-  );
-
-  const header = offsetWeeks === 0 ? `📅 *TEN TYDZIEŃ* (${fromStr} — ${toStr})` : `📅 *POPRZEDNI TYDZIEŃ* (${fromStr} — ${toStr})`;
-  if (!records.length && !tips.length) return `${header}\n\nℹ️ Brak wpisów w wybranym tygodniu.`;
-
-  let gross = 0, fuel = 0, liters = 0, km = 0, hours = 0;
-  records.forEach(r => {
-    gross += r.grossEarnings ? parseFloat(r.grossEarnings) : 0;
-    fuel += r.fuelPrice ? parseFloat(r.fuelPrice) : 0;
-    liters += r.fuelLiters ? parseFloat(r.fuelLiters) : 0;
-    km += r.fuelDistance ? parseFloat(r.fuelDistance) : 0;
-    hours += r.workHours ? parseFloat(r.workHours) : 0;
-  });
-
-  const tipTotal = tips.reduce((a, c) => a + parseFloat(c.amount), 0);
-  const tax = round2(gross * CFG.TAX_FACTOR);
-  const net = round2(gross * CFG.NETTO_FACTOR + tipTotal);
-
-  const out = [
-    header, '',
-    '📊 *ZAROBKI*',
-    `• Brutto: ${fmt(gross)} zł`,
-    `• Składki i podatek: ${fmt(tax)} zł`,
-    tipTotal > 0 ? `• Napiwki (gotówka): ${fmt(tipTotal)} zł` : '',
-    `• Netto: ${fmt(net)} zł`,
-    '',
-    '⏱ *CZAS I DYSTANS*',
-    `• Dni z wpisem: ${records.length}`,
-    hours > 0 ? `• Godziny: ${fmt(hours)} h (${fmt(gross / hours)} zł brutto/h | ${fmt(net / hours)} zł netto/h)` : '',
-    km > 0 ? `• Dystans: ${fmt(km)} km (${fmt(gross / km)} zł brutto/km | ${fmt(net / km)} zł netto/km)` : '',
-    fuel > 0 ? `• Paliwo: ${fmt(fuel)} zł / ${fmt(liters)} l` : '',
-    (km > 0 && liters > 0) ? `• Średnie spalanie: ${fmt((liters / km) * 100)} l/100km` : '',
-    '',
-    `💰 *Netto po paliwie:* ${fmt(net - fuel)} zł`
-  ].filter(Boolean);
-
-  return out.join('\n');
-}
-export async function saveCourseOffer(params: {
-  telegramId: number;
+export interface DailySummary {
   date: string;
-  time: string;
-  grossAmount: number;
-  netAmount: number;
-  totalDistance: number | null;
-  netRatePerKm: number | null;
-  isProfitable: boolean | null;
-  pointsJson: any;
-  verificationText: string | null;
-}) {
-  await db.insert(courseOffers).values({
-    telegramId: params.telegramId,
-    date: params.date,
-    time: params.time,
-    grossAmount: params.grossAmount.toString(),
-    netAmount: params.netAmount.toString(),
-    totalDistance: params.totalDistance !== null ? params.totalDistance.toString() : null,
-    netRatePerKm: params.netRatePerKm !== null ? params.netRatePerKm.toString() : null,
-    isProfitable: params.isProfitable,
-    pointsJson: params.pointsJson,
-    verificationText: params.verificationText,
-  });
+  grossEarnings: number;
+  netEarnings: number;
+  cashTipsTotal: number;
+  totalNetto: number;
+  workHours: number;
+  hourlyRateNetto: number;
+  fuelPrice: number;
+  fuelLiters: number;
+  fuelDistance: number | null;
 }
+
+export class FinanceService {
+  /**
+   * Reguła nocnej zmiany (00:00 - 03:59 -> wczorajsza data).
+   */
+  getEffectiveDate(d = new Date()): string {
+    const target = new Date(d);
+    if (target.getHours() < 4) {
+      target.setDate(target.getDate() - 1);
+    }
+    return target.toISOString().slice(0, 10);
+  }
+
+  /**
+   * Obliczanie godzin pracy z uwzględnieniem przejścia przez północ (próg >= 0.25h).
+   */
+  calculateHours(fromStr: string, toStr: string): number {
+    const [fH, fM] = fromStr.split(':').map(Number);
+    const [tH, tM] = toStr.split(':').map(Number);
+    let diffMinutes = (tH * 60 + tM) - (fH * 60 + fM);
+    if (diffMinutes < 0) diffMinutes += 24 * 60;
+    const hours = Math.round((diffMinutes / 60) * 100) / 100;
+    return hours >= 0.25 ? hours : 0;
+  }
+
+  /**
+   * Zapis napiwku gotówkowego do tabeli cash_tips.
+   */
+  async saveCashTip(telegramId: string | number, date: string, amount: number): Promise<void> {
+    await db.insert(cashTips).values({
+      telegramId: String(telegramId),
+      date,
+      amount: amount.toFixed(2),
+    });
+  }
+
+  /**
+   * Zapis / aktualizacja danych paliwowych w daily_records.
+   */
+  async saveFuelReceipt(
+    telegramId: string | number,
+    date: string,
+    price: number,
+    liters: number | null
+  ): Promise<void> {
+    const tId = String(telegramId);
+    await db
+      .insert(dailyRecords)
+      .values({
+        telegramId: tId,
+        date,
+        fuelPrice: price.toFixed(2),
+        fuelLiters: liters != null ? liters.toString() : null,
+      })
+      .onConflictDoUpdate({
+        target: [dailyRecords.telegramId, dailyRecords.date],
+        set: {
+          fuelPrice: price.toFixed(2),
+          ...(liters != null && { fuelLiters: liters.toString() }),
+        },
+      });
+  }
+
+  /**
+   * Zapis oferty kursu Glovo do tabeli course_offers.
+   */
+  async saveCourseOffer(
+    telegramId: string | number,
+    data: {
+      grossAmount: number;
+      netAmount: number;
+      totalDistance: number;
+      netRatePerKm: number;
+      isProfitable: boolean;
+      pickupAddress: string;
+      deliveryAddress: string;
+      verificationText?: string;
+    }
+  ): Promise<void> {
+    const now = new Date();
+    const date = this.getEffectiveDate(now);
+    const time = now.toTimeString().slice(0, 5);
+
+    await db.insert(courseOffers).values({
+      telegramId: String(telegramId),
+      date,
+      time,
+      grossAmount: data.grossAmount.toFixed(2),
+      netAmount: data.netAmount.toFixed(2),
+      totalDistance: data.totalDistance.toFixed(2),
+      netRatePerKm: data.netRatePerKm.toFixed(2),
+      isProfitable: data.isProfitable,
+      pointsJson: JSON.stringify({
+        pickup: data.pickupAddress,
+        delivery: data.deliveryAddress,
+      }),
+      verificationText: data.verificationText || null,
+    });
+  }
+
+  /**
+   * Zapis zdarzenia głosowego (Voice-to-Data) bezpośrednio do daily_records oraz cash_tips.
+   */
+  async saveVoiceEvent(
+    telegramId: string | number,
+    data: VoiceExtractedData
+  ): Promise<{ date: string; hasDailyUpdate: boolean; hasTip: boolean }> {
+    const tId = String(telegramId);
+    const date = this.getEffectiveDate();
+    let hasDailyUpdate = false;
+    let hasTip = false;
+
+    // 1. Zapis napiwku gotówkowego
+    if (data.cashTip && data.cashTip > 0) {
+      await this.saveCashTip(tId, date, data.cashTip);
+      hasTip = true;
+    }
+
+    // 2. Aktualizacja rekordu dziennego
+    const hasFuel = data.fuelPrice != null || data.fuelLiters != null || data.fuelDistance != null;
+    const hasEarnings = data.grossEarnings != null;
+    const hasShift = Boolean(data.workFrom && data.workTo);
+
+    if (hasFuel || hasEarnings || hasShift) {
+      hasDailyUpdate = true;
+      let calculatedHours: string | null = null;
+      if (data.workFrom && data.workTo) {
+        calculatedHours = this.calculateHours(data.workFrom, data.workTo).toString();
+      }
+
+      await db
+        .insert(dailyRecords)
+        .values({
+          telegramId: tId,
+          date,
+          fuelPrice: data.fuelPrice != null ? data.fuelPrice.toString() : null,
+          fuelLiters: data.fuelLiters != null ? data.fuelLiters.toString() : null,
+          fuelDistance: data.fuelDistance != null ? data.fuelDistance : null,
+          grossEarnings: data.grossEarnings != null ? data.grossEarnings.toString() : null,
+          workFrom: data.workFrom || null,
+          workTo: data.workTo || null,
+          workHours: calculatedHours,
+        })
+        .onConflictDoUpdate({
+          target: [dailyRecords.telegramId, dailyRecords.date],
+          set: {
+            ...(data.fuelPrice != null && { fuelPrice: data.fuelPrice.toString() }),
+            ...(data.fuelLiters != null && { fuelLiters: data.fuelLiters.toString() }),
+            ...(data.fuelDistance != null && { fuelDistance: data.fuelDistance }),
+            ...(data.grossEarnings != null && { grossEarnings: data.grossEarnings.toString() }),
+            ...(data.workFrom && { workFrom: data.workFrom }),
+            ...(data.workTo && { workTo: data.workTo }),
+            ...(calculatedHours && { workHours: calculatedHours }),
+          },
+        });
+    }
+
+    return { date, hasDailyUpdate, hasTip };
+  }
+
+  /**
+   * Pobiera pełne podsumowanie dnia dla kuriera.
+   */
+  async getDailySummary(telegramId: string | number, date: string): Promise<DailySummary> {
+    const tId = String(telegramId);
+
+    const [record] = await db
+      .select()
+      .from(dailyRecords)
+      .where(and(eq(dailyRecords.telegramId, tId), eq(dailyRecords.date, date)))
+      .limit(1);
+
+    const tips = await db
+      .select({ total: sql<string>`coalesce(sum(amount), 0)` })
+      .from(cashTips)
+      .where(and(eq(cashTips.telegramId, tId), eq(cashTips.date, date)));
+
+    const gross = record?.grossEarnings ? parseFloat(record.grossEarnings) : 0;
+    const netEarnings = Math.round(gross * NETTO_FACTOR * 100) / 100;
+    const cashTipsTotal = tips[0]?.total ? parseFloat(tips[0].total) : 0;
+    const totalNetto = Math.round((netEarnings + cashTipsTotal) * 100) / 100;
+    const workHours = record?.workHours ? parseFloat(record.workHours) : 0;
+    const hourlyRateNetto = workHours > 0 ? Math.round((totalNetto / workHours) * 100) / 100 : 0;
+
+    return {
+      date,
+      grossEarnings: gross,
+      netEarnings,
+      cashTipsTotal,
+      totalNetto,
+      workHours,
+      hourlyRateNetto,
+      fuelPrice: record?.fuelPrice ? parseFloat(record.fuelPrice) : 0,
+      fuelLiters: record?.fuelLiters ? parseFloat(record.fuelLiters) : 0,
+      fuelDistance: record?.fuelDistance ?? null,
+    };
+  }
+
+  /**
+   * Pobiera zagregowane podsumowanie za dany okres (tydzień, miesiąc).
+   */
+  async getPeriodSummary(
+    telegramId: string | number,
+    startDate: string,
+    endDate: string
+  ): Promise<{
+    startDate: string;
+    endDate: string;
+    totalGross: number;
+    totalNettoEarnings: number;
+    totalCashTips: number;
+    grandTotalNetto: number;
+    totalWorkHours: number;
+    avgHourlyRateNetto: number;
+    totalFuelCost: number;
+  }> {
+    const tId = String(telegramId);
+
+    const records = await db
+      .select()
+      .from(dailyRecords)
+      .where(
+        and(
+          eq(dailyRecords.telegramId, tId),
+          gte(dailyRecords.date, startDate),
+          lte(dailyRecords.date, endDate)
+        )
+      );
+
+    const tips = await db
+      .select({ total: sql<string>`coalesce(sum(amount), 0)` })
+      .from(cashTips)
+      .where(
+        and(
+          eq(cashTips.telegramId, tId),
+          gte(cashTips.date, startDate),
+          lte(cashTips.date, endDate)
+        )
+      );
+
+    let totalGross = 0;
+    let totalWorkHours = 0;
+    let totalFuelCost = 0;
+
+    for (const r of records) {
+      if (r.grossEarnings) totalGross += parseFloat(r.grossEarnings);
+      if (r.workHours) totalWorkHours += parseFloat(r.workHours);
+      if (r.fuelPrice) totalFuelCost += parseFloat(r.fuelPrice);
+    }
+
+    const totalNettoEarnings = Math.round(totalGross * NETTO_FACTOR * 100) / 100;
+    const totalCashTips = tips[0]?.total ? parseFloat(tips[0].total) : 0;
+    const grandTotalNetto = Math.round((totalNettoEarnings + totalCashTips) * 100) / 100;
+    const avgHourlyRateNetto =
+      totalWorkHours > 0 ? Math.round((grandTotalNetto / totalWorkHours) * 100) / 100 : 0;
+
+    return {
+      startDate,
+      endDate,
+      totalGross,
+      totalNettoEarnings,
+      totalCashTips,
+      grandTotalNetto,
+      totalWorkHours,
+      avgHourlyRateNetto,
+      totalFuelCost,
+    };
+  }
+
+  /**
+   * Oblicza kroczące saldo Portfela Glovo od ostatniego checkpointu.
+   */
+  async getRollingBalance(
+    telegramId: string | number,
+    targetDate = this.getEffectiveDate()
+  ): Promise<{ balance: number; checkpointDate: string | null }> {
+    const tId = String(telegramId);
+
+    const [checkpoint] = await db
+      .select()
+      .from(balanceCheckpoints)
+      .where(
+        and(
+          eq(balanceCheckpoints.telegramId, tId),
+          lte(balanceCheckpoints.date, targetDate)
+        )
+      )
+      .orderBy(desc(balanceCheckpoints.date))
+      .limit(1);
+
+    const baseBalance = checkpoint ? parseFloat(checkpoint.balanceValue) : 0;
+    const checkpointDate = checkpoint ? checkpoint.date : '1970-01-01';
+
+    const txs = await db
+      .select({ total: sql<string>`coalesce(sum(amount), 0)` })
+      .from(walletTransactions)
+      .where(
+        and(
+          eq(walletTransactions.telegramId, tId),
+          gte(walletTransactions.date, checkpointDate),
+          lte(walletTransactions.date, targetDate)
+        )
+      );
+
+    const delta = txs[0]?.total ? parseFloat(txs[0].total) : 0;
+    return {
+      balance: Math.round((baseBalance + delta) * 100) / 100,
+      checkpointDate: checkpoint ? checkpoint.date : null,
+    };
+  }
+}
+
+export const financeService = new FinanceService();

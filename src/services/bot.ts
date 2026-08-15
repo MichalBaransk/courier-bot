@@ -1,285 +1,337 @@
 import { Telegraf } from 'telegraf';
 import { message } from 'telegraf/filters';
-import 'dotenv/config';
-import {
-  getWorkDate,
-  parseQuickTip,
-  saveCashTip,
-  undoLastCashTip,
-  getTipsForDay,
-  saveDailyRecord,
-  getDaySummaryText,
-  getWeekSummaryText,
-  parseQuickWorkRange,
-  calculateHoursFromRange,
-  fmt,
-  round2,
-  saveCourseOffer,
-} from './finance.service.js';
-import { processVisionDocument, processVoiceOrText } from './gemini.service.js';
-import { verifyOfferDistance } from './maps.service.js';
-import { CFG } from '../config.js';
+import { geminiService } from './gemini.service';
+import { financeService } from './finance.service';
+import { mapsService } from './maps.service';
+import { NETTO_FACTOR, MIN_STAWKA_NETTO_KM } from '../config';
 
-export const bot = new Telegraf(process.env.BOT_TOKEN!);
+interface CourierLocation {
+  latitude: number;
+  longitude: number;
+  updatedAt: number;
+}
 
-// Pamięć sesji użytkownika
-const userLocations = new Map<number, { lat: number; lng: number; ts: number }>();
-const awaitingHours = new Map<number, string>(); // telegramId -> dateStr
+const lastCourierLocation: Map<string, CourierLocation> = new Map();
 
-bot.start(async (ctx) => {
-  await ctx.reply(
-    `🤖 *Witaj w asystencie kuriera!*\n\n` +
-    `Możesz wysyłać:\n` +
-    `• Wiadomości tekstowe i głosowe (np. _„zarobiłem 280 zł, 350 km, tankowanie 150 zł”_)\n` +
-    `• Szybkie napiwki: \`n 5.50\`, \`np 3\`\n` +
-    `• Zrzuty ekranu ofert Glovo, paragonów paliwa oraz Portfela\n` +
-    `• Udostępnienie lokalizacji GPS do weryfikacji tras kursów\n\n` +
-    `Wpisz /pomoc, aby zobaczyć pełną listę komend.`,
-    { parse_mode: 'Markdown' }
-  );
-});
+export function registerBotHandlers(bot: Telegraf): void {
+  // 1. Start / Pomoc
+  bot.command(['start', 'pomoc', 'help'], async (ctx) => {
+    const text = [
+      '🤖 *GlovoBot – Asystent Kuriera*',
+      '',
+      '🎙️ *Głosowe wprowadzanie zdarzeń:*',
+      ' • Wyślij notatkę głosową w trasie (np. _"Zatankowałem za 75 zł, 11 litrów, licznik 24300"_ lub _"Praca 10:00 do 16:30, zarobek 210 zł"_).',
+      '',
+      '📸 *Analiza zdjęć i zrzutów:*',
+      ' • *Oferta Glovo:* Prześlij zrzut ekranu – wyliczę opłacalność (zł netto / km).',
+      ' • *Paragon paliwowy:* Prześlij zdjęcie z podpisem _"paragon"_ lub _"paliwo"_.',
+      '',
+      '💵 *Szybkie komendy:*',
+      ' • `n 5` / `np 10.50` – natychmiastowy zapis napiwku bez AI.',
+      ' • `/dzis` – podsumowanie dzisiejszej zmiany.',
+      ' • `/tydzien` – podsumowanie bieżącego tygodnia.',
+      ' • `/miesiac` – podsumowanie miesiąca.',
+      ' • `/saldo` – aktualny stan portfela Glovo.',
+      ' • 📍 *Lokalizacja:* Wyślij pinezkę GPS – bot uwzględni realny dojazd do restauracji przez 30 min.',
+    ].join('\n');
 
-bot.command(['pomoc', 'help'], async (ctx) => {
-  await ctx.reply(
-    `📋 *Dostępne komendy:*\n\n` +
-    `• /dzis — Podsumowanie dzisiejszego dnia\n` +
-    `• /tydzien — Podsumowanie bieżącego tygodnia\n` +
-    `• /ptydzien — Podsumowanie poprzedniego tygodnia\n` +
-    `• /napiwki — Lista napiwków z dzisiaj\n` +
-    `• /napiwki cofnij — Cofnięcie ostatniego napiwku\n` +
-    `• /lokalizacja — Prośba o przesłanie punktu GPS`,
-    { parse_mode: 'Markdown' }
-  );
-});
-
-bot.command('dzis', async (ctx) => {
-  const summary = await getDaySummaryText(ctx.from.id, getWorkDate());
-  await ctx.reply(summary, { parse_mode: 'Markdown' });
-});
-
-bot.command('tydzien', async (ctx) => {
-  const summary = await getWeekSummaryText(ctx.from.id, 0);
-  await ctx.reply(summary, { parse_mode: 'Markdown' });
-});
-
-bot.command('ptydzien', async (ctx) => {
-  const summary = await getWeekSummaryText(ctx.from.id, -1);
-  await ctx.reply(summary, { parse_mode: 'Markdown' });
-});
-
-bot.command('napiwki', async (ctx) => {
-  const parts = ctx.text.split(' ');
-  const args = parts[1];
-  if (args === 'cofnij') {
-    const res = await undoLastCashTip(ctx.from.id);
-    await ctx.reply(res);
-    return;
-  }
-  const dateStr = args && /^\d{4}-\d{2}-\d{2}$/.test(args) ? args : getWorkDate();
-  const res = await getTipsForDay(ctx.from.id, dateStr);
-  await ctx.reply(res);
-});
-
-bot.command('lokalizacja', async (ctx) => {
-  await ctx.reply('📍 Wyślij swoją lokalizację GPS przyciskiem poniżej:', {
-    reply_markup: {
-      keyboard: [[{ text: '📍 Wyślij lokalizację', request_location: true }]],
-      resize_keyboard: true,
-      one_time_keyboard: true,
-    },
+    await ctx.reply(text, { parse_mode: 'Markdown' });
   });
-});
 
-// Obsługa pinezki GPS
-bot.on(message('location'), async (ctx) => {
-  userLocations.set(ctx.from.id, {
-    lat: ctx.message.location.latitude,
-    lng: ctx.message.location.longitude,
-    ts: Date.now(),
+  // 2. Podsumowanie dzisiejszego dnia
+  bot.command('dzis', async (ctx) => {
+    const date = financeService.getEffectiveDate();
+    const summary = await financeService.getDailySummary(ctx.from.id, date);
+
+    const text = [
+      `📅 *Raport dzienny:* \`${summary.date}\``,
+      '',
+      `💰 *Brutto:* *${summary.grossEarnings.toFixed(2)} zł*`,
+      `💵 *Netto (UoP 81.4%):* *${summary.netEarnings.toFixed(2)} zł*`,
+      `🪙 *Napiwki gotówka:* *+${summary.cashTipsTotal.toFixed(2)} zł*`,
+      `🏁 *Netto łącznie:* *${summary.totalNetto.toFixed(2)} zł*`,
+      '',
+      `⏱️ *Czas pracy:* *${summary.workHours.toFixed(2)} h*`,
+      `📈 *Stawka godzinowa:* *${summary.hourlyRateNetto.toFixed(2)} zł netto/h*`,
+      '',
+      summary.fuelPrice > 0
+        ? `⛽ *Paliwo:* *${summary.fuelPrice.toFixed(2)} zł* (${summary.fuelLiters.toFixed(2)} L)`
+        : '⛽ *Paliwo:* _Brak wpisu_',
+      summary.fuelDistance ? `🚗 *Przebieg:* *${summary.fuelDistance} km*` : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    await ctx.reply(text, { parse_mode: 'Markdown' });
   });
-  await ctx.reply('📍 Zaktualizowano lokalizację GPS. Będzie aktywna przez 30 minut.');
-});
 
-// Obsługa wiadomości tekstowych
-bot.on(message('text'), async (ctx) => {
-  const text = ctx.message.text.trim();
-  const telegramId = ctx.from.id;
-  const today = getWorkDate();
+  // 3. Podsumowanie tygodnia
+  bot.command('tydzien', async (ctx) => {
+    const now = new Date();
+    const dayOfWeek = now.getDay() === 0 ? 7 : now.getDay();
+    const monday = new Date(now);
+    monday.setDate(monday.getDate() - (dayOfWeek - 1));
 
-  // 1. Szybki napiwek regex (np. "n 5.5")[cite: 1]
-  const quickTip = parseQuickTip(text);
-  if (quickTip !== null) {
-    const result = await saveCashTip(telegramId, quickTip, today);
-    await ctx.reply(
-      `💸 Zapisano napiwek: *${fmt(quickTip)} zł* (Dzisiaj łącznie: *${fmt(result.sum)} zł*, ${result.count} szt.)`,
-      { parse_mode: 'Markdown' }
-    );
-    return;
-  }
+    const startDate = monday.toISOString().slice(0, 10);
+    const endDate = financeService.getEffectiveDate(now);
 
-  // 2. Odpowiedź na pytanie o godziny[cite: 1]
-  if (awaitingHours.has(telegramId)) {
-    const pendingDate = awaitingHours.get(telegramId)!;
-    const timeRange = parseQuickWorkRange(text);
-    let hours: number | null = null;
-    let from: string | null = null;
-    let to: string | null = null;
+    const summary = await financeService.getPeriodSummary(ctx.from.id, startDate, endDate);
 
-    if (timeRange) {
-      from = timeRange.from;
-      to = timeRange.to;
-      hours = calculateHoursFromRange(from, to);
-    } else {
-      const parsedHours = parseFloat(text.replace(',', '.'));
-      if (!isNaN(parsedHours) && parsedHours >= 0.25 && parsedHours <= 24) {
-        hours = round2(parsedHours);
-      }
-    }
+    const text = [
+      `📊 *Podsumowanie tygodnia (${summary.startDate} - ${summary.endDate}):*`,
+      '',
+      `💰 *Brutto łączne:* *${summary.totalGross.toFixed(2)} zł*`,
+      `💵 *Netto z zleceń:* *${summary.totalNettoEarnings.toFixed(2)} zł*`,
+      `🪙 *Napiwki gotówkowe:* *+${summary.totalCashTips.toFixed(2)} zł*`,
+      `🏁 *Netto całkowite:* *${summary.grandTotalNetto.toFixed(2)} zł*`,
+      '',
+      `⏱️ *Przepracowane godziny:* *${summary.totalWorkHours.toFixed(2)} h*`,
+      `📈 *Średnia stawka:* *${summary.avgHourlyRateNetto.toFixed(2)} zł netto/h*`,
+      `⛽ *Koszty paliwa:* *${summary.totalFuelCost.toFixed(2)} zł*`,
+    ].join('\n');
 
-    if (hours !== null) {
-      awaitingHours.delete(telegramId);
-      await saveDailyRecord(telegramId, pendingDate, { workHours: hours, workFrom: from, workTo: to });
-      await ctx.reply(`⏱ Zapisano *${fmt(hours)} h* pracy na dzień ${pendingDate}.`, { parse_mode: 'Markdown' });
-      const summary = await getDaySummaryText(telegramId, pendingDate);
-      await ctx.reply(summary, { parse_mode: 'Markdown' });
+    await ctx.reply(text, { parse_mode: 'Markdown' });
+  });
+
+  // 4. Podsumowanie miesiąca
+  bot.command('miesiac', async (ctx) => {
+    const now = new Date();
+    const startDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+    const endDate = financeService.getEffectiveDate(now);
+
+    const summary = await financeService.getPeriodSummary(ctx.from.id, startDate, endDate);
+
+    const text = [
+      `🗓️ *Podsumowanie miesiąca (${summary.startDate} - ${summary.endDate}):*`,
+      '',
+      `💰 *Brutto:* *${summary.totalGross.toFixed(2)} zł*`,
+      `💵 *Netto (zlecenia):* *${summary.totalNettoEarnings.toFixed(2)} zł*`,
+      `🪙 *Napiwki gotówkowe:* *+${summary.totalCashTips.toFixed(2)} zł*`,
+      `🏁 *Czyste Netto:* *${summary.grandTotalNetto.toFixed(2)} zł*`,
+      '',
+      `⏱️ *Godziny łączone:* *${summary.totalWorkHours.toFixed(2)} h*`,
+      `📈 *Średnia netto/h:* *${summary.avgHourlyRateNetto.toFixed(2)} zł/h*`,
+      `⛽ *Wydatki na paliwo:* *${summary.totalFuelCost.toFixed(2)} zł*`,
+    ].join('\n');
+
+    await ctx.reply(text, { parse_mode: 'Markdown' });
+  });
+
+  // 5. Saldo portfela Glovo
+  bot.command('saldo', async (ctx) => {
+    const balanceInfo = await financeService.getRollingBalance(ctx.from.id);
+    const text = [
+      '💼 *Saldo Portfela Glovo:*',
+      `💵 *Aktualny stan:* *${balanceInfo.balance.toFixed(2)} zł*`,
+      balanceInfo.checkpointDate
+        ? `📍 _Ostatni punkt bazowy z dnia: ${balanceInfo.checkpointDate}_`
+        : '⚠️ _Brak checkpointu – liczone z historii transakcji._',
+    ].join('\n');
+
+    await ctx.reply(text, { parse_mode: 'Markdown' });
+  });
+
+  // 6. Lokalizacja GPS kuriera (ważna 30 minut)
+  bot.on(message('location'), async (ctx) => {
+    const { latitude, longitude } = ctx.message.location;
+    lastCourierLocation.set(String(ctx.from.id), {
+      latitude,
+      longitude,
+      updatedAt: Date.now(),
+    });
+    await ctx.reply('📍 *Pozycja GPS zapisana.* Będzie brana pod uwagę przy weryfikacji ofert przez 30 min.', {
+      parse_mode: 'Markdown',
+    });
+  });
+
+  // 7. Szybka ścieżka napiwków (Regex: "n 5.5", "np 3", "napiwek 10")
+  bot.hears(/^(?:n|np|napiwek)\s+(\d+(?:[.,]\d+)?)$/i, async (ctx) => {
+    const rawAmount = ctx.match[1].replace(',', '.');
+    const tipAmount = parseFloat(rawAmount);
+
+    if (isNaN(tipAmount) || tipAmount <= 0) {
+      await ctx.reply('❌ Nieprawidłowa kwota napiwku.');
       return;
     }
-  }
 
-  // 3. Pełna analiza AI przez Gemini
-  await ctx.sendChatAction('typing');
-  try {
-    const aiRes = await processVoiceOrText({ text }, today);
-    const targetDate = aiRes.data || today;
+    const effectiveDate = financeService.getEffectiveDate();
+    await financeService.saveCashTip(ctx.from.id, effectiveDate, tipAmount);
 
-    let workHours = aiRes.godziny_pracy || null;
-    if (aiRes.praca_od && aiRes.praca_do) {
-      workHours = calculateHoursFromRange(aiRes.praca_od, aiRes.praca_do);
-    }
-
-    await saveDailyRecord(telegramId, targetDate, {
-      grossEarnings: aiRes.zarobki_brutto,
-      fuelPrice: aiRes.paliwo_cena,
-      fuelLiters: aiRes.paliwo_l,
-      fuelDistance: aiRes.paliwo_dystans,
-      workFrom: aiRes.praca_od,
-      workTo: aiRes.praca_do,
-      workHours,
+    await ctx.reply(`💵 *Dodano napiwek:* \`+${tipAmount.toFixed(2)} zł\`\n📅 *Data:* \`${effectiveDate}\``, {
+      parse_mode: 'Markdown',
     });
+  });
 
-    if (aiRes.napiwek_gotowka) {
-      await saveCashTip(telegramId, aiRes.napiwek_gotowka, targetDate);
-    }
+  // 8. Voice-to-Data: Nagrania audio i notatki głosowe z trasy
+  bot.on([message('voice'), message('audio')], async (ctx) => {
+    const voiceMsg = 'voice' in ctx.message ? ctx.message.voice : ctx.message.audio;
+    if (!voiceMsg) return;
 
-    const summary = await getDaySummaryText(telegramId, targetDate);
-    await ctx.reply(summary, { parse_mode: 'Markdown' });
+    const processingMsg = await ctx.reply('🎙️ *Przetwarzam notatkę głosową...*', { parse_mode: 'Markdown' });
 
-    // Jeśli podano zarobek, ale brakuje godzin – dopytaj[cite: 1]
-    if (aiRes.zarobki_brutto && !workHours) {
-      awaitingHours.set(telegramId, targetDate);
-      await ctx.reply(
-        `🕐 Ile godzin przepracowałeś ${targetDate}? (odpisz liczbą np. \`7.5\` lub zakresem \`16:00-22:30\`)`,
+    try {
+      const fileLink = await ctx.telegram.getFileLink(voiceMsg.file_id);
+      const res = await fetch(fileLink.href);
+      const arrayBuffer = await res.arrayBuffer();
+      const audioBuffer = Buffer.from(arrayBuffer);
+
+      const mimeType = ('mime_type' in voiceMsg && voiceMsg.mime_type) ? voiceMsg.mime_type : 'audio/ogg';
+      const extracted = await geminiService.parseVoiceNote(audioBuffer, mimeType);
+      const result = await financeService.saveVoiceEvent(ctx.from.id, extracted);
+
+      const lines: string[] = [
+        `🗣️ *Transkrypcja:* _"${extracted.transcription}"_`,
+        `📅 *Data wpisu:* \`${result.date}\``,
+        '',
+      ];
+
+      if (extracted.fuelPrice != null || extracted.fuelLiters != null || extracted.fuelDistance != null) {
+        lines.push('⛽ *Zaktualizowano paliwo:*');
+        if (extracted.fuelPrice != null) lines.push(` • Koszt: *${extracted.fuelPrice.toFixed(2)} zł*`);
+        if (extracted.fuelLiters != null) lines.push(` • Ilość: *${extracted.fuelLiters} L*`);
+        if (extracted.fuelDistance != null) lines.push(` • Licznik: *${extracted.fuelDistance} km*`);
+      }
+
+      if (extracted.grossEarnings != null) {
+        lines.push(`💰 *Zarobek brutto:* *${extracted.grossEarnings.toFixed(2)} zł*`);
+      }
+
+      if (extracted.workFrom && extracted.workTo) {
+        lines.push(`⏱️ *Godziny pracy:* \`${extracted.workFrom} - ${extracted.workTo}\``);
+      }
+
+      if (extracted.cashTip != null) {
+        lines.push(`💵 *Napiwek gotówkowy:* *+${extracted.cashTip.toFixed(2)} zł*`);
+      }
+
+      if (!result.hasDailyUpdate && !result.hasTip) {
+        lines.push('⚠️ _Zanotowano wypowiedź, ale nie wykryto parametrów finansowych ani licznikowych do zapisu._');
+      }
+
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        processingMsg.message_id,
+        undefined,
+        lines.join('\n'),
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      console.error('[VoiceHandler Error]:', err);
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        processingMsg.message_id,
+        undefined,
+        '❌ *Błąd przetwarzania audio:* Nie udało się odczytać danych lub zaktualizować bazy.',
         { parse_mode: 'Markdown' }
       );
     }
-  } catch (err) {
-    console.error('Błąd Gemini:', err);
-    await ctx.reply('❌ Wystąpił błąd podczas analizy wiadomości.');
-  }
-});
+  });
 
-// Obsługa zdjęć i dokumentów (oferty, paragony, portfel)[cite: 1]
-bot.on([message('photo'), message('document')], async (ctx) => {
-  await ctx.sendChatAction('typing');
-  try {
-    let fileId: string | undefined;
-    let mimeType = 'image/jpeg';
+  // 9. Vision: Zdjęcia paragonów paliwowych oraz zrzuty ekranu zleceń Glovo
+  bot.on(message('photo'), async (ctx) => {
+    const photos = ctx.message.photo;
+    const photo = photos[photos.length - 1];
+    const caption = ctx.message.caption?.toLowerCase() || '';
 
-    if ('photo' in ctx.message) {
-      const photos = ctx.message.photo;
-      fileId = photos[photos.length - 1].file_id;
-    } else if ('document' in ctx.message && ctx.message.document.mime_type?.startsWith('image/')) {
-      fileId = ctx.message.document.file_id;
-      mimeType = ctx.message.document.mime_type;
-    }
+    const processingMsg = await ctx.reply('🔍 *Analizuję przesłany obraz...*', { parse_mode: 'Markdown' });
 
-    if (!fileId) return;
+    try {
+      const fileLink = await ctx.telegram.getFileLink(photo.file_id);
+      const res = await fetch(fileLink.href);
+      const arrayBuffer = await res.arrayBuffer();
+      const imageBuffer = Buffer.from(arrayBuffer);
 
-    const fileUrl = await ctx.telegram.getFileLink(fileId);
-    const res = await fetch(fileUrl.toString());
-    const buffer = Buffer.from(await res.arrayBuffer());
+      // Ścieżka A: Paragon paliwowy
+      if (caption.includes('paragon') || caption.includes('paliwo') || caption.includes('stacja')) {
+        const receipt = await geminiService.extractFuelReceipt(imageBuffer);
+        const effectiveDate = receipt.date || financeService.getEffectiveDate();
 
-    const caption = 'caption' in ctx.message ? ctx.message.caption : undefined;
-    const today = getWorkDate();
-    const parsed = await processVisionDocument(buffer, mimeType, caption, today);
+        await financeService.saveFuelReceipt(
+          ctx.from.id,
+          effectiveDate,
+          receipt.fuelPrice || 0,
+          receipt.fuelLiters || null
+        );
 
-    // Oferta kursu[cite: 1]
-    if (parsed.kwota_brutto && parsed.punkty?.length) {
-      const gross = round2(parsed.kwota_brutto);
-      const net = round2(gross * CFG.NETTO_FACTOR);
-      const totalKm = round2(parsed.punkty.reduce((a: number, c: any) => a + (Number(c.dystans_km) || 0), 0));
-      const rate = totalKm > 0 ? round2(net / totalKm) : null;
-      const isProfitable = rate !== null && rate >= CFG.MIN_STAWKA_NETTO_KM;
+        const lines = [
+          '🧾 *Zarejestrowano paragon paliwowy:*',
+          `📅 *Data:* \`${effectiveDate}\``,
+          `💰 *Kwota:* *${receipt.fuelPrice ? receipt.fuelPrice.toFixed(2) : '0.00'} zł*`,
+        ];
+        if (receipt.fuelLiters) lines.push(`⛽ *Litry:* *${receipt.fuelLiters} L*`);
 
-      let reply = isProfitable
-        ? `✅ <b>OPŁACALNY</b> — <b>${fmt(rate)} zł netto/km</b>\n`
-        : `❌ <b>NIEOPŁACALNY</b> — <b>${fmt(rate)} zł netto/km</b>\n`;
-      reply += `<i>(${fmt(gross)} zł brutto = ${fmt(net)} zł netto / ${fmt(totalKm)} km)</i>\n`;
-
-      const userLoc = userLocations.get(ctx.from.id) || null;
-      const ver = await verifyOfferDistance(userLoc, parsed.punkty);
-      let verText: string | null = null;
-
-      if (ver.available && ver.results.length > 0) {
-        reply += `\n🔎 <b>Weryfikacja GPS:</b>`;
-        const verLines: string[] = [];
-        ver.results.forEach((r) => {
-          const l = `• ${r.name}: zgłoszone ${fmt(r.reported)} km / GPS ${fmt(r.actual)} km (różnica ${fmt(r.diff)} km)`;
-          reply += `\n${l}`;
-          verLines.push(l);
-        });
-        verText = verLines.join('\n');
-      } else if (!ver.available) {
-        reply += `\n\n📍 <i>Brak aktywnej lokalizacji GPS — wyślij /lokalizacja, aby weryfikować dojazd.</i>`;
+        await ctx.telegram.editMessageText(
+          ctx.chat.id,
+          processingMsg.message_id,
+          undefined,
+          lines.join('\n'),
+          { parse_mode: 'Markdown' }
+        );
+        return;
       }
 
-      // Zapis do tabeli course_offers
-      const now = new Date();
-      const timeStr = `${('0' + now.getHours()).slice(-2)}:${('0' + now.getMinutes()).slice(-2)}`;
-      await saveCourseOffer({
-        telegramId: ctx.from.id,
-        date: today,
-        time: timeStr,
-        grossAmount: gross,
-        netAmount: net,
-        totalDistance: totalKm > 0 ? totalKm : null,
-        netRatePerKm: rate,
+      // Ścieżka B: Analiza oferty kursu Glovo
+      const offer = await geminiService.analyzeCourseOffer(imageBuffer);
+      const userLoc = lastCourierLocation.get(String(ctx.from.id));
+      const hasRecentLocation = userLoc && Date.now() - userLoc.updatedAt <= 30 * 60 * 1000;
+
+      let totalKm = offer.appDistanceKm || 0;
+      let calculatedViaMaps = false;
+
+      if (hasRecentLocation && userLoc) {
+        const origin = `${userLoc.latitude},${userLoc.longitude}`;
+        const routeData = await mapsService.calculateFullDeliveryRoute(
+          origin,
+          offer.pickupAddress,
+          offer.deliveryAddress
+        );
+        if (routeData) {
+          totalKm = routeData.totalDistanceKm;
+          calculatedViaMaps = true;
+        }
+      }
+
+      const netAmount = Math.round(offer.grossAmount * NETTO_FACTOR * 100) / 100;
+      const netRatePerKm = totalKm > 0 ? Math.round((netAmount / totalKm) * 100) / 100 : 0;
+      const isProfitable = netRatePerKm >= MIN_STAWKA_NETTO_KM;
+
+      await financeService.saveCourseOffer(ctx.from.id, {
+        grossAmount: offer.grossAmount,
+        netAmount,
+        totalDistance: totalKm,
+        netRatePerKm,
         isProfitable,
-        pointsJson: parsed.punkty,
-        verificationText: verText,
+        pickupAddress: offer.pickupAddress,
+        deliveryAddress: offer.deliveryAddress,
       });
 
-      await ctx.reply(reply, { parse_mode: 'HTML' });
-      return;
-    }
+      const responseLines = [
+        isProfitable ? '✅ *KURS OPŁACALNY*' : '❌ *KURS SŁABY / ODRZUĆ*',
+        '',
+        `💵 *Stawka:* *${offer.grossAmount.toFixed(2)} zł brutto* ➔ *${netAmount.toFixed(2)} zł netto*`,
+        `📍 *Trasa:* \`${offer.pickupAddress}\` ➔ \`${offer.deliveryAddress}\``,
+        `🛣️ *Dystans:* *${totalKm.toFixed(1)} km* ${
+          calculatedViaMaps ? '_(weryfikacja Google Maps)_' : '_(z aplikacji)_'
+        }`,
+        `📊 *Stawka netto/km:* *${netRatePerKm.toFixed(2)} zł / km* (Min: ${MIN_STAWKA_NETTO_KM.toFixed(2)} zł)`,
+      ];
 
-    // Paragon paliwowy[cite: 1]
-    if (parsed.paliwo_cena || parsed.paliwo_l) {
-      const targetDate = parsed.data || today;
-      await saveDailyRecord(ctx.from.id, targetDate, {
-        fuelPrice: parsed.paliwo_cena,
-        fuelLiters: parsed.paliwo_l,
-      });
-      await ctx.reply(
-        `⛽ <b>Zapisano tankowanie:</b> ${fmt(parsed.paliwo_cena)} zł | ${fmt(parsed.paliwo_l)} l (${targetDate})`,
-        { parse_mode: 'HTML' }
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        processingMsg.message_id,
+        undefined,
+        responseLines.join('\n'),
+        { parse_mode: 'Markdown' }
       );
-      return;
+    } catch (err) {
+      console.error('[PhotoHandler Error]:', err);
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        processingMsg.message_id,
+        undefined,
+        '❌ *Błąd analizy obrazu:* Nie udało się odczytać parametrów zlecenia.',
+        { parse_mode: 'Markdown' }
+      );
     }
-
-    await ctx.reply('🤔 Nie rozpoznano danych oferty ani paragonu na zdjęciu.');
-  } catch (err) {
-    console.error('Błąd analizy zdjęcia:', err);
-    await ctx.reply('❌ Wystąpił błąd podczas analizy przesłanego obrazu.');
-  }
-});
+  });
+}

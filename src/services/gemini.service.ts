@@ -1,113 +1,244 @@
-import 'dotenv/config';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, Type, Schema } from '@google/genai';
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-const MODEL_NAME = 'gemini-3.6-flash';
-
-export async function processVisionDocument(imageBuffer: Buffer, mimeType: string, caption?: string, todayStr?: string) {
-  const prompt = `Przeanalizuj ten zrzut ekranu / zdjęcie kuriera Glovo. Dzisiejsza data: ${todayStr}.
-Wypełnij TYLKO pola widoczne na zdjęciu, reszta null.
-A) OFERTA kursu: zielona kwota brutto, punkty z rodzajem (odbior/dostawa), nazwą, adresem i małą szarą liczbą km po prawej.
-B) PALIWO / PARAGON / FAKTURA: kwota łączna (paliwo_cena), litry (paliwo_l - szukaj przy "l"/"litr", pomijaj kod CN i oktany 95/98), data zakupu.
-C) SALDO GLOVO: pojedyncza kwota salda (ujemna jeśli Glovo winne kurierowi).
-D) PORTFEL: lista pojedynczych transakcji z datą, godziną, typem (pobranie/wyplata/wyplata_gotowka/platnosc_punkt/korekta) i kwotą ze znakiem.
-${caption ? `Podpis użytkownika: ${caption}` : ''}`;
-
-  const response = await ai.models.generateContent({
-    model: MODEL_NAME,
-    contents: [
-      { text: prompt },
-      { inlineData: { mimeType, data: imageBuffer.toString('base64') } }
-    ],
-    config: {
-      temperature: 0.15,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          kwota_brutto: { type: Type.NUMBER },
-          paliwo_cena: { type: Type.NUMBER },
-          paliwo_l: { type: Type.NUMBER },
-          saldo_glovo: { type: Type.NUMBER },
-          data: { type: Type.STRING },
-          punkty: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                rodzaj: { type: Type.STRING },
-                nazwa: { type: Type.STRING },
-                adres: { type: Type.STRING },
-                dystans_km: { type: Type.NUMBER }
-              },
-              required: ['rodzaj']
-            }
-          },
-          transakcje: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                data: { type: Type.STRING },
-                godzina: { type: Type.STRING },
-                typ: { type: Type.STRING },
-                kwota: { type: Type.NUMBER },
-                id: { type: Type.STRING }
-              },
-              required: ['data', 'typ', 'kwota']
-            }
-          }
-        }
-      }
-    }
-  });
-
-  return JSON.parse(response.text || '{}');
+export interface VoiceExtractedData {
+  transcription: string;
+  fuelPrice?: number | null;
+  fuelLiters?: number | null;
+  fuelDistance?: number | null;
+  grossEarnings?: number | null;
+  workFrom?: string | null;
+  workTo?: string | null;
+  cashTip?: number | null;
 }
 
-export async function processVoiceOrText(input: { text?: string; audioBuffer?: Buffer; mimeType?: string }, todayStr: string) {
-  const systemPrompt = `Jesteś asystentem finansowym kuriera. Dzisiejsza data: ${todayStr}.
-Zwróć czysty JSON klasyfikujący dane:
-- typ: "wpis" (dodanie/edycja danych) lub "pytanie" (o zarobki, saldo itp.)
-- pola liczbowe: zarobki_brutto, paliwo_cena, paliwo_l, paliwo_dystans, saldo_glovo, napiwek_gotowka
-- godziny: praca_od i praca_do (GG:MM) lub godziny_pracy (liczba)`;
+export interface FuelReceiptExtractedData {
+  date?: string | null;
+  fuelPrice?: number | null;
+  fuelLiters?: number | null;
+}
 
-  const parts: any[] = [{ text: systemPrompt }];
-  if (input.audioBuffer) {
-    parts.push({
-      inlineData: {
-        mimeType: input.mimeType || 'audio/ogg',
-        data: input.audioBuffer.toString('base64')
-      }
-    });
+export interface CourseOfferExtractedData {
+  grossAmount: number;
+  pickupAddress: string;
+  deliveryAddress: string;
+  appDistanceKm?: number | null;
+}
+
+// 1. Schemat ekstrakcji głosu (Voice-to-Data)
+const voiceExtractionSchema: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    transcription: {
+      type: Type.STRING,
+      description: 'Dosłowna transkrypcja słów kuriera w języku polskim.',
+    },
+    fuelPrice: {
+      type: Type.NUMBER,
+      nullable: true,
+      description: 'Kwota zapłacona za paliwo w PLN (np. 75.00).',
+    },
+    fuelLiters: {
+      type: Type.NUMBER,
+      nullable: true,
+      description: 'Liczba zatankowanych litrów paliwa (np. 11.00).',
+    },
+    fuelDistance: {
+      type: Type.INTEGER,
+      nullable: true,
+      description: 'Aktualny stan licznika / całkowity przebieg w km (np. 24300).',
+    },
+    grossEarnings: {
+      type: Type.NUMBER,
+      nullable: true,
+      description: 'Zarobek brutto w PLN jeśli podano w nagraniu.',
+    },
+    workFrom: {
+      type: Type.STRING,
+      nullable: true,
+      description: 'Godzina rozpoczęcia pracy w formacie HH:MM.',
+    },
+    workTo: {
+      type: Type.STRING,
+      nullable: true,
+      description: 'Godzina zakończenia pracy w formacie HH:MM.',
+    },
+    cashTip: {
+      type: Type.NUMBER,
+      nullable: true,
+      description: 'Kwota napiwku gotówkowego w PLN.',
+    },
+  },
+  required: ['transcription'],
+};
+
+// 2. Schemat ekstrakcji paragonu paliwowego (Vision)
+const fuelReceiptSchema: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    date: {
+      type: Type.STRING,
+      nullable: true,
+      description: 'Data transakcji z paragonu w formacie YYYY-MM-DD.',
+    },
+    fuelPrice: {
+      type: Type.NUMBER,
+      nullable: true,
+      description: 'Łączna kwota do zapłaty (Suma PLN) za paliwo.',
+    },
+    fuelLiters: {
+      type: Type.NUMBER,
+      nullable: true,
+      description: 'Ilość zatankowanego paliwa w litrach.',
+    },
+  },
+  required: ['fuelPrice'],
+};
+
+// 3. Schemat oferty kursu Glovo (Vision)
+const courseOfferSchema: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    grossAmount: {
+      type: Type.NUMBER,
+      description: 'Kwota wynagrodzenia brutto dla kuriera za realizację zlecenia. Ignoruj kwoty "POTRZEBNA GOTÓWKA", "ZAPŁAĆ" i "ODBIERZ".',
+    },
+    pickupAddress: {
+      type: Type.STRING,
+      description: 'Adres lub nazwa punktu odbioru (restauracja / sklep).',
+    },
+    deliveryAddress: {
+      type: Type.STRING,
+      description: 'Adres doręczenia do klienta.',
+    },
+    appDistanceKm: {
+      type: Type.NUMBER,
+      nullable: true,
+      description: 'Szacowany dystans w kilometrach, jeśli jest podany na zrzucie ekranu.',
+    },
+  },
+  required: ['grossAmount', 'pickupAddress', 'deliveryAddress'],
+};
+
+export class GeminiService {
+  private ai: GoogleGenAI;
+  private model: string;
+
+  constructor() {
+    this.ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    this.model = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
   }
-  if (input.text) parts.push({ text: `Treść: ${input.text}` });
 
-  const response = await ai.models.generateContent({
-    model: MODEL_NAME,
-    contents: parts,
-    config: {
-      temperature: 0,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          typ: { type: Type.STRING },
-          data: { type: Type.STRING },
-          zarobki_brutto: { type: Type.NUMBER },
-          paliwo_cena: { type: Type.NUMBER },
-          paliwo_l: { type: Type.NUMBER },
-          paliwo_dystans: { type: Type.NUMBER },
-          napiwek_gotowka: { type: Type.NUMBER },
-          saldo_glovo: { type: Type.NUMBER },
-          praca_od: { type: Type.STRING },
-          praca_do: { type: Type.STRING },
-          godziny_pracy: { type: Type.NUMBER }
+  /**
+   * Voice-to-Data: Przetwarzanie notatek głosowych nagranych podczas jazdy.
+   */
+  async parseVoiceNote(audioBuffer: Buffer, mimeType = 'audio/ogg'): Promise<VoiceExtractedData> {
+    const base64Audio = audioBuffer.toString('base64');
+    const prompt = `
+Jesteś asystentem kuriera dostarczającego zamówienia. Przeanalizuj notatkę głosową nagraną w trasie.
+Wyodrębnij parametry:
+1. Tankowanie: koszt całkowity w PLN, ilość litrów, stan licznika kilometrów (przebieg).
+2. Czas pracy: zakres godzin (od-do w formacie HH:MM).
+3. Finanse: zarobek brutto lub napiwek gotówkowy.
+Ignoruj szum wiatru, silnika i odgłosy uliczne. Przypisz wartości do odpowiednich pól schematu JSON.
+`;
+
+    const response = await this.ai.models.generateContent({
+      model: this.model,
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { inlineData: { mimeType, data: base64Audio } },
+            { text: prompt },
+          ],
         },
-        required: ['typ']
-      }
-    }
-  });
+      ],
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: voiceExtractionSchema,
+        temperature: 0.1,
+      },
+    });
 
-  return JSON.parse(response.text || '{}');
+    const text = response.text();
+    if (!text) throw new Error('Gemini API zwróciło pustą odpowiedź dla notatki audio.');
+    return JSON.parse(text) as VoiceExtractedData;
+  }
+
+  /**
+   * Vision: Odczyt danych z paragonu/faktury za paliwo.
+   */
+  async extractFuelReceipt(imageBuffer: Buffer, mimeType = 'image/jpeg'): Promise<FuelReceiptExtractedData> {
+    const base64Image = imageBuffer.toString('base64');
+    const prompt = `
+Przeanalizuj zdjęcie paragonu/faktury za paliwo.
+Wyciągnij:
+- Łączną kwotę do zapłaty (PLN)
+- Ilość zatankowanych litrów
+- Datę transakcji (YYYY-MM-DD)
+Ignoruj kody CN, numery stacji benzynowej, numery dystrybutorów oraz oznaczenia oktanowe (PB95, ON, 98).
+`;
+
+    const response = await this.ai.models.generateContent({
+      model: this.model,
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { inlineData: { mimeType, data: base64Image } },
+            { text: prompt },
+          ],
+        },
+      ],
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: fuelReceiptSchema,
+        temperature: 0.1,
+      },
+    });
+
+    const text = response.text();
+    if (!text) throw new Error('Gemini API zwróciło pustą odpowiedź dla paragonu.');
+    return JSON.parse(text) as FuelReceiptExtractedData;
+  }
+
+  /**
+   * Vision: Analiza zrzutu ekranu oferty kursu Glovo.
+   */
+  async analyzeCourseOffer(imageBuffer: Buffer, mimeType = 'image/jpeg'): Promise<CourseOfferExtractedData> {
+    const base64Image = imageBuffer.toString('base64');
+    const prompt = `
+Przeanalizuj zrzut ekranu oferty kursu z aplikacji kurierskiej Glovo.
+Wyciągnij:
+1. Kwotę wynagrodzenia brutto dla kuriera za realizację zlecenia.
+   Pomiń etykiety "POTRZEBNA GOTÓWKA" i "ZAPŁAĆ" (pobrania gotówkowe od klienta).
+2. Adres/nazwę punktu odbioru (restauracja / sklep).
+3. Adres doręczenia do klienta.
+4. Szacowany dystans w km, jeśli występuje.
+`;
+
+    const response = await this.ai.models.generateContent({
+      model: this.model,
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { inlineData: { mimeType, data: base64Image } },
+            { text: prompt },
+          ],
+        },
+      ],
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: courseOfferSchema,
+        temperature: 0.1,
+      },
+    });
+
+    const text = response.text();
+    if (!text) throw new Error('Gemini API zwróciło pustą odpowiedź dla zrzutu ekranu.');
+    return JSON.parse(text) as CourseOfferExtractedData;
+  }
 }
+
+export const geminiService = new GeminiService();
