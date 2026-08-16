@@ -100,6 +100,29 @@ export interface CourseOfferStats {
   totalDistanceKm: number;
 }
 
+/**
+ * Pojedyncza oferta w postaci gotowej do wyslania na zewnatrz (REST API).
+ * Wszystkie `numeric` sa juz przepuszczone przez `parseFloat` — patrz 9b.
+ */
+export interface CourseOfferItem {
+  id: number;
+  date: string;
+  time: string;
+  grossAmount: number;
+  netAmount: number;
+  appTotalKm: number | null;
+  mapsTotalKm: number | null;
+  distanceTotalKm: number;
+  /** Skad wziety dystans do stawki: 'APP' | 'MAPS' | 'NONE'. */
+  rateBasis: string;
+  netRatePerKm: number;
+  isProfitable: boolean;
+  /** 'PENDING' | 'ACCEPTED' | 'REJECTED' */
+  status: string;
+  pickupAddress: string | null;
+  deliveryAddress: string | null;
+}
+
 export interface WalletImportPreview {
   newTransactions: WalletTransactionItem[];
   existingCount: number;
@@ -879,6 +902,53 @@ export class FinanceService {
       totalGross: round2(totalGross),
       totalDistanceKm: Math.round(totalDistanceKm * 10) / 10,
     };
+  }
+
+  /**
+   * Lista ofert do wyswietlenia i do wykresow w aplikacji mobilnej.
+   *
+   * Celowo `null` zamiast pol opcjonalnych: przy `exactOptionalPropertyTypes`
+   * przekazanie `{ startDate: undefined }` jest bledem typu, a jawne `null`
+   * nie zostawia watpliwosci, co znaczy brak filtra.
+   *
+   * `limit` jest przycinany takze tutaj — warstwa HTTP nie moze byc jedynym
+   * miejscem, ktore pilnuje rozmiaru zapytania do bazy.
+   */
+  async listCourseOffers(
+    telegramId: string | number,
+    startDate: string | null,
+    endDate: string | null,
+    limit: number
+  ): Promise<CourseOfferItem[]> {
+    const tId = String(telegramId);
+
+    const conditions = [eq(courseOffers.telegramId, tId)];
+    if (startDate) conditions.push(gte(courseOffers.date, startDate));
+    if (endDate) conditions.push(lte(courseOffers.date, endDate));
+
+    const rows = await db
+      .select()
+      .from(courseOffers)
+      .where(and(...conditions))
+      .orderBy(desc(courseOffers.date), desc(courseOffers.time))
+      .limit(Math.min(Math.max(Math.trunc(limit), 1), 500));
+
+    return rows.map((o) => ({
+      id: o.id,
+      date: o.date,
+      time: o.time,
+      grossAmount: parseFloat(o.grossAmount),
+      netAmount: parseFloat(o.netAmount),
+      appTotalKm: numOrNull(o.appTotalKm),
+      mapsTotalKm: numOrNull(o.mapsTotalKm),
+      distanceTotalKm: parseFloat(o.distanceTotalKm),
+      rateBasis: o.rateBasis,
+      netRatePerKm: parseFloat(o.netRatePerKm),
+      isProfitable: o.isProfitable,
+      status: o.status,
+      pickupAddress: o.pickupAddress,
+      deliveryAddress: o.deliveryAddress,
+    }));
   }
 
   // --- Cele -----------------------------------------------------------------

@@ -6,10 +6,21 @@ import { registerBotHandlers } from './bot/index.js';
 import { startWebhookServer, stopWebhookServer } from './server.js';
 import type { Server } from 'node:http';
 
-const botToken = process.env.BOT_TOKEN;
-if (!botToken) {
-  throw new Error('Brak zmiennej BOT_TOKEN w pliku .env!');
+/**
+ * Zawezenie typu zrobione na poziomie modulu (`if (!x) throw`) NIE przenosi sie
+ * do wnetrza `main()` — w srodku `botToken` mial dalej typ `string | undefined`
+ * i `startWebhookServer` zglaszal TS2345.
+ *
+ * Funkcja zwracajaca `string` rozwiazuje to bez rzutowania `as` i bez `!`,
+ * a przy okazji nadaje sie do kazdej innej wymaganej zmiennej srodowiskowej.
+ */
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Brak zmiennej ${name} w pliku .env!`);
+  return value;
 }
+
+const botToken = requireEnv('BOT_TOKEN');
 
 const bot = new Telegraf(botToken);
 

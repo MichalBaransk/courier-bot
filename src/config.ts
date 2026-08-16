@@ -81,9 +81,37 @@ export const CFG = {
    * Pusta = bot otwarty dla wszystkich, ostrzezenie przy starcie.
    */
   ALLOWED_TELEGRAM_IDS: parseIdList(process.env.ALLOWED_TELEGRAM_IDS),
+
+  /**
+   * Token dostepu do REST API dla aplikacji mobilnej.
+   * PUSTY = API wylaczone, kazde zadanie spod /api/ dostaje 503.
+   * Generowanie: `openssl rand -base64 32`.
+   */
+  API_TOKEN: (process.env.API_TOKEN || '').trim(),
+
+  /**
+   * telegram_id wlasciciela danych, do ktorego odnosi sie API_TOKEN.
+   *
+   * Tozsamosc wynika z MAPOWANIA TOKENA, nie z wartosci zaszytej w kodzie —
+   * dzieki temu dolozenie drugiego uzytkownika zmienia to mapowanie,
+   * a nie kazdy endpoint z osobna.
+   *
+   * Puste = jedyny wpis z ALLOWED_TELEGRAM_IDS (patrz `apiUserId`).
+   */
+  API_TELEGRAM_ID: (process.env.API_TELEGRAM_ID || '').trim(),
 } as const;
 
 export function isAllowedUser(telegramId: string | number): boolean {
   if (CFG.ALLOWED_TELEGRAM_IDS.size === 0) return true;
   return CFG.ALLOWED_TELEGRAM_IDS.has(String(telegramId));
+}
+
+/**
+ * Wlasciciel danych widocznych przez API.
+ * `null` = konfiguracja niejednoznaczna; API ma wtedy nie odpowiadac danymi.
+ */
+export function apiUserId(): string | null {
+  if (CFG.API_TELEGRAM_ID) return CFG.API_TELEGRAM_ID;
+  if (CFG.ALLOWED_TELEGRAM_IDS.size === 1) return [...CFG.ALLOWED_TELEGRAM_IDS][0] ?? null;
+  return null;
 }

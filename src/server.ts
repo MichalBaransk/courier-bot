@@ -3,6 +3,7 @@ import { createServer, type RequestListener, type Server } from 'node:http';
 import type { Telegraf } from 'telegraf';
 import { CFG } from './config.js';
 import { geminiQueue } from './services/gemini.service.js';
+import { API_PREFIX, createApiSetup } from './api/router.js';
 
 /**
  * Tryb webhook.
@@ -80,6 +81,9 @@ export async function startWebhookServer(bot: Telegraf, botToken: string): Promi
     max_connections: CFG.WEBHOOK_MAX_CONNECTIONS,
   });
 
+  // REST API dla aplikacji mobilnej. Budowane raz, przy starcie.
+  const api = createApiSetup();
+
   const handler: RequestListener = (req, res) => {
     if (req.method === 'GET' && (req.url === '/healthz' || req.url === '/health')) {
       const body = JSON.stringify(healthPayload());
@@ -90,6 +94,20 @@ export async function startWebhookServer(bot: Telegraf, botToken: string): Promi
 
     if (req.url === path) {
       telegrafHandler(req, res);
+      return;
+    }
+
+    /**
+     * Cala reszta ruchu spod /api/ idzie do Hono.
+     *
+     * `startsWith` zamiast `===`, bo `req.url` zawiera query string —
+     * `/api/v1/okres?od=…` nigdy nie zrownalo by sie ze stala sciezka.
+     *
+     * Gdyby API mialo kiedykolwiek zaszkodzic botowi, usuniecie tego
+     * jednego `if` przywraca zachowanie sprzed zmiany.
+     */
+    if (req.url?.startsWith(API_PREFIX)) {
+      api.listener(req, res);
       return;
     }
 
@@ -110,6 +128,11 @@ export async function startWebhookServer(bot: Telegraf, botToken: string): Promi
 
   console.log(`🌐 Webhook: https://${domain}${path}`);
   console.log(`🩺 Health:  http://0.0.0.0:${CFG.WEBHOOK_PORT}/healthz`);
+  console.log(
+    api.enabled
+      ? `📱 API:     https://${domain}${API_PREFIX}v1/  (Bearer API_TOKEN)`
+      : `📱 API:     WYŁĄCZONE — ${api.disabledReason ?? 'nieznany powód'}`
+  );
 
   return server;
 }

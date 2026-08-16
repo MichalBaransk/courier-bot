@@ -1143,7 +1143,9 @@ export function registerBotHandlers(bot: Telegraf): void {
             `➕ ${b('Nowe:')} ${preview.newTransactions.length} szt.  |  ⏭ ${b('Duplikaty:')} ${preview.existingCount}`,
             `💵 ${b('Wpływ na saldo:')} ${b(zlSigned(preview.totalAmountDelta))}`,
           ]),
-          walletImportKeyboard()
+          // Spread, nie sama instancja: `Markup` to klasa bez sygnatury indeksu,
+          // wiec nie pasuje do `Record<string, unknown>`. Reszta pliku juz tak robi.
+          { ...walletImportKeyboard() }
         );
         return;
       }
@@ -1248,7 +1250,8 @@ export function registerBotHandlers(bot: Telegraf): void {
           netRatePerKm,
           status: 'PENDING',
         }),
-        offerDecisionKeyboard(offerId)
+        // Jak wyzej — `Markup` musi wejsc jako rozlozony obiekt.
+        { ...offerDecisionKeyboard(offerId) }
       );
     } catch (err) {
       console.error('[PhotoHandler]', err);
