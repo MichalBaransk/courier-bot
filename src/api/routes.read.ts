@@ -114,6 +114,30 @@ export function registerReadRoutes(app: Hono, userId: string): void {
     return c.json(await financeService.getCourseOfferStats(userId, date));
   });
 
+  /**
+   * Dzienne sumy dla zakresu — pod wykres tygodnia i kalendarz miesiąca.
+   * Jedno wywołanie zamiast 31 zapytań o `/dzien`.
+   */
+  app.get('/api/v1/dni', async (c) => {
+    const range = parseRange(c.req.query('od'), c.req.query('do'));
+    if (!range.ok) return c.json({ error: range.message }, 400);
+
+    const items = await financeService.listDailyTotals(userId, range.od, range.do);
+    return c.json({ od: range.od, do: range.do, items, count: items.length });
+  });
+
+  /**
+   * Postęp celów. Oba okresy naraz — aplikacja i tak pokazuje je razem,
+   * a dwa zapytania z telefonu to dwa razy więcej okazji do utraty zasięgu.
+   */
+  app.get('/api/v1/cele', async (c) => {
+    const [miesiac, tydzien] = await Promise.all([
+      financeService.getTargetProgress(userId, 'MONTHLY'),
+      financeService.getTargetProgress(userId, 'WEEKLY'),
+    ]);
+    return c.json({ miesiac, tydzien });
+  });
+
   /** Lista ofert — surowe pozycje pod wykresy w aplikacji. */
   app.get('/api/v1/oferty', async (c) => {
     const odRaw = c.req.query('od');

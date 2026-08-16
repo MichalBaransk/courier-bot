@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   BruttoSchema,
+  CelSchema,
   DystansSchema,
   NapiwekSchema,
   PaliwoSchema,
+  UsunSchema,
   ZmianaSchema,
   pierwszyBlad,
 } from './schemas.js';
@@ -126,5 +128,40 @@ describe('pierwszyBlad', () => {
 
   it('zwraca komunikat także dla braku pola', () => {
     expect(pierwszyBlad(NapiwekSchema.safeParse({}))).toBeTruthy();
+  });
+});
+
+describe('CelSchema', () => {
+  it('przyjmuje cel miesięczny i tygodniowy', () => {
+    expect(CelSchema.safeParse({ okres: 'MONTHLY', kwota: 4500 }).success).toBe(true);
+    expect(CelSchema.safeParse({ okres: 'WEEKLY', kwota: 1200 }).success).toBe(true);
+  });
+
+  it('odrzuca nieznany okres', () => {
+    expect(CelSchema.safeParse({ okres: 'DAILY', kwota: 100 }).success).toBe(false);
+    expect(CelSchema.safeParse({ okres: 'monthly', kwota: 100 }).success).toBe(false);
+  });
+
+  it('odrzuca cel zerowy', () => {
+    expect(CelSchema.safeParse({ okres: 'MONTHLY', kwota: 0 }).success).toBe(false);
+  });
+});
+
+describe('UsunSchema', () => {
+  it('przyjmuje wszystkie zakresy znane botowi', () => {
+    for (const cel of ['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'DISTANCE', 'ALL_DAY']) {
+      expect(UsunSchema.safeParse({ cel }).success).toBe(true);
+    }
+  });
+
+  it('data jest opcjonalna', () => {
+    const w = UsunSchema.safeParse({ cel: 'ALL_DAY' });
+    expect(w.success).toBe(true);
+    if (w.success) expect(w.data.data).toBeNull();
+  });
+
+  it('odrzuca zakres spoza listy', () => {
+    expect(UsunSchema.safeParse({ cel: 'WSZYSTKO' }).success).toBe(false);
+    expect(UsunSchema.safeParse({}).success).toBe(false);
   });
 });

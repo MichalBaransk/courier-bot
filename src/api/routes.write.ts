@@ -4,9 +4,11 @@ import { financeService } from '../services/finance.service.js';
 import { ensureUserById } from '../services/user.service.js';
 import {
   BruttoSchema,
+  CelSchema,
   DystansSchema,
   NapiwekSchema,
   PaliwoSchema,
+  UsunSchema,
   ZmianaSchema,
   pierwszyBlad,
 } from './schemas.js';
@@ -136,5 +138,34 @@ export function registerWriteRoutes(app: Hono, userId: string): void {
     }
 
     return odpowiedz(c, date, ostrzezenie);
+  });
+
+  /** Cel zarobkowy na bieżący miesiąc albo tydzień ISO (§8e). */
+  app.post('/api/v1/cel', async (c) => {
+    const w = await czytajCialo(c, CelSchema);
+    if (!w.ok) return c.json({ error: w.komunikat }, 400);
+
+    await ensureUserById(userId);
+    const zapisany = await financeService.setEarningTarget(userId, w.wartosc.okres, w.wartosc.kwota);
+    const postep = await financeService.getTargetProgress(userId, w.wartosc.okres);
+    return c.json({ zapisany, postep }, 201);
+  });
+
+  /**
+   * Kasowanie wpisów — ta sama ścieżka co kasowanie głosem w bocie.
+   *
+   * `POST`, nie `DELETE`, bo potrzebne jest ciało z zakresem i datą, a `DELETE`
+   * z ciałem bywa gubione przez pośredniki. Nazwa endpointu mówi wprost, co robi.
+   */
+  app.post('/api/v1/usun', async (c) => {
+    const w = await czytajCialo(c, UsunSchema);
+    if (!w.ok) return c.json({ error: w.komunikat }, 400);
+
+    const wynik = await financeService.handleVoiceDeletion(userId, w.wartosc.cel, w.wartosc.data);
+    return c.json({
+      usuniete: wynik.success,
+      komunikat: wynik.message,
+      dzien: await financeService.getDailySummary(userId, wynik.date),
+    });
   });
 }

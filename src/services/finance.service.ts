@@ -123,6 +123,25 @@ export interface CourseOfferItem {
   deliveryAddress: string | null;
 }
 
+/**
+ * Lekki wiersz dzienny pod wykresy i kalendarz.
+ *
+ * NIE zawiera `doPrzelewu` — ta wartosc wymaga sumy wyplat z portfela, czyli
+ * czwartego zapytania na kazdy dzien. Do slupkow i heatmapy nie jest potrzebna,
+ * a podanie jej wyliczonej z zerowych wyplat byloby po prostu nieprawda.
+ */
+export interface DailyTotals {
+  date: string;
+  grossEarnings: number;
+  netEarnings: number;
+  cashTipsTotal: number;
+  totalNetto: number;
+  workHours: number;
+  hourlyRateNetto: number;
+  distanceKm: number;
+  fuelCost: number;
+}
+
 export interface WalletImportPreview {
   newTransactions: WalletTransactionItem[];
   existingCount: number;
@@ -949,6 +968,99 @@ export class FinanceService {
       pickupAddress: o.pickupAddress,
       deliveryAddress: o.deliveryAddress,
     }));
+  }
+
+  /**
+   * Dzienne sumy dla zakresu — jedno wywolanie zamiast N zapytan o `/dzien`.
+   *
+   * Trzy zapytania zgrupowane po dacie, scalone w pamieci. Miesiac heatmapy to
+   * 3 zapytania zamiast 31 × 4 = 124, ktore wyszlyby z petli po `getDailySummary`.
+   *
+   * Zwraca WYLACZNIE dni, ktore maja jakiekolwiek dane. Luki uzupelnia klient —
+   * inaczej trzeba by tu generowac kalendarz, a to nie jest rola serwisu.
+   */
+  async listDailyTotals(
+    telegramId: string | number,
+    startDate: string,
+    endDate: string
+  ): Promise<DailyTotals[]> {
+    const tId = String(telegramId);
+
+    const [rekordy, napiwki, paliwa] = await Promise.all([
+      db
+        .select({
+          date: dailyRecords.date,
+          gross: dailyRecords.grossEarnings,
+          hours: dailyRecords.workHours,
+          dist: dailyRecords.distanceKm,
+        })
+        .from(dailyRecords)
+        .where(
+          and(
+            eq(dailyRecords.telegramId, tId),
+            gte(dailyRecords.date, startDate),
+            lte(dailyRecords.date, endDate)
+          )
+        ),
+      db
+        .select({ date: cashTips.date, suma: sql<string>`sum(${cashTips.amount})` })
+        .from(cashTips)
+        .where(
+          and(eq(cashTips.telegramId, tId), gte(cashTips.date, startDate), lte(cashTips.date, endDate))
+        )
+        .groupBy(cashTips.date),
+      db
+        .select({ date: fuelReceipts.date, suma: sql<string>`sum(${fuelReceipts.totalCost})` })
+        .from(fuelReceipts)
+        .where(
+          and(
+            eq(fuelReceipts.telegramId, tId),
+            gte(fuelReceipts.date, startDate),
+            lte(fuelReceipts.date, endDate)
+          )
+        )
+        .groupBy(fuelReceipts.date),
+    ]);
+
+    const mapa = new Map<string, { gross: number; hours: number; dist: number; tips: number; fuel: number }>();
+    const wpis = (date: string) => {
+      const istniejacy = mapa.get(date);
+      if (istniejacy) return istniejacy;
+      const nowy = { gross: 0, hours: 0, dist: 0, tips: 0, fuel: 0 };
+      mapa.set(date, nowy);
+      return nowy;
+    };
+
+    for (const r of rekordy) {
+      const w = wpis(r.date);
+      w.gross = num(r.gross);
+      w.hours = num(r.hours);
+      w.dist = num(r.dist);
+    }
+    for (const r of napiwki) wpis(r.date).tips = num(r.suma);
+    for (const r of paliwa) wpis(r.date).fuel = num(r.suma);
+
+    return [...mapa.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, w]) => {
+        const { netEarnings, totalNetto, hourlyRateNetto } = computeDailyTotals({
+          grossEarnings: w.gross,
+          cashTipsTotal: round2(w.tips),
+          walletPayouts: 0,
+          workHours: w.hours,
+        });
+        return {
+          date,
+          grossEarnings: round2(w.gross),
+          netEarnings,
+          cashTipsTotal: round2(w.tips),
+          totalNetto,
+          workHours: round2(w.hours),
+          hourlyRateNetto,
+          distanceKm: round2(w.dist),
+          fuelCost: round2(w.fuel),
+        };
+      });
   }
 
   // --- Cele -----------------------------------------------------------------

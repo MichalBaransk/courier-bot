@@ -76,11 +76,26 @@ export const ZmianaSchema = z
     message: 'Podaj przynajmniej jedną godzinę — "od" albo "do".',
   });
 
+export const CelSchema = z.object({
+  okres: z.enum(['MONTHLY', 'WEEKLY'], { message: 'Pole "okres" musi być "MONTHLY" albo "WEEKLY".' }),
+  kwota: liczbaDodatnia('kwota', 1_000_000),
+});
+
+/** Te same cele co kasowanie głosem w bocie — jedna lista, jedna logika. */
+export const UsunSchema = z.object({
+  cel: z.enum(['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'DISTANCE', 'ALL_DAY'], {
+    message: 'Nieznany zakres kasowania.',
+  }),
+  data: dataWpisu,
+});
+
 export type NapiwekBody = z.infer<typeof NapiwekSchema>;
 export type PaliwoBody = z.infer<typeof PaliwoSchema>;
 export type DystansBody = z.infer<typeof DystansSchema>;
 export type BruttoBody = z.infer<typeof BruttoSchema>;
 export type ZmianaBody = z.infer<typeof ZmianaSchema>;
+export type CelBody = z.infer<typeof CelSchema>;
+export type UsunBody = z.infer<typeof UsunSchema>;
 
 /**
  * Kształt wyniku `safeParse` opisany STRUKTURALNIE, a nie przez nazwę typu
