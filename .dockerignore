@@ -1,0 +1,26 @@
+# Bez tego `COPY . .` wciaga node_modules i .git do obrazu:
+# build trwa dluzej, obraz puchnie, a modules skompilowane pod hosta
+# potrafia nadpisac te zainstalowane w kontenerze.
+node_modules
+dist
+.git
+.gitignore
+
+# Sekrety nie moga trafic do warstwy obrazu — zmienne i tak wchodzą
+# przez `env_file` w docker-compose.yml.
+.env
+.env.*
+!.env.example
+
+# Backupy i dane lokalne
+backups
+data
+*.sql.gz
+*.gpg
+# UWAGA: nie wykluczaj `*.sql` — skasowaloby to drizzle/0001_rework.sql,
+# ktory bywa potrzebny z wnetrza kontenera przy migracji.
+
+# Dokumentacja i artefakty
+codebase.md
+*.md
+!README.md
