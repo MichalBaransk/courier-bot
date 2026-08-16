@@ -3,6 +3,8 @@ import { Telegraf } from 'telegraf';
 import { CFG } from './config.js';
 import { closeDb } from './db/index.js';
 import { registerBotHandlers } from './bot/index.js';
+import { startWebhookServer, stopWebhookServer } from './server.js';
+import type { Server } from 'node:http';
 
 const botToken = process.env.BOT_TOKEN;
 if (!botToken) {
@@ -35,26 +37,44 @@ async function main(): Promise<void> {
     );
   }
 
-  /**
-   * FIX (3.5): `bot.launch()` w Telegraf 4 rozwiazuje sie dopiero po ZATRZYMANIU
-   * pollingu, wiec `.then(() => console.log('wystartowal'))` logowal przy
-   * zamykaniu bota. Do tego brakowalo `.catch()` — bledny token dawal
-   * unhandled rejection zamiast czytelnego komunikatu.
-   *
-   * Dlatego: promise dostaje wlasny catch, a komunikat startowy pochodzi
-   * z `getMe()`, ktore od razu weryfikuje token.
-   */
-  void bot.launch().catch((err) => {
-    console.error('❌ Polling Telegrama przerwany:', err);
-    process.exit(1);
-  });
-
   const me = await bot.telegram.getMe();
-  console.log(`🤖 @${me.username} wystartował (model: ${CFG.GEMINI_MODEL}, TZ: ${CFG.TZ})`);
+  let webhookServer: Server | null = null;
+
+  if (CFG.WEBHOOK_DOMAIN) {
+    // --- Tryb webhook -------------------------------------------------------
+    // Telegram sam puka pod nasz adres, wiec zadna instancja nie odpytuje
+    // `getUpdates` i konflikt 409 przy podmianie kontenera nie ma jak wystapic.
+    webhookServer = await startWebhookServer(bot, botToken);
+    console.log(`🤖 @${me.username} działa w trybie WEBHOOK (model: ${CFG.GEMINI_MODEL}, TZ: ${CFG.TZ})`);
+  } else {
+    // --- Tryb long polling (rozwoj lokalny) ---------------------------------
+    // Webhook i polling wykluczaja sie wzajemnie — jesli poprzednio byl
+    // ustawiony webhook, `getUpdates` zwracalby 409, dopoki go nie usuniemy.
+    await bot.telegram.deleteWebhook({ drop_pending_updates: false });
+
+    /**
+     * FIX (3.5): `bot.launch()` w Telegraf 4 rozwiazuje sie dopiero po
+     * ZATRZYMANIU pollingu, wiec `.then(...)` logowal przy zamykaniu bota.
+     * Do tego brakowalo `.catch()` — bledny token dawal unhandled rejection.
+     */
+    void bot.launch().catch((err) => {
+      console.error('❌ Polling Telegrama przerwany:', err);
+      process.exit(1);
+    });
+
+    console.log(`🤖 @${me.username} działa w trybie POLLING (model: ${CFG.GEMINI_MODEL}, TZ: ${CFG.TZ})`);
+    console.log('💡 Ustaw WEBHOOK_DOMAIN w .env, żeby przełączyć na webhook.');
+  }
 
   const shutdown = async (signal: string): Promise<void> => {
     console.log(`\n${signal} — zamykam bota…`);
-    bot.stop(signal);
+
+    // Webhooka NIE kasujemy: Telegram kolejkuje update'y do 24 h i dostarczy
+    // je, gdy kontener wróci. Usunięcie oznaczałoby utratę wiadomości
+    // wysłanych w trakcie wdrożenia.
+    if (webhookServer) await stopWebhookServer(webhookServer).catch(() => {});
+    else bot.stop(signal);
+
     await closeDb().catch((err) => console.error('[DB close]', err));
     process.exit(0);
   };

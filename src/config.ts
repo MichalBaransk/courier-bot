@@ -44,6 +44,16 @@ export const CFG = {
   /** Stawka przyjmowana do prognoz, dopoki nie ma wlasnej historii godzin. */
   FALLBACK_HOURLY_RATE_NETTO: 35.0,
 
+  /**
+   * Domena webhooka (np. `bot.baranskiha.ovh`). Pusta = long polling.
+   * Sam host, bez `https://` i bez sciezki.
+   */
+  WEBHOOK_DOMAIN: (process.env.WEBHOOK_DOMAIN || '').replace(/^https?:\/\//, '').replace(/\/+$/, ''),
+  /** Port nasluchu w kontenerze. Nie jest wystawiany na zewnatrz — siega go tunel. */
+  WEBHOOK_PORT: Number(process.env.WEBHOOK_PORT ?? 8080),
+  /** Ile rownoleglych polaczen Telegram moze otworzyc do webhooka. */
+  WEBHOOK_MAX_CONNECTIONS: Number(process.env.WEBHOOK_MAX_CONNECTIONS ?? 20),
+
   /** Model Gemini - jedno miejsce dla calej aplikacji. */
   GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-3.7-flash',
 

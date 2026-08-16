@@ -1,0 +1,123 @@
+# Compose v2 ignoruje `version:` i ostrzega o nim przy każdym poleceniu — usunięte.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: courier-db
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgrespassword}
+      POSTGRES_DB: ${POSTGRES_DB:-courierdb}
+    ports:
+      # ZMIANA: nasłuch tylko na pętli lokalnej. Wcześniej "5432:5432" oznaczało
+      # 0.0.0.0 — baza była widoczna z internetu, jeśli serwer ma publiczne IP.
+      # Bot i studio łączą się przez sieć Dockera, więc nic na tym nie tracą.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-courierdb}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+  bot:
+    build: .
+    image: courier-bot:latest
+    container_name: courier-bot
+    restart: always
+    depends_on:
+      postgres:
+        # ZMIANA: samo `depends_on` czeka tylko na START kontenera, nie na
+        # gotowość bazy. Przy restarcie serwera bot potrafił wystartować
+        # sekundę za wcześnie i przywitać się błędem połączenia.
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgrespassword}@postgres:5432/${POSTGRES_DB:-courierdb}
+    # Zaden port nie wychodzi na hosta — tunel Cloudflare siega bota
+    # po wewnetrznej sieci Dockera, pod adresem http://bot:8080.
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'test -z "$$WEBHOOK_DOMAIN" || wget -qO- http://127.0.0.1:${WEBHOOK_PORT:-8080}/healthz > /dev/null',
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *logging
+
+  # Tunel Cloudflare: bot.baranskiha.ovh -> http://bot:8080
+  # Token bierzesz z panelu Cloudflare Zero Trust przy tworzeniu tunelu.
+  # Uruchamia sie tylko z profilem `webhook`, wiec lokalnie nie przeszkadza.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: courier-tunnel
+    restart: always
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      bot:
+        condition: service_started
+    profiles: ['webhook']
+    logging: *logging
+
+  studio:
+    # ZMIANA: ten sam obraz co bot, zamiast drugiego `build: .`.
+    # Wcześniej każde `docker compose build` budowało identyczny obraz dwa razy.
+    image: courier-bot:latest
+    container_name: courier-studio
+    restart: always
+    command: npx drizzle-kit studio --host 0.0.0.0 --port 4983
+    ports:
+      # UWAGA: Drizzle Studio nie ma żadnego logowania — kto trafi na ten port,
+      # ma pełny dostęp do bazy. Zostawiam na pętli lokalnej; jeśli wystawiasz
+      # go przez reverse proxy działający na hoście, nadal zadziała.
+      - "127.0.0.1:4983:4983"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bot:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgrespassword}@postgres:5432/${POSTGRES_DB:-courierdb}
+    logging: *logging
+
+  backup:
+    build: ./docker/backup
+    container_name: courier-backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-courierdb}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgrespassword}
+      BACKUP_CRON: '30 3 * * *' # codziennie 03:30 — zrzut lokalny
+      BACKUP_SEND_CRON: '0 4 * * 0' # niedziela 04:00 — wysyłka na Telegram
+      BACKUP_KEEP_DAYS: 14
+      BACKUP_ON_START: 'true'
+      BACKUP_PASSPHRASE: ${BACKUP_PASSPHRASE}
+      BOT_TOKEN: ${BOT_TOKEN}
+      BACKUP_CHAT_ID: ${BACKUP_CHAT_ID}
+    volumes:
+      - backups:/backups
+    logging: *logging
+
+volumes:
+  pgdata:
+  backups:

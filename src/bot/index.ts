@@ -275,6 +275,45 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.reply(helpCard(), { ...HTML, ...mainMenuKeyboard() });
   });
 
+  /**
+   * Diagnostyka dostarczania update'ow. Bez tego jedyne, co widac przy
+   * zepsutym webhooku, to cisza — Telegram nie ma jak zglosic bledu botowi,
+   * bo wlasnie do niego nie potrafi sie dobic.
+   */
+  bot.command('webhook', async (ctx) => {
+    const info = await ctx.telegram.getWebhookInfo();
+
+    await ctx.reply(
+      joinLines([
+        `🌐 ${b('Stan dostarczania')}`,
+        '',
+        info.url
+          ? `${b('Tryb:')} webhook\n${b('Adres:')} ${code(info.url.replace(/\/tg\/[a-f0-9]+$/, '/tg/…'))}`
+          : `${b('Tryb:')} long polling ${i('(webhook nieustawiony)')}`,
+        `${b('Oczekujące update’y:')} ${info.pending_update_count}`,
+        info.max_connections != null && `${b('Limit połączeń:')} ${info.max_connections}`,
+        info.ip_address && `${b('IP Telegrama:')} ${code(info.ip_address)}`,
+        info.has_custom_certificate ? `${b('Certyfikat:')} własny` : null,
+        '',
+        info.last_error_message
+          ? joinLines([
+              `⚠️ ${b('Ostatni błąd dostarczenia:')}`,
+              code(info.last_error_message),
+              info.last_error_date != null &&
+                i(new Date(info.last_error_date * 1000).toLocaleString('pl-PL', { timeZone: CFG.TZ })),
+            ])
+          : `✅ ${i('Brak błędów dostarczania.')}`,
+        info.last_synchronization_error_date != null &&
+          i(
+            `Ostatni problem z synchronizacją: ${new Date(
+              info.last_synchronization_error_date * 1000
+            ).toLocaleString('pl-PL', { timeZone: CFG.TZ })}`
+          ),
+      ]),
+      HTML
+    );
+  });
+
   bot.command('anuluj', async (ctx) => {
     const had = awaitingInput.delete(String(ctx.from.id));
     pendingWalletImports.delete(String(ctx.from.id));
