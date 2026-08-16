@@ -4,6 +4,7 @@ import { getRequestListener } from '@hono/node-server';
 import { apiUserId } from '../config.js';
 import { isApiEnabled, isValidApiToken } from './auth.js';
 import { registerReadRoutes } from './routes.read.js';
+import { registerWriteRoutes } from './routes.write.js';
 
 /**
  * REST API dla aplikacji mobilnej.
@@ -66,6 +67,7 @@ export function createApiSetup(): ApiSetup {
   // Puste `userId` jest juz odsiane przez `disabledReason`, ale kompilator
   // o tym nie wie — a rzutowanie `as` bylo by obietnica bez pokrycia.
   registerReadRoutes(app, userId ?? '');
+  registerWriteRoutes(app, userId ?? '');
 
   app.notFound((c) => c.json({ error: 'Nie ma takiego endpointu.' }, 404));
 
