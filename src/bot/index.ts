@@ -3,7 +3,7 @@ import { message } from 'telegraf/filters';
 import { CFG, isAllowedUser } from '../config.js';
 import { financeService } from '../services/finance.service.js';
 import { computeOfferRate } from '../services/finance.calc.js';
-import { geminiService } from '../services/gemini.service.js';
+import { geminiService, geminiQueue } from '../services/gemini.service.js';
 import { verifyOfferDistance } from '../services/maps.service.js';
 import { ensureUser } from '../services/user.service.js';
 import { isValidDateStr, monthRange, normalizeTime, nowTimeWarsaw, splitDate } from '../utils/datetime.js';
@@ -1047,7 +1047,14 @@ export function registerBotHandlers(bot: Telegraf): void {
     if (!photo) return;
 
     const caption = ctx.message.caption ?? '';
-    const processing = await ctx.reply('🔍 Analizuję obraz…');
+
+    // Przy albumie zdjec Telegram wysyla osobny update na kazde — warto pokazac,
+    // ze reszta czeka w kolejce, zamiast zostawiac "Analizuję…" na minute.
+    const queued = geminiQueue.pending + geminiQueue.running;
+    const processing = await ctx.reply(
+      queued > 0 ? `🔍 Analizuję obraz… ${i(`(w kolejce: ${queued})`)}` : '🔍 Analizuję obraz…',
+      HTML
+    );
     const editProcessing = (text: string, extra?: Record<string, unknown>) =>
       ctx.telegram.editMessageText(ctx.chat.id, processing.message_id, undefined, text, { ...HTML, ...extra });
 

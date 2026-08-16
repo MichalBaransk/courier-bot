@@ -48,6 +48,25 @@ export const CFG = {
   GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-3.7-flash',
 
   /**
+   * Kolejka zapytan do Gemini. Album 3 zdjec = 6 wywolan (klasyfikacja + odczyt),
+   * wiec bez limitu rownoleglosci darmowy tier zwraca 429.
+   */
+  GEMINI_CONCURRENCY: Number(process.env.GEMINI_CONCURRENCY ?? 1),
+  GEMINI_MIN_INTERVAL_MS: Number(process.env.GEMINI_MIN_INTERVAL_MS ?? 1200),
+  GEMINI_MAX_RETRIES: Number(process.env.GEMINI_MAX_RETRIES ?? 4),
+  GEMINI_BASE_DELAY_MS: 2000,
+  GEMINI_MAX_DELAY_MS: 60_000,
+  GEMINI_MAX_QUEUE: 20,
+
+  /** Kolejka Google Maps - limity sa luzniejsze, ale 429 tez sie zdarza. */
+  MAPS_CONCURRENCY: Number(process.env.MAPS_CONCURRENCY ?? 4),
+  MAPS_MIN_INTERVAL_MS: Number(process.env.MAPS_MIN_INTERVAL_MS ?? 100),
+  MAPS_MAX_RETRIES: 3,
+  MAPS_BASE_DELAY_MS: 500,
+  MAPS_MAX_DELAY_MS: 10_000,
+  MAPS_MAX_QUEUE: 50,
+
+  /**
    * Lista telegram_id z dostepem do bota (ALLOWED_TELEGRAM_IDS="123,456").
    * Pusta = bot otwarty dla wszystkich, ostrzezenie przy starcie.
    */

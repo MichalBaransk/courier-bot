@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { CFG } from '../config.js';
+import { RequestQueue } from '../utils/rate-limiter.js';
 
 interface LatLng {
   lat: number;
@@ -46,13 +47,33 @@ function apiKey(): string | null {
   return process.env.GOOGLE_MAPS_API_KEY || null;
 }
 
-async function fetchJson(url: string): Promise<unknown | null> {
+const mapsQueue = new RequestQueue({
+  name: 'maps',
+  concurrency: CFG.MAPS_CONCURRENCY,
+  minIntervalMs: CFG.MAPS_MIN_INTERVAL_MS,
+  maxRetries: CFG.MAPS_MAX_RETRIES,
+  baseDelayMs: CFG.MAPS_BASE_DELAY_MS,
+  maxDelayMs: CFG.MAPS_MAX_DELAY_MS,
+  maxQueueLength: CFG.MAPS_MAX_QUEUE,
+});
+
+/** Bledy HTTP musza polecieć wyjatkiem, inaczej kolejka nie ma czego ponowic. */
+class HttpError extends Error {
+  constructor(readonly status: number) {
+    super(`HTTP ${status}`);
+    this.name = 'HttpError';
+  }
+}
+
+async function fetchJson(url: string, label: string): Promise<unknown | null> {
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-    if (!res.ok) return null;
-    return (await res.json()) as unknown;
+    return await mapsQueue.run(async () => {
+      const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+      if (!res.ok) throw new HttpError(res.status);
+      return (await res.json()) as unknown;
+    }, label);
   } catch (err) {
-    console.warn('[Maps] błąd zapytania:', err);
+    console.warn(`[Maps:${label}] błąd zapytania:`, err instanceof Error ? err.message : err);
     return null;
   }
 }
@@ -65,7 +86,7 @@ export async function geocodeAddress(address: string): Promise<LatLng | null> {
   if (cached) return cached;
 
   const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${key}`;
-  const data = (await fetchJson(url)) as
+  const data = (await fetchJson(url, 'geocode')) as
     | { status?: string; results?: Array<{ geometry?: { location?: LatLng } }> }
     | null;
 
@@ -85,7 +106,7 @@ export async function getRoadDistanceKm(origin: LatLng, dest: LatLng): Promise<n
     `?origins=${origin.lat},${origin.lng}&destinations=${dest.lat},${dest.lng}` +
     `&mode=driving&units=metric&key=${key}`;
 
-  const data = (await fetchJson(url)) as
+  const data = (await fetchJson(url, 'distance')) as
     | { rows?: Array<{ elements?: Array<{ status?: string; distance?: { value?: number } }> }> }
     | null;
 

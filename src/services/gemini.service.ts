@@ -1,6 +1,22 @@
 import { GoogleGenAI, Type, type Schema } from '@google/genai';
 import { z } from 'zod';
 import { CFG } from '../config.js';
+import { RequestQueue } from '../utils/rate-limiter.js';
+
+/**
+ * Wszystkie wywolania Gemini przechodza przez jedna kolejke procesu.
+ * Ogranicza rownoleglosc, wymusza odstep miedzy zapytaniami i ponawia 429/503
+ * z wykladniczym backoffem, honorujac `retryDelay` z odpowiedzi Google.
+ */
+export const geminiQueue = new RequestQueue({
+  name: 'gemini',
+  concurrency: CFG.GEMINI_CONCURRENCY,
+  minIntervalMs: CFG.GEMINI_MIN_INTERVAL_MS,
+  maxRetries: CFG.GEMINI_MAX_RETRIES,
+  baseDelayMs: CFG.GEMINI_BASE_DELAY_MS,
+  maxDelayMs: CFG.GEMINI_MAX_DELAY_MS,
+  maxQueueLength: CFG.GEMINI_MAX_QUEUE,
+});
 
 /**
  * FIX (3.10): odpowiedzi modelu byly rzutowane przez `as`, bez zadnej walidacji.
@@ -192,15 +208,21 @@ export class GeminiService {
     let lastError: unknown = null;
 
     for (let attempt = 1; attempt <= 2; attempt++) {
-      const response = await this.ai.models.generateContent({
-        model: this.model,
-        contents: [{ role: 'user', parts }],
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema,
-          temperature,
-        },
-      });
+      // Kolejka zajmuje sie limitami i ponawianiem bledow sieciowych;
+      // ta petla obsluguje wylacznie odpowiedz niezgodna ze schematem.
+      const response = await geminiQueue.run(
+        () =>
+          this.ai.models.generateContent({
+            model: this.model,
+            contents: [{ role: 'user', parts }],
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema,
+              temperature,
+            },
+          }),
+        label
+      );
 
       try {
         return schema.parse(JSON.parse(response.text || '{}'));
