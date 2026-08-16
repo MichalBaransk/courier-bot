@@ -3,9 +3,11 @@ import { b, code, i, joinLines, km, progressBar, zl, zlSigned, SEPARATOR } from 
 import type {
   CourseOfferStats,
   DailySummary,
+  FinanceService,
   PeriodSummary,
   TargetProgress,
 } from '../services/finance.service.js';
+import type { VoiceExtractedData } from '../services/gemini.service.js';
 
 /**
  * Wszystkie karty renderuja HTML (3.3). Kazda wartosc pochodzaca od uzytkownika
@@ -293,7 +295,46 @@ export function helpCard(): string {
     ` • ${code('/statystyki')} – statystyki ofert kursów.`,
     ` • ${code('/saldo')} – stan portfela Glovo (suma transakcji).`,
     '',
-    `🎙️ ${b('Głos:')} tankowanie, dystans, godziny, zarobki, napiwki.`,
+    `🎙️ ${b('Głos:')} tankowanie, dystans, godziny, zarobki, napiwki — także kasowanie wpisów.`,
+    `✍️ ${b('Tekst:')} to samo co głosem, ale bez kasowania. Np. ${code('dzisiaj zarobiłem 438.60')}.`,
     `📸 ${b('Zdjęcia:')} zrzuty Portfela, paragony paliwowe, oferty zleceń — rozpoznaję automatycznie.`,
+  ]);
+}
+
+/**
+ * Wynik zapisu notatki — glosowej albo tekstowej.
+ * Typ wyprowadzony z serwisu, zeby nie rozjechal sie po cichu przy zmianie
+ * `saveVoiceEvent()`.
+ */
+export type NoteSaveResult = Awaited<ReturnType<FinanceService['saveVoiceEvent']>>;
+
+/**
+ * Karta potwierdzenia zapisu z notatki. Naglowek jest parametrem, bo glos
+ * pokazuje transkrypcje, a tekst nie ma czego transkrybowac — reszta jest
+ * wspolna i nie ma powodu jej duplikowac (5).
+ */
+export function noteSavedCard(
+  headerLines: Array<string | false | null>,
+  extracted: VoiceExtractedData,
+  saved: NoteSaveResult
+): string {
+  return joinLines([
+    ...headerLines,
+    `📅 ${b('Data wpisu:')} ${code(saved.date)}`,
+    '',
+    saved.hasFuel && `⛽ ${b('Zapisano tankowanie:')}`,
+    saved.hasFuel && extracted.fuelTotalCost != null && ` • Koszt: ${b(zl(extracted.fuelTotalCost))}`,
+    saved.hasFuel && extracted.fuelLiters != null && ` • Ilość: ${b(`${extracted.fuelLiters} L`)}`,
+    saved.hasFuel &&
+      extracted.fuelPricePerLiter != null &&
+      ` • Cena: ${b(`${extracted.fuelPricePerLiter.toFixed(2)} zł/L`)}`,
+    extracted.distanceKm != null && `🚗 ${b('Dystans dnia:')} ${b(`${extracted.distanceKm} km`)}`,
+    extracted.grossEarnings != null && `💰 ${b('Zarobek brutto:')} ${b(zl(extracted.grossEarnings))}`,
+    extracted.workFrom &&
+      extracted.workTo &&
+      `⏱️ ${b('Godziny:')} ${code(`${extracted.workFrom} - ${extracted.workTo}`)}`,
+    extracted.cashTip != null && `💵 ${b('Napiwek gotówkowy:')} ${b(zlSigned(extracted.cashTip))}`,
+    saved.hoursError && `⚠️ ${i(saved.hoursError)}`,
+    !saved.hasDailyUpdate && !saved.hasTip && !saved.hasFuel && i('Nie rozpoznano żadnych danych do zapisania.'),
   ]);
 }

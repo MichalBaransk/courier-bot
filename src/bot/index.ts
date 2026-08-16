@@ -24,12 +24,14 @@ import {
   dailyCard,
   endShiftCard,
   helpCard,
+  noteSavedCard,
   offerCard,
   offerStatsCard,
   periodCard,
   startShiftCard,
   targetCard,
 } from './cards.js';
+import { shouldParseAsNote } from './text-note.js';
 
 const HTML = { parse_mode: 'HTML' as const };
 
@@ -923,6 +925,74 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.reply(`💵 ${b('Dodano napiwek:')} ${b(zlSigned(amount))}\n📅 ${b('Data:')} ${code(date)}`, HTML);
   });
 
+  // === 9a. Wolny tekst -> Gemini ============================================
+
+  /**
+   * KOLEJNOSC REJESTRACJI JEST TU ISTOTNA (10a).
+   *
+   * Ten handler stoi PO `bot.hears` szybkich napiwkow, a nie zamiast `next()`
+   * w pierwszym handlerze tekstu. Gdyby stal wczesniej, przechwytywalby `n 5.5`
+   * i szybka sciezka napiwkow (8g) przestalaby dzialac — po cichu, bez bledu.
+   *
+   * Przeplyw: handler tekstu (stan oczekiwania, „tak”/„nie”) -> `next()`
+   * -> `bot.hears` napiwkow -> dopiero to, czego nikt nie zlapal, trafia tutaj.
+   *
+   * Tekst obsluguje WYLACZNIE zapis. Kasowanie zostaje przy glosie i komendach:
+   * prog przypadkowego wywolania jest przy pisaniu duzo nizszy niz przy nagraniu.
+   */
+  bot.on(message('text'), async (ctx) => {
+    const rawText = ctx.message.text.trim();
+
+    // Filtr przed modelem — patrz `text-note.ts`. Cisza jest tu poprawna:
+    // to nie jest wpis, tylko zwykla wiadomosc.
+    if (!shouldParseAsNote(rawText, CFG.TEXT_NOTE_MAX_CHARS)) return;
+
+    const processing = await ctx.reply('✍️ Analizuję wiadomość…');
+    const editProcessing = (text: string) =>
+      ctx.telegram.editMessageText(ctx.chat.id, processing.message_id, undefined, text, HTML);
+
+    try {
+      const extracted = await geminiService.parseTextNote(rawText);
+
+      // Twarde odsianie DELETE. Prompt tego zabrania, ale prompt to nie kontrakt —
+      // rzutowanie zaufania na model bylo by obietnica bez pokrycia.
+      if (extracted.action === 'DELETE') {
+        await editProcessing(
+          joinLines([
+            `🚫 ${b('Kasowanie danych nie działa z wiadomości tekstowej.')}`,
+            '',
+            i('Użyj notatki głosowej albo komendy — tekst służy wyłącznie do zapisu.'),
+          ])
+        );
+        return;
+      }
+
+      const saved = await financeService.saveVoiceEvent(ctx.from.id, extracted);
+
+      // Model juz kosztowal, wiec milczenie byloby gorsze niz komunikat (14).
+      if (!saved.hasDailyUpdate && !saved.hasTip && !saved.hasFuel && !saved.hoursError) {
+        await editProcessing(
+          joinLines([
+            `🤷 ${b('Nie wyciągnąłem z tej wiadomości żadnych danych.')}`,
+            '',
+            i('Napisz np. „dzisiaj zarobiłem 438.60”, „przejechałem 52 km”'),
+            i('albo „tankowanie 312.40 za 48 litrów”.'),
+            '',
+            `📋 Pełna lista komend: ${code('/pomoc')}`,
+          ])
+        );
+        return;
+      }
+
+      await editProcessing(noteSavedCard([`✍️ ${b('Zapisano z wiadomości:')}`], extracted, saved));
+    } catch (err) {
+      console.error('[TextNoteHandler]', err);
+      await editProcessing(
+        `❌ ${b('Błąd analizy wiadomości.')} ${h(err instanceof Error ? err.message : '')}`
+      ).catch(() => {});
+    }
+  });
+
   // === 10. Oferty kursow — decyzje ==========================================
 
   bot.action(/^offer:(accept|reject):(\d+)$/, async (ctx) => {
@@ -1051,25 +1121,7 @@ export function registerBotHandlers(bot: Telegraf): void {
       const saved = await financeService.saveVoiceEvent(ctx.from.id, extracted);
 
       await editProcessing(
-        joinLines([
-          `🗣️ ${b('Transkrypcja:')} ${i(`„${extracted.transcription}”`)}`,
-          `📅 ${b('Data wpisu:')} ${code(saved.date)}`,
-          '',
-          saved.hasFuel && `⛽ ${b('Zapisano tankowanie:')}`,
-          saved.hasFuel && extracted.fuelTotalCost != null && ` • Koszt: ${b(zl(extracted.fuelTotalCost))}`,
-          saved.hasFuel && extracted.fuelLiters != null && ` • Ilość: ${b(`${extracted.fuelLiters} L`)}`,
-          saved.hasFuel &&
-            extracted.fuelPricePerLiter != null &&
-            ` • Cena: ${b(`${extracted.fuelPricePerLiter.toFixed(2)} zł/L`)}`,
-          extracted.distanceKm != null && `🚗 ${b('Dystans dnia:')} ${b(`${extracted.distanceKm} km`)}`,
-          extracted.grossEarnings != null && `💰 ${b('Zarobek brutto:')} ${b(zl(extracted.grossEarnings))}`,
-          extracted.workFrom &&
-            extracted.workTo &&
-            `⏱️ ${b('Godziny:')} ${code(`${extracted.workFrom} - ${extracted.workTo}`)}`,
-          extracted.cashTip != null && `💵 ${b('Napiwek gotówkowy:')} ${b(zlSigned(extracted.cashTip))}`,
-          saved.hoursError && `⚠️ ${i(saved.hoursError)}`,
-          !saved.hasDailyUpdate && !saved.hasTip && !saved.hasFuel && i('Nie rozpoznano żadnych danych do zapisania.'),
-        ])
+        noteSavedCard([`🗣️ ${b('Transkrypcja:')} ${i(`„${extracted.transcription}”`)}`], extracted, saved)
       );
     } catch (err) {
       console.error('[VoiceHandler]', err);

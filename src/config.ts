@@ -45,6 +45,13 @@ export const CFG = {
   FALLBACK_HOURLY_RATE_NETTO: 35.0,
 
   /**
+   * Gorny limit dlugosci wiadomosci tekstowej oddawanej do Gemini.
+   * Dluzszy tekst na pewno nie jest wpisem o zarobku ani tankowaniu,
+   * a bylby najdrozszym wywolaniem modelu w calej aplikacji.
+   */
+  TEXT_NOTE_MAX_CHARS: 200,
+
+  /**
    * Domena webhooka (np. `bot.baranskiha.ovh`). Pusta = long polling.
    * Sam host, bez `https://` i bez sciezki.
    */

@@ -254,6 +254,36 @@ Ignoruj szum wiatru i wydechu motocykla.
     );
   }
 
+  /**
+   * Ten sam schemat i ta sama sciezka zapisu co notatka glosowa — rozni sie
+   * wylacznie zrodlem. `VoiceExtractedSchema`, `saveVoiceEvent()` i cala reszta
+   * sa obojetne na to, czy dane przyszly z mikrofonu, czy z klawiatury.
+   *
+   * DELETE jest tu zabronione promptem, ale to NIE jest zabezpieczenie —
+   * model moze zwrocic cokolwiek. Twarde odsianie robi handler w `bot/index.ts`.
+   */
+  async parseTextNote(text: string): Promise<VoiceExtractedData> {
+    const prompt = `
+Jesteś asystentem kuriera. Przeanalizuj wiadomość tekstową i zwróć dane w JSON.
+Rozpoznajesz WYŁĄCZNIE zapis danych — pole "action" ma zawsze wartość "UPSERT".
+Nigdy nie zwracaj "DELETE": kasowanie danych nie jest dostępne z wiadomości tekstowej.
+
+Wyciągnij, jeśli występują: tankowanie (łączna kwota, litry, cena za litr),
+przejechany dystans, godziny od-do, zarobki brutto, napiwek gotówkowy.
+
+Uwaga: "distanceKm" to dystans PRZEJECHANY danego dnia, nie stan licznika pojazdu.
+Jeśli kurier poda stan licznika, zostaw distanceKm puste.
+Jeśli wiadomość nie zawiera żadnych danych do zapisania, zostaw wszystkie pola puste.
+W polu "transcription" przepisz wiadomość bez zmian.
+
+Wiadomość kuriera:
+"""
+${text}
+"""
+`;
+    return this.generate(VoiceExtractedSchema, voiceResponseSchema, [{ text: prompt }], 0.1, 'text');
+  }
+
   async extractFuelReceipt(imageBuffer: Buffer, mimeType = 'image/jpeg'): Promise<FuelReceiptExtractedData> {
     const prompt = `
 Przeanalizuj paragon paliwowy. Wyciągnij:
