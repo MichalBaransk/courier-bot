@@ -24,12 +24,16 @@ import {
  * Każdy zapis idzie przez TEN SAM serwis co bot, więc reguły biznesowe z §8
  * obowiązują w obu klientach bez duplikacji logiki.
  *
- * ⚠️ BRAK IDEMPOTENCJI — świadomie, do kroku 3b.
- * `saveCashTip` i `saveFuelReceipt` to czyste `INSERT` (celowo: drugie
- * tankowanie tego samego dnia ma się dodawać, FIX 2.8). Powtórzone żądanie
- * utworzy DRUGI wpis. Dopóki nie ma kolejki offline z ponawianiem, ryzyko
- * sprowadza się do dwukrotnego kliknięcia przez użytkownika. Kolejka wymaga
- * nagłówka `Idempotency-Key` i migracji — osobny krok, osobna decyzja.
+ * IDEMPOTENCJA — od kroku 5 jest, ale trzeba o nią poprosić.
+ * `saveCashTip` i `saveFuelReceipt` to nadal czyste `INSERT` (celowo: drugie
+ * tankowanie tego samego dnia ma się dodawać, FIX 2.8), więc powtórzone
+ * żądanie BEZ nagłówka `Idempotency-Key` utworzy DRUGI wpis. Z nagłówkiem
+ * operacja wykona się raz, a każde ponowienie dostanie zapamiętaną odpowiedź.
+ * Szczegóły i powód: `src/api/idempotency.ts`.
+ *
+ * Same trasy nic o tym nie wiedzą — cała obsługa siedzi w middleware
+ * zarejestrowanym w `router.ts`. To celowe: dopisanie nowego endpointu zapisu
+ * nie wymaga pamiętania o idempotencji.
  */
 
 /** Wspólny kształt odpowiedzi wszystkich zapisów: stan dnia po zmianie. */

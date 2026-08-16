@@ -219,3 +219,41 @@ export const earningTargets = pgTable(
  * Reczna korekta salda zapisuje sie jako transakcja typu 'korekta',
  * dzieki czemu historia pozostaje audytowalna.
  */
+
+/**
+ * Pamiec idempotencji dla `POST /api/v1/*` (krok 5 planu aplikacji).
+ *
+ * Powod: `saveCashTip` i `saveFuelReceipt` to czyste `INSERT` — celowo, bo
+ * drugie tankowanie tego samego dnia ma sie dodawac (FIX 2.8). Kolejka offline
+ * ponawia zadania, wiec bez tej tabeli kazde ponowienie tworzyloby DRUGI wpis.
+ *
+ * Klient generuje `Idempotency-Key` (UUID) i wysyla go w naglowku. Ten sam
+ * klucz drugi raz nie wykonuje operacji, tylko odsyla zapamietana odpowiedz.
+ *
+ * `key` jest KLUCZEM GLOWNYM, nie unikalnym indeksem na kolumnie nullowalnej.
+ * W Postgresie `NULL != NULL`, wiec taki indeks nie blokowalby duplikatow (9a).
+ *
+ * `status_code = 0` oznacza wiersz ZAJETY, ale jeszcze nierozstrzygniety —
+ * pierwsze zadanie trwa. To jest mechanizm blokady, nie stan koncowy.
+ *
+ * `response_json` to `text`, nie `jsonb`: odpowiedz jest odsylana doslownie
+ * i nigdy po niej nie szukamy.
+ */
+export const apiIdempotency = pgTable(
+  'api_idempotency',
+  {
+    key: text('key').primaryKey(),
+    telegramId: text('telegram_id')
+      .notNull()
+      .references(() => users.telegramId, { onDelete: 'cascade' }),
+    endpoint: text('endpoint').notNull(),
+    /** 0 = zadanie w toku. >0 = zapamietany kod odpowiedzi. */
+    statusCode: integer('status_code').notNull(),
+    responseJson: text('response_json').notNull(),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => ({
+    // Wylacznie pod sprzatanie starych wierszy.
+    apiIdempotencyCreatedAtIdx: index('api_idempotency_created_at_idx').on(table.createdAt),
+  })
+);

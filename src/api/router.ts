@@ -3,6 +3,7 @@ import { Hono } from 'hono';
 import { getRequestListener } from '@hono/node-server';
 import { apiUserId } from '../config.js';
 import { isApiEnabled, isValidApiToken } from './auth.js';
+import { idempotencja } from './idempotency.js';
 import { registerReadRoutes } from './routes.read.js';
 import { registerWriteRoutes } from './routes.write.js';
 
@@ -63,6 +64,16 @@ export function createApiSetup(): ApiSetup {
 
     await next();
   });
+
+  // --- Idempotencja zapisow -------------------------------------------------
+  // PO autoryzacji (niezalogowany nie ma po co zajmowac klucza) i PRZED
+  // trasami — middleware zarejestrowany po nich w ogole by sie dla nich nie
+  // uruchomil, i to bez zadnego bledu. Ta sama klasa pulapki co 10a.
+  //
+  // Dotyka wylacznie `POST` z naglowkiem `Idempotency-Key`. Bez naglowka
+  // zachowanie jest dokladnie takie jak dotad, wiec bot, `curl` i starsza
+  // wersja aplikacji nie zauwaza zmiany.
+  app.use('/api/*', idempotencja(userId ?? ''));
 
   // Puste `userId` jest juz odsiane przez `disabledReason`, ale kompilator
   // o tym nie wie — a rzutowanie `as` bylo by obietnica bez pokrycia.
