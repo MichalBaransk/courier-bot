@@ -10,10 +10,22 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgrespassword}
       POSTGRES_DB: ${POSTGRES_DB:-courierdb}
     ports:
-      # ZMIANA: nasłuch tylko na pętli lokalnej. Wcześniej "5432:5432" oznaczało
-      # 0.0.0.0 — baza była widoczna z internetu, jeśli serwer ma publiczne IP.
-      # Bot i studio łączą się przez sieć Dockera, więc nic na tym nie tracą.
-      - "127.0.0.1:5432:5432"
+      # ZMIANA 16.08.2026: z "127.0.0.1:5432" na adres LAN.
+      #
+      # Powod: tunel SSH okazal sie niemozliwy. Dodatek Advanced SSH & Web
+      # Terminal ma `AllowTcpForwarding no` — przekierowanie portow konczy sie
+      # `channel 2: open failed: administratively prohibited`. Wpis klucza na
+      # serwerze pozwala na port-forwarding, ale konfiguracja globalna wygrywa,
+      # a `sshd_config` dodatku i tak przepada przy restarcie (§3a).
+      #
+      # `192.168.1.50` zamiast `0.0.0.0`: baza jest widoczna z LAN-u, ale
+      # zaden inny interfejs jej nie wystawia. Serwer siedzi za NAT-em, wiec
+      # z internetu dostepu nie ma. Jedyna obrona to POSTGRES_PASSWORD —
+      # NIE zostawiaj domyslnego `postgrespassword`.
+      #
+      # Bot, backup i migracje lacza sie przez siec Dockera i nie korzystaja
+      # z tego mapowania; jest wylacznie dla klienta bazy na Windowsie.
+      - "${POSTGRES_BIND_IP:-127.0.0.1}:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -71,28 +83,20 @@ services:
     profiles: ['webhook']
     logging: *logging
 
-  studio:
-    # ZMIANA: ten sam obraz co bot, zamiast drugiego `build: .`.
-    # Wcześniej każde `docker compose build` budowało identyczny obraz dwa razy.
-    image: courier-bot:latest
-    container_name: courier-studio
-    restart: always
-    command: npx drizzle-kit studio --host 0.0.0.0 --port 4983
-    ports:
-      # UWAGA: Drizzle Studio nie ma żadnego logowania — kto trafi na ten port,
-      # ma pełny dostęp do bazy. Zostawiam na pętli lokalnej; jeśli wystawiasz
-      # go przez reverse proxy działający na hoście, nadal zadziała.
-      - "127.0.0.1:4983:4983"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      bot:
-        condition: service_started
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgrespassword}@postgres:5432/${POSTGRES_DB:-courierdb}
-    logging: *logging
+  # --- USUNIETE 16.08.2026: Drizzle Studio -----------------------------------
+  #
+  # Powod 1 — nie dzialalo. Port byl wystawiony na `127.0.0.1:4983`, a dodatek
+  # Cloudflared w HA to osobny kontener i siegal `192.168.1.50:4983`. Nie mial
+  # jak sie dobic, wiec przegladarka wisiala na „Connecting…". Dokladnie 12b.
+  #
+  # Powod 2 — a gdyby dzialalo, byloby gorzej. Drizzle Studio NIE MA zadnego
+  # logowania. Publiczna subdomena = pelny odczyt i ZAPIS do bazy z realnymi
+  # zarobkami dla kazdego, kto na nia trafi.
+  #
+  # Zamiast tego: klient bazy na Windowsie (DBeaver) z wbudowanym tunelem SSH.
+  # Postgres zostaje na `127.0.0.1:5432`, nic nie wychodzi na zewnatrz,
+  # a uwierzytelnia SSH — nie „brak logowania".
+  # Doraznie na serwerze: `docker compose exec -T postgres psql -U postgres -d courierdb`.
 
   backup:
     build: ./docker/backup
