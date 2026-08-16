@@ -33,7 +33,15 @@ echo
 echo "🚀 5/5  Wdrażam na serwerze ($SERWER)…"
 echo "     (za chwilę zapyta o hasło — POCZEKAJ na pytanie, nie wpisuj nic wcześniej)"
 echo
-ssh -t "$SERWER" "cd '$KATALOG_SERWERA' && sh scripts/wdroz-serwer.sh"
+# `git pull` MUSI być tutaj, a nie tylko w skrypcie serwerowym.
+#
+# Jajko i kura: `wdroz-serwer.sh` trafia na serwer dopiero przez `git pull`,
+# więc dopóki tego pulla nie zrobimy stąd, nie ma czego uruchomić i wychodzi
+# `sh: can't open 'scripts/wdroz-serwer.sh'`.
+#
+# Ten sam `git pull` jest jeszcze raz w środku skryptu — celowo. Dzięki temu
+# działa też uruchomiony ręcznie na serwerze, a drugie wywołanie to no-op.
+ssh -t "$SERWER" "cd '$KATALOG_SERWERA' && git pull --ff-only && sh scripts/wdroz-serwer.sh"
 
 echo
 echo "🎉 Gotowe. Sprawdź jeszcze bota w Telegramie."
