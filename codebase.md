@@ -1,6 +1,6 @@
 # GlovoBot — kod źródłowy
 
-Plików: 36 · linii: 6222
+Plików: 53 · linii: 8169
 
 ## Struktura
 
@@ -10,9 +10,21 @@ tsconfig.json
 docker-compose.yml
 Dockerfile
 .env.example
+src/api/auth.test.ts
+src/api/auth.ts
+src/api/idempotency.rules.test.ts
+src/api/idempotency.rules.ts
+src/api/idempotency.ts
+src/api/router.ts
+src/api/routes.read.ts
+src/api/routes.write.ts
+src/api/schemas.test.ts
+src/api/schemas.ts
 src/bot/cards.ts
 src/bot/index.ts
 src/bot/keyboards.ts
+src/bot/text-note.test.ts
+src/bot/text-note.ts
 src/config.ts
 src/db/index.ts
 src/db/schema.ts
@@ -36,10 +48,15 @@ docker/backup/Dockerfile
 docker/backup/entrypoint.sh
 docker/backup/README.md
 drizzle/0001_rework.sql
+drizzle/0002_api_idempotency.sql
 .dockerignore
 .gitignore
 drizzle.config.ts
+scripts/wdroz-serwer.sh
+scripts/wdroz.sh
+scripts/zastosuj-patch.sh
 vitest.config.ts
+WDRAZANIE.md
 ZMIANY.md
 ```
 
@@ -57,6 +74,9 @@ ZMIANY.md
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "sprawdz": "npm run typecheck && npm test",
+    "patch": "bash scripts/zastosuj-patch.sh",
+    "wdroz": "bash scripts/wdroz.sh",
     "db:push": "drizzle-kit push",
     "db:generate": "drizzle-kit generate",
     "db:studio": "drizzle-kit studio",
@@ -68,9 +88,11 @@ ZMIANY.md
   "type": "module",
   "dependencies": {
     "@google/genai": "^2.17.1",
+    "@hono/node-server": "^2.1.1",
     "csv-parse": "^7.0.2",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
+    "hono": "^4.13.2",
     "pg": "^8.23.0",
     "telegraf": "^4.16.3",
     "zod": "^4.4.3"
@@ -143,10 +165,22 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgrespassword}
       POSTGRES_DB: ${POSTGRES_DB:-courierdb}
     ports:
-      # ZMIANA: nasłuch tylko na pętli lokalnej. Wcześniej "5432:5432" oznaczało
-      # 0.0.0.0 — baza była widoczna z internetu, jeśli serwer ma publiczne IP.
-      # Bot i studio łączą się przez sieć Dockera, więc nic na tym nie tracą.
-      - "127.0.0.1:5432:5432"
+      # ZMIANA 16.08.2026: z "127.0.0.1:5432" na adres LAN.
+      #
+      # Powod: tunel SSH okazal sie niemozliwy. Dodatek Advanced SSH & Web
+      # Terminal ma `AllowTcpForwarding no` — przekierowanie portow konczy sie
+      # `channel 2: open failed: administratively prohibited`. Wpis klucza na
+      # serwerze pozwala na port-forwarding, ale konfiguracja globalna wygrywa,
+      # a `sshd_config` dodatku i tak przepada przy restarcie (§3a).
+      #
+      # `192.168.1.50` zamiast `0.0.0.0`: baza jest widoczna z LAN-u, ale
+      # zaden inny interfejs jej nie wystawia. Serwer siedzi za NAT-em, wiec
+      # z internetu dostepu nie ma. Jedyna obrona to POSTGRES_PASSWORD —
+      # NIE zostawiaj domyslnego `postgrespassword`.
+      #
+      # Bot, backup i migracje lacza sie przez siec Dockera i nie korzystaja
+      # z tego mapowania; jest wylacznie dla klienta bazy na Windowsie.
+      - "${POSTGRES_BIND_IP:-127.0.0.1}:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -204,28 +238,20 @@ services:
     profiles: ['webhook']
     logging: *logging
 
-  studio:
-    # ZMIANA: ten sam obraz co bot, zamiast drugiego `build: .`.
-    # Wcześniej każde `docker compose build` budowało identyczny obraz dwa razy.
-    image: courier-bot:latest
-    container_name: courier-studio
-    restart: always
-    command: npx drizzle-kit studio --host 0.0.0.0 --port 4983
-    ports:
-      # UWAGA: Drizzle Studio nie ma żadnego logowania — kto trafi na ten port,
-      # ma pełny dostęp do bazy. Zostawiam na pętli lokalnej; jeśli wystawiasz
-      # go przez reverse proxy działający na hoście, nadal zadziała.
-      - "127.0.0.1:4983:4983"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      bot:
-        condition: service_started
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgrespassword}@postgres:5432/${POSTGRES_DB:-courierdb}
-    logging: *logging
+  # --- USUNIETE 16.08.2026: Drizzle Studio -----------------------------------
+  #
+  # Powod 1 — nie dzialalo. Port byl wystawiony na `127.0.0.1:4983`, a dodatek
+  # Cloudflared w HA to osobny kontener i siegal `192.168.1.50:4983`. Nie mial
+  # jak sie dobic, wiec przegladarka wisiala na „Connecting…". Dokladnie 12b.
+  #
+  # Powod 2 — a gdyby dzialalo, byloby gorzej. Drizzle Studio NIE MA zadnego
+  # logowania. Publiczna subdomena = pelny odczyt i ZAPIS do bazy z realnymi
+  # zarobkami dla kazdego, kto na nia trafi.
+  #
+  # Zamiast tego: klient bazy na Windowsie (DBeaver) z wbudowanym tunelem SSH.
+  # Postgres zostaje na `127.0.0.1:5432`, nic nie wychodzi na zewnatrz,
+  # a uwierzytelnia SSH — nie „brak logowania".
+  # Doraznie na serwerze: `docker compose exec -T postgres psql -U postgres -d courierdb`.
 
   backup:
     build: ./docker/backup
@@ -279,6 +305,12 @@ ALLOWED_TELEGRAM_IDS=5066453902
 DATABASE_URL=postgres://user:pass@host:5432/glovobot
 # DATABASE_SSL=true    # tylko gdy baza wymaga TLS, a URL nie ma sslmode=require
 
+# Na jakim interfejsie serwera ma nasłuchiwać port 5432.
+# Puste = 127.0.0.1, czyli baza niewidoczna spoza samego serwera (domyślne, bezpieczne).
+# 192.168.1.50 = widoczna z LAN-u — potrzebne wyłącznie dla klienta bazy (DBeaver)
+# na innym komputerze. Wtedy POSTGRES_PASSWORD jest JEDYNĄ obroną.
+# POSTGRES_BIND_IP=192.168.1.50
+
 # Gemini
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-3.7-flash
@@ -296,10 +328,1210 @@ GEMINI_MAX_RETRIES=4
 MAPS_CONCURRENCY=4
 MAPS_MIN_INTERVAL_MS=100
 
+# --- REST API dla aplikacji mobilnej ---
+# Puste = API wyłączone (wszystko spod /api/ dostaje 503).
+# Wygeneruj: openssl rand -base64 32
+API_TOKEN=
+# telegram_id właściciela danych widocznych przez API.
+# Puste = jedyny wpis z ALLOWED_TELEGRAM_IDS.
+API_TELEGRAM_ID=
+
 # --- Backup bazy ---
 POSTGRES_PASSWORD=
 BACKUP_PASSPHRASE=długie-losowe-hasło-trzymane-POZA-serwerem
 BACKUP_CHAT_ID=5066453902
+```
+
+# Plik: src/api/auth.test.ts
+```typescript
+import { describe, expect, it } from 'vitest';
+import { tokenMatches } from './auth.js';
+
+const TOKEN = 'a'.repeat(43);
+
+describe('tokenMatches', () => {
+  it('przepuszcza poprawny token', () => {
+    expect(tokenMatches(`Bearer ${TOKEN}`, TOKEN)).toBe(true);
+  });
+
+  it('schemat jest niewrazliwy na wielkosc liter (RFC 7235)', () => {
+    expect(tokenMatches(`bearer ${TOKEN}`, TOKEN)).toBe(true);
+    expect(tokenMatches(`BEARER ${TOKEN}`, TOKEN)).toBe(true);
+  });
+
+  it('toleruje biale znaki wokol naglowka', () => {
+    expect(tokenMatches(`  Bearer   ${TOKEN}  `, TOKEN)).toBe(true);
+  });
+
+  it('odrzuca zly token tej samej dlugosci', () => {
+    expect(tokenMatches(`Bearer ${'b'.repeat(43)}`, TOKEN)).toBe(false);
+  });
+
+  /**
+   * Kluczowy przypadek: `timingSafeEqual` rzuca przy roznych dlugosciach
+   * buforow. Gdyby porownywac surowe wartosci zamiast skrotow, ten test
+   * wywalilby sie wyjatkiem zamiast zwrocic `false`.
+   */
+  it('odrzuca token innej dlugosci BEZ rzucania wyjatkiem', () => {
+    expect(() => tokenMatches('Bearer krotki', TOKEN)).not.toThrow();
+    expect(tokenMatches('Bearer krotki', TOKEN)).toBe(false);
+    expect(tokenMatches(`Bearer ${'c'.repeat(500)}`, TOKEN)).toBe(false);
+  });
+
+  it('odrzuca brak naglowka', () => {
+    expect(tokenMatches(undefined, TOKEN)).toBe(false);
+    expect(tokenMatches(null, TOKEN)).toBe(false);
+    expect(tokenMatches('', TOKEN)).toBe(false);
+  });
+
+  it('odrzuca inny schemat autoryzacji', () => {
+    expect(tokenMatches(`Basic ${TOKEN}`, TOKEN)).toBe(false);
+    expect(tokenMatches(TOKEN, TOKEN)).toBe(false);
+  });
+
+  it('odrzuca sam schemat bez wartosci', () => {
+    expect(tokenMatches('Bearer', TOKEN)).toBe(false);
+    expect(tokenMatches('Bearer   ', TOKEN)).toBe(false);
+  });
+
+  /** Pusty API_TOKEN = API wylaczone. Nie wolno, zeby pusty naglowek pasowal. */
+  it('pusty oczekiwany token nie pasuje do niczego', () => {
+    expect(tokenMatches('Bearer cokolwiek', '')).toBe(false);
+    expect(tokenMatches('Bearer ', '')).toBe(false);
+    expect(tokenMatches(undefined, '')).toBe(false);
+  });
+});
+```
+
+# Plik: src/api/auth.ts
+```typescript
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { CFG } from '../config.js';
+
+/**
+ * Autoryzacja REST API dla aplikacji mobilnej.
+ *
+ * Naglowek: `Authorization: Bearer <API_TOKEN>`.
+ *
+ * Dlaczego nie zwykle `===`:
+ * porownanie stringow w JS przerywa sie na pierwszym roznym bajcie, wiec czas
+ * odpowiedzi minimalnie zdradza, ile znakow sie zgadzalo. Przez internet, za
+ * Cloudflare, atak czasowy jest w praktyce nierealny — ale poprawka kosztuje
+ * trzy linijki, wiec nie ma powodu jej nie robic.
+ *
+ * Dlaczego skroty, a nie surowe bufory:
+ * `timingSafeEqual` RZUCA wyjatkiem przy roznych dlugosciach buforow, a sama
+ * roznica dlugosci zdradzalaby dlugosc tokena. SHA-256 daje zawsze 32 bajty.
+ */
+
+const BEARER = /^bearer\s+(\S+)$/i;
+
+function sha256(value: string): Buffer {
+  return createHash('sha256').update(value, 'utf8').digest();
+}
+
+/**
+ * Czysta funkcja — bez odwolan do CFG, dzieki czemu da sie ja testowac
+ * bez ustawiania zmiennych srodowiskowych przed importem modulu.
+ */
+export function tokenMatches(headerValue: string | null | undefined, expectedToken: string): boolean {
+  if (!expectedToken) return false;
+  if (!headerValue) return false;
+
+  const match = BEARER.exec(headerValue.trim());
+  const presented = match?.[1];
+  if (!presented) return false;
+
+  return timingSafeEqual(sha256(presented), sha256(expectedToken));
+}
+
+/** Czy API jest w ogole wlaczone. Brak `API_TOKEN` = kazde zadanie dostaje 401. */
+export function isApiEnabled(): boolean {
+  return CFG.API_TOKEN.length > 0;
+}
+
+export function isValidApiToken(headerValue: string | null | undefined): boolean {
+  return tokenMatches(headerValue, CFG.API_TOKEN);
+}
+```
+
+# Plik: src/api/idempotency.rules.test.ts
+```typescript
+import { describe, expect, it } from 'vitest';
+import { czyPorzucony, czyZapamietac, normalizujKlucz } from './idempotency.rules.js';
+
+/**
+ * Testy czystej czesci idempotencji — bez bazy, bez serwera.
+ *
+ * Ta sama zasada co w `schemas.test.ts` (16.4): logika, ktora da sie
+ * przetestowac bez podnoszenia calego swiata, ma byc wydzielona tak, zeby
+ * dalo sie ja przetestowac bez podnoszenia calego swiata.
+ *
+ * Reszty — wyscigu dwoch zadan i zapamietywania odpowiedzi — nie da sie
+ * sprawdzic bez bazy. Procedura recznego testu jest w
+ * `claude/plan-punkt-5-kolejka-offline.md` i sprowadza sie do:
+ * dwa `curl` z tym samym kluczem, potem `SELECT count(*)` = 1.
+ */
+
+describe('normalizujKlucz', () => {
+  it('przepuszcza UUID', () => {
+    const uuid = '9f1c2a4e-3b7d-4c2f-9a11-2f6b8c0d5e73';
+    expect(normalizujKlucz(uuid)).toBe(uuid);
+  });
+
+  it('obcina biale znaki', () => {
+    expect(normalizujKlucz('  klucz-12345678  ')).toBe('klucz-12345678');
+  });
+
+  it('brak naglowka to nie blad — idempotencja jest opcjonalna', () => {
+    expect(normalizujKlucz(undefined)).toBeNull();
+    expect(normalizujKlucz(null)).toBeNull();
+    expect(normalizujKlucz('')).toBeNull();
+  });
+
+  it('odrzuca klucz za krotki i za dlugi', () => {
+    expect(normalizujKlucz('abc')).toBeNull();
+    expect(normalizujKlucz('a'.repeat(129))).toBeNull();
+    expect(normalizujKlucz('a'.repeat(128))).toBe('a'.repeat(128));
+  });
+
+  it('odrzuca znaki, ktore nie maja prawa trafic do logu ani do klucza glownego', () => {
+    expect(normalizujKlucz('klucz z spacja')).toBeNull();
+    expect(normalizujKlucz('klucz\nz-nowa-linia')).toBeNull();
+    expect(normalizujKlucz("klucz';DROP TABLE users;--")).toBeNull();
+  });
+});
+
+describe('czyZapamietac', () => {
+  it('zapamietuje sukcesy', () => {
+    expect(czyZapamietac(200)).toBe(true);
+    expect(czyZapamietac(201)).toBe(true);
+  });
+
+  it('zapamietuje bledy klienta — powtorka ma dostac te sama odpowiedz', () => {
+    expect(czyZapamietac(400)).toBe(true);
+    expect(czyZapamietac(404)).toBe(true);
+  });
+
+  it('NIE zapamietuje bledow serwera — inaczej awaria bazy zablokowalaby wpis na zawsze', () => {
+    expect(czyZapamietac(500)).toBe(false);
+    expect(czyZapamietac(503)).toBe(false);
+  });
+
+  it('zero znaczy „w toku", a nie kod odpowiedzi', () => {
+    expect(czyZapamietac(0)).toBe(false);
+  });
+});
+
+describe('czyPorzucony', () => {
+  const teraz = new Date('2026-08-16T12:00:00Z');
+
+  it('swieze zadanie nie jest porzucone', () => {
+    expect(czyPorzucony(new Date('2026-08-16T11:59:30Z'), teraz)).toBe(false);
+  });
+
+  it('granica 60 s', () => {
+    expect(czyPorzucony(new Date('2026-08-16T11:59:00Z'), teraz)).toBe(false);
+    expect(czyPorzucony(new Date('2026-08-16T11:58:59Z'), teraz)).toBe(true);
+  });
+
+  it('zadanie sprzed godziny to ubity proces, nie praca w toku', () => {
+    expect(czyPorzucony(new Date('2026-08-16T11:00:00Z'), teraz)).toBe(true);
+  });
+});
+```
+
+# Plik: src/api/idempotency.rules.ts
+```typescript
+/**
+ * Czysta czesc idempotencji — bez bazy, bez Hono, bez `process.env`.
+ *
+ * Wydzielone celowo (16.4). Gdyby te funkcje siedzialy w `idempotency.ts`,
+ * ich test importowalby posrednio `db/index.ts`, ktore rzuca przy braku
+ * `DATABASE_URL` — i `npm test` w kopii WSL przestalby dzialac z powodu,
+ * ktory nie ma nic wspolnego z testowana logika.
+ *
+ * Ta sama zasada, co przy `finance.calc.ts` i `schemas.ts`.
+ */
+
+/** Po tylu godzinach wiersz jest bezuzyteczny — kolejka i tak porzuca wpisy. */
+export const RETENCJA_H = 48;
+
+/**
+ * Po tylu sekundach wiersz „w toku" uznajemy za porzucony.
+ *
+ * Bez tego pojedynczy ubity proces zostawialby klucz zablokowany na zawsze
+ * i ten konkretny wpis nigdy by nie przeszedl. 60 s jest z duzym zapasem
+ * powyzej 10-sekundowego timeoutu klienta.
+ */
+export const PORZUCONY_PO_S = 60;
+
+/** Co ile zapisow uruchamiamy sprzatanie starych wierszy. */
+export const SPRZATAJ_CO = 50;
+
+/**
+ * Walidacja klucza z naglowka.
+ *
+ * Zwraca `null`, gdy naglowka nie ma (to NIE jest blad — idempotencja jest
+ * opcjonalna) albo gdy klucz jest bezsensowny. Ciche odrzucenie zamiast bledu
+ * 400 jest swiadome: klient, ktory przysyla smiec, dostaje zwykle zachowanie,
+ * a nie zablokowany zapis danych.
+ *
+ * Ograniczenie znakow nie jest ozdobne — klucz trafia do logow i do klucza
+ * glownego tabeli.
+ */
+export function normalizujKlucz(naglowek: string | undefined | null): string | null {
+  if (typeof naglowek !== 'string') return null;
+  const k = naglowek.trim();
+  if (k.length < 8 || k.length > 128) return null;
+  if (!/^[A-Za-z0-9._:-]+$/.test(k)) return null;
+  return k;
+}
+
+/** Czy zajety, ale nierozstrzygniety wiersz mozna przejac. */
+export function czyPorzucony(utworzony: Date, teraz: Date): boolean {
+  return teraz.getTime() - utworzony.getTime() > PORZUCONY_PO_S * 1000;
+}
+
+/**
+ * Czy odpowiedz warto zapamietac.
+ *
+ * `5xx` NIE — blad serwera musi dac sie ponowic, inaczej jedna awaria bazy
+ * zablokowalaby ten wpis na zawsze. `4xx` TAK — powtorzone zle zadanie ma
+ * dostac te sama odpowiedz bez ponownego przelatywania przez trase.
+ */
+export function czyZapamietac(status: number): boolean {
+  return status > 0 && status < 500;
+}
+```
+
+# Plik: src/api/idempotency.ts
+```typescript
+import type { Context, Next } from 'hono';
+import { and, eq, lt, sql } from 'drizzle-orm';
+import { db } from '../db/index.js';
+import { apiIdempotency } from '../db/schema.js';
+import {
+  czyPorzucony,
+  czyZapamietac,
+  normalizujKlucz,
+  RETENCJA_H,
+  SPRZATAJ_CO,
+} from './idempotency.rules.js';
+
+/**
+ * Idempotencja zapisow — jeden klucz, jedno wykonanie.
+ *
+ * PO CO TO JEST. Kolejka offline w aplikacji ponawia zadania, ktore nie
+ * doszly. Bez tej warstwy kazde ponowienie `POST /api/v1/napiwek` tworzyloby
+ * DRUGI wiersz, bo `saveCashTip` to czysty `INSERT` (celowo — drugie
+ * tankowanie tego samego dnia ma sie dodawac, FIX 2.8). Kolejka bez
+ * idempotencji jest wiec GORSZA niz jej brak: zamiast utraty wpisu dostajemy
+ * cicha inflacje danych, ktorej nikt nie zauwazy.
+ *
+ * To nie jest problem wylacznie trybu offline. Juz dzis dwukrotne dotkniecie
+ * „Zapisz" przy wolnej sieci daje dwa napiwki: przycisk blokuje sie na czas
+ * zadania, ale timeout to 10 s, a po nim uzytkownik naciska ponownie.
+ *
+ * KONTRAKT. Naglowek `Idempotency-Key` jest OPCJONALNY:
+ *  - brak naglowka  -> zachowanie dokladnie takie jak dotad (bot, curl,
+ *    starsza wersja aplikacji nie zauwaza zmiany),
+ *  - ten sam klucz drugi raz -> operacja NIE jest wykonywana, wraca
+ *    zapamietana odpowiedz z oryginalnym kodem statusu.
+ *
+ * Kluczem jest UUID od klienta, a NIE skrot tresci. Skrot sklejalby dwa
+ * swiadome, identyczne napiwki po 5 zl w jeden — a to jest poprawny scenariusz.
+ *
+ * Reguly (walidacja klucza, progi czasowe) siedza w `idempotency.rules.ts`,
+ * zeby dalo sie je przetestowac bez bazy.
+ */
+
+/* ========================================================================== */
+/*  Middleware                                                                */
+/* ========================================================================== */
+
+let odSprzatania = 0;
+
+/**
+ * Sprzatanie w wariancie „przy okazji" (uzgodnione: A, nie cron).
+ *
+ * Bez wlasnej infrastruktury i bez kolejnego zadania w kontenerze backupu.
+ * Blad sprzatania nigdy nie moze wywrocic zapisu — stad `catch` i sam log.
+ */
+async function sprzatnijCzasem(): Promise<void> {
+  odSprzatania += 1;
+  if (odSprzatania < SPRZATAJ_CO) return;
+  odSprzatania = 0;
+
+  try {
+    await db
+      .delete(apiIdempotency)
+      .where(lt(apiIdempotency.createdAt, sql`now() - interval '${sql.raw(String(RETENCJA_H))} hours'`));
+  } catch (err) {
+    console.error('[API idempotencja] sprzatanie nie powiodlo sie', err);
+  }
+}
+
+async function zwolnij(klucz: string): Promise<void> {
+  try {
+    await db.delete(apiIdempotency).where(eq(apiIdempotency.key, klucz));
+  } catch (err) {
+    console.error('[API idempotencja] nie udalo sie zwolnic klucza', err);
+  }
+}
+
+/**
+ * Middleware do rejestracji w `router.ts` PO autoryzacji i PRZED trasami.
+ *
+ * Kolejnosc ma znaczenie dokladnie tak samo jak przy handlerach Telegrafa
+ * (10a): middleware zarejestrowany po trasach w Hono w ogole sie dla nich
+ * nie uruchomi, i to bez zadnego bledu.
+ */
+export function idempotencja(userId: string) {
+  return async (c: Context, next: Next): Promise<Response | void> => {
+    // Odczyty sa idempotentne z natury — nie ma czego pilnowac.
+    if (c.req.method !== 'POST') return next();
+
+    const klucz = normalizujKlucz(c.req.header('idempotency-key'));
+    if (klucz === null) return next();
+
+    /**
+     * ZAJMIJ KLUCZ, POTEM PRACUJ.
+     *
+     * Naiwna kolejnosc „sprawdz -> wykonaj -> zapisz" ma okno miedzy
+     * sprawdzeniem a zapisem. Przy podwojnym dotknieciu przycisku to okno
+     * realnie sie otwiera. `ON CONFLICT DO NOTHING` przenosi rozstrzygniecie
+     * do bazy, gdzie jest atomowe.
+     */
+    let zajety: { key: string }[];
+    try {
+      zajety = await db
+        .insert(apiIdempotency)
+        .values({
+          key: klucz,
+          telegramId: userId,
+          endpoint: c.req.path,
+          statusCode: 0,
+          responseJson: '',
+        })
+        .onConflictDoNothing()
+        .returning({ key: apiIdempotency.key });
+    } catch (err) {
+      // Awaria tabeli idempotencji nie moze uniemozliwic zapisu danych.
+      // Lepiej ryzykowac duplikat niz stracic wpis kuriera.
+      console.error('[API idempotencja] nie udalo sie zajac klucza — przepuszczam', err);
+      return next();
+    }
+
+    if (zajety.length === 0) {
+      const [istniejacy] = await db
+        .select()
+        .from(apiIdempotency)
+        .where(eq(apiIdempotency.key, klucz))
+        .limit(1);
+
+      // Wiersz zniknal miedzy INSERT-em a SELECT-em (rownolegle sprzatanie
+      // albo zwolnienie po bledzie). Traktujemy to jak zwykle zadanie.
+      if (!istniejacy) return next();
+
+      if (czyZapamietac(istniejacy.statusCode)) {
+        console.log(`[API idempotencja] powtorka ${c.req.path} klucz=${klucz}`);
+        return new Response(istniejacy.responseJson, {
+          status: istniejacy.statusCode,
+          headers: {
+            'content-type': 'application/json; charset=UTF-8',
+            'idempotent-replay': 'true',
+          },
+        });
+      }
+
+      if (!czyPorzucony(istniejacy.createdAt, new Date())) {
+        return c.json(
+          { error: 'Poprzednia próba tego zapisu jeszcze się nie zakończyła. Spróbuj za chwilę.' },
+          409
+        );
+      }
+
+      // Porzucony wiersz przejmujemy: odswiezamy znacznik czasu, zeby drugie
+      // ponowienie nie przejelo go natychmiast raz jeszcze.
+      await db
+        .update(apiIdempotency)
+        .set({ createdAt: new Date(), statusCode: 0, responseJson: '' })
+        .where(and(eq(apiIdempotency.key, klucz), eq(apiIdempotency.statusCode, 0)));
+    }
+
+    try {
+      await next();
+    } catch (err) {
+      await zwolnij(klucz);
+      throw err;
+    }
+
+    const status = c.res.status;
+    if (!czyZapamietac(status)) {
+      // 5xx — ponowienie musi miec szanse.
+      await zwolnij(klucz);
+      return;
+    }
+
+    let tresc = '';
+    try {
+      tresc = await c.res.clone().text();
+    } catch (err) {
+      console.error('[API idempotencja] nie udalo sie odczytac odpowiedzi', err);
+      await zwolnij(klucz);
+      return;
+    }
+
+    await db
+      .update(apiIdempotency)
+      .set({ statusCode: status, responseJson: tresc })
+      .where(eq(apiIdempotency.key, klucz));
+
+    await sprzatnijCzasem();
+  };
+}
+```
+
+# Plik: src/api/router.ts
+```typescript
+import type { RequestListener } from 'node:http';
+import { Hono } from 'hono';
+import { getRequestListener } from '@hono/node-server';
+import { apiUserId } from '../config.js';
+import { isApiEnabled, isValidApiToken } from './auth.js';
+import { idempotencja } from './idempotency.js';
+import { registerReadRoutes } from './routes.read.js';
+import { registerWriteRoutes } from './routes.write.js';
+
+/**
+ * REST API dla aplikacji mobilnej.
+ *
+ * Zyje w TYM SAMYM procesie i na TYM SAMYM porcie co webhook Telegrama —
+ * bot juz jest serwerem HTTP, wiec nie ma po co stawiac drugiego kontenera.
+ * Granica przebiega na jednym `if` w `server.ts`: wszystko spod `/api/`
+ * trafia tutaj, reszta zostaje na dotychczasowym handlerze.
+ *
+ * Gdyby Hono kiedykolwiek sprawialo problemy, wypiecie tego jednego `if`
+ * przywraca bota do stanu sprzed zmiany.
+ *
+ * UWAGA BEZPIECZENSTWA: to API stoi na tej samej subdomenie co webhook, a na
+ * niej NIE WOLNO wlaczyc Cloudflare Access — Telegram nie przejdzie logowania
+ * i wszystkie update'y wroca jako 403 (12c). `API_TOKEN` jest jedyna obrona
+ * miedzy internetem a baza.
+ */
+
+export interface ApiSetup {
+  listener: RequestListener;
+  enabled: boolean;
+  /** Powod wylaczenia — do wypisania przy starcie. `null` gdy API dziala. */
+  disabledReason: string | null;
+}
+
+function clientIp(headers: Headers): string {
+  return headers.get('cf-connecting-ip') ?? headers.get('x-forwarded-for') ?? 'nieznane';
+}
+
+export function createApiSetup(): ApiSetup {
+  const app = new Hono();
+  const userId = apiUserId();
+
+  let disabledReason: string | null = null;
+  if (!isApiEnabled()) {
+    disabledReason = 'brak API_TOKEN w .env';
+  } else if (!userId) {
+    disabledReason =
+      'nie wiadomo, do kogo należy API_TOKEN — ustaw API_TELEGRAM_ID ' +
+      'albo zostaw dokładnie jeden wpis w ALLOWED_TELEGRAM_IDS';
+  }
+
+  // --- Autoryzacja ----------------------------------------------------------
+  // Rejestrowana PRZED trasami, inaczej Hono jej dla nich nie uruchomi.
+  app.use('/api/*', async (c, next) => {
+    if (disabledReason !== null) {
+      console.warn(`[API] odrzucone: ${disabledReason}`);
+      return c.body(null, 503);
+    }
+
+    if (!isValidApiToken(c.req.header('authorization'))) {
+      // Log bez tokena — inaczej sekret laduje w `docker compose logs`.
+      console.warn(`[API 401] ${c.req.method} ${c.req.path} ip=${clientIp(c.req.raw.headers)}`);
+      return c.body(null, 401);
+    }
+
+    await next();
+  });
+
+  // --- Idempotencja zapisow -------------------------------------------------
+  // PO autoryzacji (niezalogowany nie ma po co zajmowac klucza) i PRZED
+  // trasami — middleware zarejestrowany po nich w ogole by sie dla nich nie
+  // uruchomil, i to bez zadnego bledu. Ta sama klasa pulapki co 10a.
+  //
+  // Dotyka wylacznie `POST` z naglowkiem `Idempotency-Key`. Bez naglowka
+  // zachowanie jest dokladnie takie jak dotad, wiec bot, `curl` i starsza
+  // wersja aplikacji nie zauwaza zmiany.
+  app.use('/api/*', idempotencja(userId ?? ''));
+
+  // Puste `userId` jest juz odsiane przez `disabledReason`, ale kompilator
+  // o tym nie wie — a rzutowanie `as` bylo by obietnica bez pokrycia.
+  registerReadRoutes(app, userId ?? '');
+  registerWriteRoutes(app, userId ?? '');
+
+  app.notFound((c) => c.json({ error: 'Nie ma takiego endpointu.' }, 404));
+
+  /**
+   * Odpowiednik `bot.catch()` dla HTTP. Nigdy nie polykamy wyjatku cicho —
+   * pelny slad idzie do logow, klient dostaje 500 bez szczegolow.
+   */
+  app.onError((err, c) => {
+    console.error(`[API 500] ${c.req.method} ${c.req.path}`, err);
+    return c.json({ error: 'Błąd po stronie serwera.' }, 500);
+  });
+
+  return {
+    listener: getRequestListener(app.fetch),
+    enabled: disabledReason === null,
+    disabledReason,
+  };
+}
+
+/** Prefiks, ktory `server.ts` przekierowuje tutaj. */
+export const API_PREFIX = '/api/';
+```
+
+# Plik: src/api/routes.read.ts
+```typescript
+import type { Hono } from 'hono';
+import { financeService } from '../services/finance.service.js';
+import { daysBetween, isValidDateStr } from '../utils/datetime.js';
+import { CFG } from '../config.js';
+
+/**
+ * Endpointy REST do ODCZYTU (krok 1 planu aplikacji mobilnej).
+ *
+ * Zadna z tych sciezek nic nie zapisuje — blad tutaj to zla liczba na ekranie,
+ * a nie uszkodzony wiersz w bazie. Zapisy dochodza dopiero w kroku 3.
+ *
+ * Wszystkie kwoty wracaja jako LICZBY, nie stringi: `getDailySummary` i
+ * `getPeriodSummary` przepuszczaja `numeric` przez `parseFloat` (patrz 9b),
+ * a `listCourseOffers` robi to samo dla swoich kolumn.
+ *
+ * Daty sa zawsze `YYYY-MM-DD` w strefie Europe/Warsaw. Nigdzie nie ma
+ * `toISOString()` na dacie lokalnej.
+ */
+
+/** Gorna granica zakresu raportu. Bez tego `?od=1970-01-01` ciagnie wszystko. */
+const MAX_RANGE_DAYS = 400;
+const MAX_OFFERS_LIMIT = 500;
+const DEFAULT_OFFERS_LIMIT = 100;
+
+interface RangeOk {
+  ok: true;
+  od: string;
+  do: string;
+}
+interface RangeErr {
+  ok: false;
+  message: string;
+}
+
+function parseRange(odRaw: string | undefined, doRaw: string | undefined): RangeOk | RangeErr {
+  if (!isValidDateStr(odRaw)) {
+    return { ok: false, message: 'Parametr "od" musi być datą w formacie YYYY-MM-DD.' };
+  }
+  if (!isValidDateStr(doRaw)) {
+    return { ok: false, message: 'Parametr "do" musi być datą w formacie YYYY-MM-DD.' };
+  }
+  const span = daysBetween(odRaw, doRaw);
+  if (span < 0) {
+    return { ok: false, message: 'Parametr "od" jest późniejszy niż "do".' };
+  }
+  if (span > MAX_RANGE_DAYS) {
+    return { ok: false, message: `Zakres przekracza ${MAX_RANGE_DAYS} dni.` };
+  }
+  return { ok: true, od: odRaw, do: doRaw };
+}
+
+function parseLimit(raw: string | undefined): number | null {
+  if (raw === undefined) return DEFAULT_OFFERS_LIMIT;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > MAX_OFFERS_LIMIT) return null;
+  return n;
+}
+
+export function registerReadRoutes(app: Hono, userId: string): void {
+  /** Metadane — pozwalaja aplikacji sprawdzic, czy gada z tym, czym myśli. */
+  app.get('/api/v1/info', (c) =>
+    c.json({
+      api: 'v1',
+      tz: CFG.TZ,
+      nettoFactor: CFG.NETTO_FACTOR,
+      minStawkaNettoKm: CFG.MIN_STAWKA_NETTO_KM,
+      dzisiaj: financeService.getEffectiveDate(),
+    })
+  );
+
+  /** Podsumowanie dnia dzisiejszego (data wyznaczana po stronie serwera). */
+  app.get('/api/v1/dzien', async (c) => {
+    const date = financeService.getEffectiveDate();
+    return c.json(await financeService.getDailySummary(userId, date));
+  });
+
+  /** Podsumowanie wybranego dnia. */
+  app.get('/api/v1/dzien/:data', async (c) => {
+    const date = c.req.param('data');
+    if (!isValidDateStr(date)) {
+      return c.json({ error: 'Data musi być w formacie YYYY-MM-DD.' }, 400);
+    }
+    return c.json(await financeService.getDailySummary(userId, date));
+  });
+
+  /** Podsumowanie zakresu dat — pod tydzien, miesiac i wykresy. */
+  app.get('/api/v1/okres', async (c) => {
+    const range = parseRange(c.req.query('od'), c.req.query('do'));
+    if (!range.ok) return c.json({ error: range.message }, 400);
+
+    return c.json(await financeService.getPeriodSummary(userId, range.od, range.do));
+  });
+
+  /** Saldo Portfela Glovo = suma transakcji ze znakiem. */
+  app.get('/api/v1/saldo', async (c) => {
+    const doDate = c.req.query('do');
+    if (doDate !== undefined && !isValidDateStr(doDate)) {
+      return c.json({ error: 'Parametr "do" musi być datą w formacie YYYY-MM-DD.' }, 400);
+    }
+    const wallet =
+      doDate === undefined
+        ? await financeService.getWalletBalance(userId)
+        : await financeService.getWalletBalance(userId, doDate);
+
+    return c.json(wallet);
+  });
+
+  /** Statystyki ofert z jednego dnia (to samo, co pokazuje /statystyki w bocie). */
+  app.get('/api/v1/oferty/statystyki/:data', async (c) => {
+    const date = c.req.param('data');
+    if (!isValidDateStr(date)) {
+      return c.json({ error: 'Data musi być w formacie YYYY-MM-DD.' }, 400);
+    }
+    return c.json(await financeService.getCourseOfferStats(userId, date));
+  });
+
+  /**
+   * Dzienne sumy dla zakresu — pod wykres tygodnia i kalendarz miesiąca.
+   * Jedno wywołanie zamiast 31 zapytań o `/dzien`.
+   */
+  app.get('/api/v1/dni', async (c) => {
+    const range = parseRange(c.req.query('od'), c.req.query('do'));
+    if (!range.ok) return c.json({ error: range.message }, 400);
+
+    const items = await financeService.listDailyTotals(userId, range.od, range.do);
+    return c.json({ od: range.od, do: range.do, items, count: items.length });
+  });
+
+  /**
+   * Postęp celów. Oba okresy naraz — aplikacja i tak pokazuje je razem,
+   * a dwa zapytania z telefonu to dwa razy więcej okazji do utraty zasięgu.
+   */
+  app.get('/api/v1/cele', async (c) => {
+    const [miesiac, tydzien] = await Promise.all([
+      financeService.getTargetProgress(userId, 'MONTHLY'),
+      financeService.getTargetProgress(userId, 'WEEKLY'),
+    ]);
+    return c.json({ miesiac, tydzien });
+  });
+
+  /** Lista ofert — surowe pozycje pod wykresy w aplikacji. */
+  app.get('/api/v1/oferty', async (c) => {
+    const odRaw = c.req.query('od');
+    const doRaw = c.req.query('do');
+
+    if (odRaw !== undefined && !isValidDateStr(odRaw)) {
+      return c.json({ error: 'Parametr "od" musi być datą w formacie YYYY-MM-DD.' }, 400);
+    }
+    if (doRaw !== undefined && !isValidDateStr(doRaw)) {
+      return c.json({ error: 'Parametr "do" musi być datą w formacie YYYY-MM-DD.' }, 400);
+    }
+    if (odRaw !== undefined && doRaw !== undefined && daysBetween(odRaw, doRaw) < 0) {
+      return c.json({ error: 'Parametr "od" jest późniejszy niż "do".' }, 400);
+    }
+
+    const limit = parseLimit(c.req.query('limit'));
+    if (limit === null) {
+      return c.json({ error: `Parametr "limit" musi być liczbą całkowitą 1-${MAX_OFFERS_LIMIT}.` }, 400);
+    }
+
+    const items = await financeService.listCourseOffers(userId, odRaw ?? null, doRaw ?? null, limit);
+    return c.json({ items, count: items.length, limit });
+  });
+}
+```
+
+# Plik: src/api/routes.write.ts
+```typescript
+import type { Context, Hono } from 'hono';
+import type { z } from 'zod';
+import { financeService } from '../services/finance.service.js';
+import { ensureUserById } from '../services/user.service.js';
+import {
+  BruttoSchema,
+  CelSchema,
+  DystansSchema,
+  NapiwekSchema,
+  PaliwoSchema,
+  UsunSchema,
+  ZmianaSchema,
+  pierwszyBlad,
+} from './schemas.js';
+
+/**
+ * Endpointy REST do ZAPISU (krok 3a planu aplikacji mobilnej).
+ *
+ * Zasada: JEDEN ENDPOINT = JEDEN ZAPIS. Nie ma zbiorczego „zapisz wszystko",
+ * bo przy kolejce offline (krok 3b) jeden element kolejki musi odpowiadać
+ * jednej operacji. Przy zbiorczym wpisie odrzucenie jednego pola stawia
+ * pytanie, co zrobić z resztą, i nie ma na nie dobrej odpowiedzi.
+ *
+ * Każdy zapis idzie przez TEN SAM serwis co bot, więc reguły biznesowe z §8
+ * obowiązują w obu klientach bez duplikacji logiki.
+ *
+ * IDEMPOTENCJA — od kroku 5 jest, ale trzeba o nią poprosić.
+ * `saveCashTip` i `saveFuelReceipt` to nadal czyste `INSERT` (celowo: drugie
+ * tankowanie tego samego dnia ma się dodawać, FIX 2.8), więc powtórzone
+ * żądanie BEZ nagłówka `Idempotency-Key` utworzy DRUGI wpis. Z nagłówkiem
+ * operacja wykona się raz, a każde ponowienie dostanie zapamiętaną odpowiedź.
+ * Szczegóły i powód: `src/api/idempotency.ts`.
+ *
+ * Same trasy nic o tym nie wiedzą — cała obsługa siedzi w middleware
+ * zarejestrowanym w `router.ts`. To celowe: dopisanie nowego endpointu zapisu
+ * nie wymaga pamiętania o idempotencji.
+ */
+
+/** Wspólny kształt odpowiedzi wszystkich zapisów: stan dnia po zmianie. */
+interface OdpowiedzZapisu {
+  dzien: Awaited<ReturnType<typeof financeService.getDailySummary>>;
+  /** Komunikat z `calculateHours` — np. zmiana dłuższa niż 16 h (§8d). */
+  ostrzezenie: string | null;
+}
+
+type Wynik<T> = { ok: true; wartosc: T } | { ok: false; komunikat: string };
+
+async function czytajCialo<T>(c: Context, schemat: z.ZodType<T>): Promise<Wynik<T>> {
+  let surowe: unknown;
+  try {
+    surowe = await c.req.json();
+  } catch {
+    return { ok: false, komunikat: 'Ciało żądania nie jest poprawnym JSON-em.' };
+  }
+
+  const wynik = schemat.safeParse(surowe);
+  if (!wynik.success) {
+    return { ok: false, komunikat: pierwszyBlad(wynik) ?? 'Nieprawidłowe dane.' };
+  }
+  return { ok: true, wartosc: wynik.data };
+}
+
+export function registerWriteRoutes(app: Hono, userId: string): void {
+  /**
+   * Data wpisu wyznaczana PO STRONIE SERWERA, gdy klient jej nie poda.
+   * Telefon może mieć przestawiony zegar albo złą strefę, a doba kończy się
+   * o północy w Europe/Warsaw (§8a). Serwer jest tu jedynym źródłem prawdy.
+   */
+  const dzien = (podana: string | null): string => podana ?? financeService.getEffectiveDate();
+
+  /** FK z wszystkich tabel stoi na `users.telegram_id` — wiersz musi istnieć. */
+  const odpowiedz = async (c: Context, date: string, ostrzezenie: string | null) => {
+    const body: OdpowiedzZapisu = {
+      dzien: await financeService.getDailySummary(userId, date),
+      ostrzezenie,
+    };
+    return c.json(body, 201);
+  };
+
+  app.post('/api/v1/napiwek', async (c) => {
+    const w = await czytajCialo(c, NapiwekSchema);
+    if (!w.ok) return c.json({ error: w.komunikat }, 400);
+
+    const date = dzien(w.wartosc.data);
+    await ensureUserById(userId);
+    await financeService.saveCashTip(userId, date, w.wartosc.kwota);
+    return odpowiedz(c, date, null);
+  });
+
+  app.post('/api/v1/paliwo', async (c) => {
+    const w = await czytajCialo(c, PaliwoSchema);
+    if (!w.ok) return c.json({ error: w.komunikat }, 400);
+
+    const date = dzien(w.wartosc.data);
+    await ensureUserById(userId);
+    await financeService.saveFuelReceipt(userId, date, {
+      totalCost: w.wartosc.kwota,
+      liters: w.wartosc.litry,
+      pricePerLiter: w.wartosc.cenaZaLitr,
+    });
+    return odpowiedz(c, date, null);
+  });
+
+  app.post('/api/v1/dystans', async (c) => {
+    const w = await czytajCialo(c, DystansSchema);
+    if (!w.ok) return c.json({ error: w.komunikat }, 400);
+
+    const date = dzien(w.wartosc.data);
+    await ensureUserById(userId);
+    await financeService.setDailyDistance(userId, date, w.wartosc.km);
+    return odpowiedz(c, date, null);
+  });
+
+  app.post('/api/v1/brutto', async (c) => {
+    const w = await czytajCialo(c, BruttoSchema);
+    if (!w.ok) return c.json({ error: w.komunikat }, 400);
+
+    const date = dzien(w.wartosc.data);
+    await ensureUserById(userId);
+    await financeService.setGrossEarnings(userId, date, w.wartosc.kwota);
+    return odpowiedz(c, date, null);
+  });
+
+  app.post('/api/v1/zmiana', async (c) => {
+    const w = await czytajCialo(c, ZmianaSchema);
+    if (!w.ok) return c.json({ error: w.komunikat }, 400);
+
+    const date = dzien(w.wartosc.data);
+    await ensureUserById(userId);
+
+    let ostrzezenie: string | null = null;
+
+    // Kolejność ma znaczenie: `setShiftEnd` przelicza godziny dopiero wtedy,
+    // gdy `workFrom` jest już w bazie. Odwrotnie wynik byłby pusty.
+    if (w.wartosc.od !== null) {
+      const r = await financeService.setShiftStart(userId, date, w.wartosc.od);
+      ostrzezenie = r.hoursError;
+    }
+    if (w.wartosc.do !== null) {
+      const r = await financeService.setShiftEnd(userId, date, { workTo: w.wartosc.do });
+      ostrzezenie = r.hoursError;
+    }
+
+    return odpowiedz(c, date, ostrzezenie);
+  });
+
+  /** Cel zarobkowy na bieżący miesiąc albo tydzień ISO (§8e). */
+  app.post('/api/v1/cel', async (c) => {
+    const w = await czytajCialo(c, CelSchema);
+    if (!w.ok) return c.json({ error: w.komunikat }, 400);
+
+    await ensureUserById(userId);
+    const zapisany = await financeService.setEarningTarget(userId, w.wartosc.okres, w.wartosc.kwota);
+    const postep = await financeService.getTargetProgress(userId, w.wartosc.okres);
+    return c.json({ zapisany, postep }, 201);
+  });
+
+  /**
+   * Kasowanie wpisów — ta sama ścieżka co kasowanie głosem w bocie.
+   *
+   * `POST`, nie `DELETE`, bo potrzebne jest ciało z zakresem i datą, a `DELETE`
+   * z ciałem bywa gubione przez pośredniki. Nazwa endpointu mówi wprost, co robi.
+   */
+  app.post('/api/v1/usun', async (c) => {
+    const w = await czytajCialo(c, UsunSchema);
+    if (!w.ok) return c.json({ error: w.komunikat }, 400);
+
+    const wynik = await financeService.handleVoiceDeletion(userId, w.wartosc.cel, w.wartosc.data);
+    return c.json({
+      usuniete: wynik.success,
+      komunikat: wynik.message,
+      dzien: await financeService.getDailySummary(userId, wynik.date),
+    });
+  });
+}
+```
+
+# Plik: src/api/schemas.test.ts
+```typescript
+import { describe, expect, it } from 'vitest';
+import {
+  BruttoSchema,
+  CelSchema,
+  DystansSchema,
+  NapiwekSchema,
+  PaliwoSchema,
+  UsunSchema,
+  ZmianaSchema,
+  pierwszyBlad,
+} from './schemas.js';
+
+describe('NapiwekSchema', () => {
+  it('przyjmuje kwotę bez daty', () => {
+    const w = NapiwekSchema.safeParse({ kwota: 5.5 });
+    expect(w.success).toBe(true);
+    if (w.success) expect(w.data.data).toBeNull();
+  });
+
+  it('przyjmuje datę w poprawnym formacie', () => {
+    const w = NapiwekSchema.safeParse({ kwota: 5.5, data: '2026-08-16' });
+    expect(w.success).toBe(true);
+    if (w.success) expect(w.data.data).toBe('2026-08-16');
+  });
+
+  it('odrzuca zero i wartości ujemne', () => {
+    expect(NapiwekSchema.safeParse({ kwota: 0 }).success).toBe(false);
+    expect(NapiwekSchema.safeParse({ kwota: -5 }).success).toBe(false);
+  });
+
+  it('odrzuca NaN i nieskończoność', () => {
+    expect(NapiwekSchema.safeParse({ kwota: Number.NaN }).success).toBe(false);
+    expect(NapiwekSchema.safeParse({ kwota: Number.POSITIVE_INFINITY }).success).toBe(false);
+  });
+
+  it('odrzuca kwotę spoza rozsądnego zakresu', () => {
+    expect(NapiwekSchema.safeParse({ kwota: 10_001 }).success).toBe(false);
+  });
+
+  it('odrzuca kwotę podaną jako tekst', () => {
+    expect(NapiwekSchema.safeParse({ kwota: '5.5' }).success).toBe(false);
+  });
+
+  it('odrzuca datę, która nie istnieje w kalendarzu', () => {
+    expect(NapiwekSchema.safeParse({ kwota: 5, data: '2026-02-30' }).success).toBe(false);
+    expect(NapiwekSchema.safeParse({ kwota: 5, data: '16-08-2026' }).success).toBe(false);
+  });
+});
+
+describe('PaliwoSchema', () => {
+  it('litry i cena są opcjonalne', () => {
+    const w = PaliwoSchema.safeParse({ kwota: 312.4 });
+    expect(w.success).toBe(true);
+    if (w.success) {
+      expect(w.data.litry).toBeNull();
+      expect(w.data.cenaZaLitr).toBeNull();
+    }
+  });
+
+  it('przyjmuje komplet', () => {
+    const w = PaliwoSchema.safeParse({ kwota: 312.4, litry: 48.2, cenaZaLitr: 6.48 });
+    expect(w.success).toBe(true);
+  });
+
+  it('odrzuca absurdalną liczbę litrów', () => {
+    expect(PaliwoSchema.safeParse({ kwota: 100, litry: 5000 }).success).toBe(false);
+  });
+});
+
+describe('DystansSchema', () => {
+  it('przyjmuje dystans dzienny', () => {
+    expect(DystansSchema.safeParse({ km: 142.3 }).success).toBe(true);
+  });
+
+  /** Sanity-check przeciw wpisaniu stanu licznika zamiast dystansu dnia. */
+  it('odrzuca wartość wyglądającą na stan licznika', () => {
+    expect(DystansSchema.safeParse({ km: 84_500 }).success).toBe(false);
+  });
+});
+
+describe('BruttoSchema', () => {
+  it('zero jest dozwolone — pozwala wyzerować pomyłkę', () => {
+    expect(BruttoSchema.safeParse({ kwota: 0 }).success).toBe(true);
+  });
+
+  it('odrzuca wartości ujemne', () => {
+    expect(BruttoSchema.safeParse({ kwota: -1 }).success).toBe(false);
+  });
+});
+
+describe('ZmianaSchema', () => {
+  it('przyjmuje samo "od"', () => {
+    expect(ZmianaSchema.safeParse({ od: '11:30' }).success).toBe(true);
+  });
+
+  it('przyjmuje samo "do"', () => {
+    expect(ZmianaSchema.safeParse({ do: '21:15' }).success).toBe(true);
+  });
+
+  it('przyjmuje obie godziny', () => {
+    expect(ZmianaSchema.safeParse({ od: '11:30', do: '21:15' }).success).toBe(true);
+  });
+
+  it('przyjmuje zapis jednocyfrowy — normalizacja jest po stronie serwisu', () => {
+    expect(ZmianaSchema.safeParse({ od: '9:05' }).success).toBe(true);
+  });
+
+  it('odrzuca puste ciało — nie ma czego zapisać', () => {
+    expect(ZmianaSchema.safeParse({}).success).toBe(false);
+  });
+
+  it('odrzuca nieistniejące godziny', () => {
+    expect(ZmianaSchema.safeParse({ od: '25:00' }).success).toBe(false);
+    expect(ZmianaSchema.safeParse({ od: '11:75' }).success).toBe(false);
+    expect(ZmianaSchema.safeParse({ od: '1130' }).success).toBe(false);
+  });
+});
+
+describe('pierwszyBlad', () => {
+  it('zwraca null dla poprawnych danych', () => {
+    expect(pierwszyBlad(NapiwekSchema.safeParse({ kwota: 5 }))).toBeNull();
+  });
+
+  it('zwraca komunikat wskazujący pole', () => {
+    const komunikat = pierwszyBlad(NapiwekSchema.safeParse({ kwota: -1 }));
+    expect(komunikat).toContain('kwota');
+  });
+
+  it('zwraca komunikat także dla braku pola', () => {
+    expect(pierwszyBlad(NapiwekSchema.safeParse({}))).toBeTruthy();
+  });
+});
+
+describe('CelSchema', () => {
+  it('przyjmuje cel miesięczny i tygodniowy', () => {
+    expect(CelSchema.safeParse({ okres: 'MONTHLY', kwota: 4500 }).success).toBe(true);
+    expect(CelSchema.safeParse({ okres: 'WEEKLY', kwota: 1200 }).success).toBe(true);
+  });
+
+  it('odrzuca nieznany okres', () => {
+    expect(CelSchema.safeParse({ okres: 'DAILY', kwota: 100 }).success).toBe(false);
+    expect(CelSchema.safeParse({ okres: 'monthly', kwota: 100 }).success).toBe(false);
+  });
+
+  it('odrzuca cel zerowy', () => {
+    expect(CelSchema.safeParse({ okres: 'MONTHLY', kwota: 0 }).success).toBe(false);
+  });
+});
+
+describe('UsunSchema', () => {
+  it('przyjmuje wszystkie zakresy znane botowi', () => {
+    for (const cel of ['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'DISTANCE', 'ALL_DAY']) {
+      expect(UsunSchema.safeParse({ cel }).success).toBe(true);
+    }
+  });
+
+  it('data jest opcjonalna', () => {
+    const w = UsunSchema.safeParse({ cel: 'ALL_DAY' });
+    expect(w.success).toBe(true);
+    if (w.success) expect(w.data.data).toBeNull();
+  });
+
+  it('odrzuca zakres spoza listy', () => {
+    expect(UsunSchema.safeParse({ cel: 'WSZYSTKO' }).success).toBe(false);
+    expect(UsunSchema.safeParse({}).success).toBe(false);
+  });
+});
+```
+
+# Plik: src/api/schemas.ts
+```typescript
+import { z } from 'zod';
+import { isValidDateStr, normalizeTime } from '../utils/datetime.js';
+
+/**
+ * Schematy ciał żądań POST.
+ *
+ * Wydzielone z tras, bo są czystymi wartościami — dają się testować bez
+ * podnoszenia serwera, bazy i całej reszty (§16.4).
+ *
+ * Komunikaty są po polsku i mówią, KTÓRE pole jest złe. Klient dostaje 400
+ * z konkretem zamiast „Bad Request", bo po drugiej stronie stoi formularz
+ * na telefonie, a nie programista z debuggerem.
+ */
+
+const liczbaDodatnia = (pole: string, maks: number) =>
+  z
+    .number({ message: `Pole "${pole}" musi być liczbą.` })
+    .refine(Number.isFinite, `Pole "${pole}" musi być skończoną liczbą.`)
+    .refine((v) => v > 0, `Pole "${pole}" musi być większe od zera.`)
+    .refine((v) => v <= maks, `Pole "${pole}" przekracza rozsądny limit (${maks}).`);
+
+const liczbaNieujemna = (pole: string, maks: number) =>
+  z
+    .number({ message: `Pole "${pole}" musi być liczbą.` })
+    .refine(Number.isFinite, `Pole "${pole}" musi być skończoną liczbą.`)
+    .refine((v) => v >= 0, `Pole "${pole}" nie może być ujemne.`)
+    .refine((v) => v <= maks, `Pole "${pole}" przekracza rozsądny limit (${maks}).`);
+
+/** `undefined` i `null` traktujemy tak samo — jako „nie podano". */
+const opcjonalna = <T>(schemat: z.ZodType<T>) => schemat.nullish().transform((v) => v ?? null);
+
+/**
+ * Data wpisu. Puste = dzisiaj wyznaczone PO STRONIE SERWERA.
+ * Telefon może mieć złą strefę albo przestawiony zegar, a doba kończy się
+ * o północy w Europe/Warsaw (§8a) — serwer jest tu jedynym źródłem prawdy.
+ */
+const dataWpisu = opcjonalna(
+  z.string().refine(isValidDateStr, 'Data musi być w formacie RRRR-MM-DD.')
+);
+
+const godzina = opcjonalna(
+  z.string().refine((v) => normalizeTime(v) !== null, 'Godzina musi być w formacie GG:MM.')
+);
+
+export const NapiwekSchema = z.object({
+  kwota: liczbaDodatnia('kwota', 10_000),
+  data: dataWpisu,
+});
+
+export const PaliwoSchema = z.object({
+  kwota: liczbaDodatnia('kwota', 10_000),
+  litry: opcjonalna(liczbaDodatnia('litry', 500)),
+  cenaZaLitr: opcjonalna(liczbaDodatnia('cenaZaLitr', 100)),
+  data: dataWpisu,
+});
+
+export const DystansSchema = z.object({
+  /** Dystans PRZEJECHANY danego dnia, nie stan licznika (§2.7 w ZMIANY.md). */
+  km: liczbaDodatnia('km', 2_000),
+  data: dataWpisu,
+});
+
+export const BruttoSchema = z.object({
+  /** Zero jest dozwolone — pozwala wyzerować pomyłkowy wpis. */
+  kwota: liczbaNieujemna('kwota', 100_000),
+  data: dataWpisu,
+});
+
+export const ZmianaSchema = z
+  .object({
+    od: godzina,
+    do: godzina,
+    data: dataWpisu,
+  })
+  .refine((v) => v.od !== null || v.do !== null, {
+    message: 'Podaj przynajmniej jedną godzinę — "od" albo "do".',
+  });
+
+export const CelSchema = z.object({
+  okres: z.enum(['MONTHLY', 'WEEKLY'], { message: 'Pole "okres" musi być "MONTHLY" albo "WEEKLY".' }),
+  kwota: liczbaDodatnia('kwota', 1_000_000),
+});
+
+/** Te same cele co kasowanie głosem w bocie — jedna lista, jedna logika. */
+export const UsunSchema = z.object({
+  cel: z.enum(['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'DISTANCE', 'ALL_DAY'], {
+    message: 'Nieznany zakres kasowania.',
+  }),
+  data: dataWpisu,
+});
+
+export type NapiwekBody = z.infer<typeof NapiwekSchema>;
+export type PaliwoBody = z.infer<typeof PaliwoSchema>;
+export type DystansBody = z.infer<typeof DystansSchema>;
+export type BruttoBody = z.infer<typeof BruttoSchema>;
+export type ZmianaBody = z.infer<typeof ZmianaSchema>;
+export type CelBody = z.infer<typeof CelSchema>;
+export type UsunBody = z.infer<typeof UsunSchema>;
+
+/**
+ * Kształt wyniku `safeParse` opisany STRUKTURALNIE, a nie przez nazwę typu
+ * z zoda. Powód: `SafeParseReturnType` z zoda 3 nazywa się inaczej w zodzie 4,
+ * a projekt jest na `^4.4.3`. Struktura jest stabilna między wersjami, nazwa nie.
+ */
+type WynikWalidacji =
+  | { success: true }
+  | { success: false; error: { issues: ReadonlyArray<{ message: string }> } };
+
+/** Pierwszy komunikat błędu albo `null`, gdy dane są poprawne. */
+export function pierwszyBlad(wynik: WynikWalidacji): string | null {
+  if (wynik.success) return null;
+  return wynik.error.issues[0]?.message ?? 'Nieprawidłowe dane.';
+}
 ```
 
 # Plik: src/bot/cards.ts
@@ -309,9 +1541,11 @@ import { b, code, i, joinLines, km, progressBar, zl, zlSigned, SEPARATOR } from 
 import type {
   CourseOfferStats,
   DailySummary,
+  FinanceService,
   PeriodSummary,
   TargetProgress,
 } from '../services/finance.service.js';
+import type { VoiceExtractedData } from '../services/gemini.service.js';
 
 /**
  * Wszystkie karty renderuja HTML (3.3). Kazda wartosc pochodzaca od uzytkownika
@@ -599,8 +1833,47 @@ export function helpCard(): string {
     ` • ${code('/statystyki')} – statystyki ofert kursów.`,
     ` • ${code('/saldo')} – stan portfela Glovo (suma transakcji).`,
     '',
-    `🎙️ ${b('Głos:')} tankowanie, dystans, godziny, zarobki, napiwki.`,
+    `🎙️ ${b('Głos:')} tankowanie, dystans, godziny, zarobki, napiwki — także kasowanie wpisów.`,
+    `✍️ ${b('Tekst:')} to samo co głosem, ale bez kasowania. Np. ${code('dzisiaj zarobiłem 438.60')}.`,
     `📸 ${b('Zdjęcia:')} zrzuty Portfela, paragony paliwowe, oferty zleceń — rozpoznaję automatycznie.`,
+  ]);
+}
+
+/**
+ * Wynik zapisu notatki — glosowej albo tekstowej.
+ * Typ wyprowadzony z serwisu, zeby nie rozjechal sie po cichu przy zmianie
+ * `saveVoiceEvent()`.
+ */
+export type NoteSaveResult = Awaited<ReturnType<FinanceService['saveVoiceEvent']>>;
+
+/**
+ * Karta potwierdzenia zapisu z notatki. Naglowek jest parametrem, bo glos
+ * pokazuje transkrypcje, a tekst nie ma czego transkrybowac — reszta jest
+ * wspolna i nie ma powodu jej duplikowac (5).
+ */
+export function noteSavedCard(
+  headerLines: Array<string | false | null>,
+  extracted: VoiceExtractedData,
+  saved: NoteSaveResult
+): string {
+  return joinLines([
+    ...headerLines,
+    `📅 ${b('Data wpisu:')} ${code(saved.date)}`,
+    '',
+    saved.hasFuel && `⛽ ${b('Zapisano tankowanie:')}`,
+    saved.hasFuel && extracted.fuelTotalCost != null && ` • Koszt: ${b(zl(extracted.fuelTotalCost))}`,
+    saved.hasFuel && extracted.fuelLiters != null && ` • Ilość: ${b(`${extracted.fuelLiters} L`)}`,
+    saved.hasFuel &&
+      extracted.fuelPricePerLiter != null &&
+      ` • Cena: ${b(`${extracted.fuelPricePerLiter.toFixed(2)} zł/L`)}`,
+    extracted.distanceKm != null && `🚗 ${b('Dystans dnia:')} ${b(`${extracted.distanceKm} km`)}`,
+    extracted.grossEarnings != null && `💰 ${b('Zarobek brutto:')} ${b(zl(extracted.grossEarnings))}`,
+    extracted.workFrom &&
+      extracted.workTo &&
+      `⏱️ ${b('Godziny:')} ${code(`${extracted.workFrom} - ${extracted.workTo}`)}`,
+    extracted.cashTip != null && `💵 ${b('Napiwek gotówkowy:')} ${b(zlSigned(extracted.cashTip))}`,
+    saved.hoursError && `⚠️ ${i(saved.hoursError)}`,
+    !saved.hasDailyUpdate && !saved.hasTip && !saved.hasFuel && i('Nie rozpoznano żadnych danych do zapisania.'),
   ]);
 }
 ```
@@ -633,12 +1906,14 @@ import {
   dailyCard,
   endShiftCard,
   helpCard,
+  noteSavedCard,
   offerCard,
   offerStatsCard,
   periodCard,
   startShiftCard,
   targetCard,
 } from './cards.js';
+import { shouldParseAsNote } from './text-note.js';
 
 const HTML = { parse_mode: 'HTML' as const };
 
@@ -1532,6 +2807,74 @@ export function registerBotHandlers(bot: Telegraf): void {
     await ctx.reply(`💵 ${b('Dodano napiwek:')} ${b(zlSigned(amount))}\n📅 ${b('Data:')} ${code(date)}`, HTML);
   });
 
+  // === 9a. Wolny tekst -> Gemini ============================================
+
+  /**
+   * KOLEJNOSC REJESTRACJI JEST TU ISTOTNA (10a).
+   *
+   * Ten handler stoi PO `bot.hears` szybkich napiwkow, a nie zamiast `next()`
+   * w pierwszym handlerze tekstu. Gdyby stal wczesniej, przechwytywalby `n 5.5`
+   * i szybka sciezka napiwkow (8g) przestalaby dzialac — po cichu, bez bledu.
+   *
+   * Przeplyw: handler tekstu (stan oczekiwania, „tak”/„nie”) -> `next()`
+   * -> `bot.hears` napiwkow -> dopiero to, czego nikt nie zlapal, trafia tutaj.
+   *
+   * Tekst obsluguje WYLACZNIE zapis. Kasowanie zostaje przy glosie i komendach:
+   * prog przypadkowego wywolania jest przy pisaniu duzo nizszy niz przy nagraniu.
+   */
+  bot.on(message('text'), async (ctx) => {
+    const rawText = ctx.message.text.trim();
+
+    // Filtr przed modelem — patrz `text-note.ts`. Cisza jest tu poprawna:
+    // to nie jest wpis, tylko zwykla wiadomosc.
+    if (!shouldParseAsNote(rawText, CFG.TEXT_NOTE_MAX_CHARS)) return;
+
+    const processing = await ctx.reply('✍️ Analizuję wiadomość…');
+    const editProcessing = (text: string) =>
+      ctx.telegram.editMessageText(ctx.chat.id, processing.message_id, undefined, text, HTML);
+
+    try {
+      const extracted = await geminiService.parseTextNote(rawText);
+
+      // Twarde odsianie DELETE. Prompt tego zabrania, ale prompt to nie kontrakt —
+      // rzutowanie zaufania na model bylo by obietnica bez pokrycia.
+      if (extracted.action === 'DELETE') {
+        await editProcessing(
+          joinLines([
+            `🚫 ${b('Kasowanie danych nie działa z wiadomości tekstowej.')}`,
+            '',
+            i('Użyj notatki głosowej albo komendy — tekst służy wyłącznie do zapisu.'),
+          ])
+        );
+        return;
+      }
+
+      const saved = await financeService.saveVoiceEvent(ctx.from.id, extracted);
+
+      // Model juz kosztowal, wiec milczenie byloby gorsze niz komunikat (14).
+      if (!saved.hasDailyUpdate && !saved.hasTip && !saved.hasFuel && !saved.hoursError) {
+        await editProcessing(
+          joinLines([
+            `🤷 ${b('Nie wyciągnąłem z tej wiadomości żadnych danych.')}`,
+            '',
+            i('Napisz np. „dzisiaj zarobiłem 438.60”, „przejechałem 52 km”'),
+            i('albo „tankowanie 312.40 za 48 litrów”.'),
+            '',
+            `📋 Pełna lista komend: ${code('/pomoc')}`,
+          ])
+        );
+        return;
+      }
+
+      await editProcessing(noteSavedCard([`✍️ ${b('Zapisano z wiadomości:')}`], extracted, saved));
+    } catch (err) {
+      console.error('[TextNoteHandler]', err);
+      await editProcessing(
+        `❌ ${b('Błąd analizy wiadomości.')} ${h(err instanceof Error ? err.message : '')}`
+      ).catch(() => {});
+    }
+  });
+
   // === 10. Oferty kursow — decyzje ==========================================
 
   bot.action(/^offer:(accept|reject):(\d+)$/, async (ctx) => {
@@ -1660,25 +3003,7 @@ export function registerBotHandlers(bot: Telegraf): void {
       const saved = await financeService.saveVoiceEvent(ctx.from.id, extracted);
 
       await editProcessing(
-        joinLines([
-          `🗣️ ${b('Transkrypcja:')} ${i(`„${extracted.transcription}”`)}`,
-          `📅 ${b('Data wpisu:')} ${code(saved.date)}`,
-          '',
-          saved.hasFuel && `⛽ ${b('Zapisano tankowanie:')}`,
-          saved.hasFuel && extracted.fuelTotalCost != null && ` • Koszt: ${b(zl(extracted.fuelTotalCost))}`,
-          saved.hasFuel && extracted.fuelLiters != null && ` • Ilość: ${b(`${extracted.fuelLiters} L`)}`,
-          saved.hasFuel &&
-            extracted.fuelPricePerLiter != null &&
-            ` • Cena: ${b(`${extracted.fuelPricePerLiter.toFixed(2)} zł/L`)}`,
-          extracted.distanceKm != null && `🚗 ${b('Dystans dnia:')} ${b(`${extracted.distanceKm} km`)}`,
-          extracted.grossEarnings != null && `💰 ${b('Zarobek brutto:')} ${b(zl(extracted.grossEarnings))}`,
-          extracted.workFrom &&
-            extracted.workTo &&
-            `⏱️ ${b('Godziny:')} ${code(`${extracted.workFrom} - ${extracted.workTo}`)}`,
-          extracted.cashTip != null && `💵 ${b('Napiwek gotówkowy:')} ${b(zlSigned(extracted.cashTip))}`,
-          saved.hoursError && `⚠️ ${i(saved.hoursError)}`,
-          !saved.hasDailyUpdate && !saved.hasTip && !saved.hasFuel && i('Nie rozpoznano żadnych danych do zapisania.'),
-        ])
+        noteSavedCard([`🗣️ ${b('Transkrypcja:')} ${i(`„${extracted.transcription}”`)}`], extracted, saved)
       );
     } catch (err) {
       console.error('[VoiceHandler]', err);
@@ -1752,7 +3077,9 @@ export function registerBotHandlers(bot: Telegraf): void {
             `➕ ${b('Nowe:')} ${preview.newTransactions.length} szt.  |  ⏭ ${b('Duplikaty:')} ${preview.existingCount}`,
             `💵 ${b('Wpływ na saldo:')} ${b(zlSigned(preview.totalAmountDelta))}`,
           ]),
-          walletImportKeyboard()
+          // Spread, nie sama instancja: `Markup` to klasa bez sygnatury indeksu,
+          // wiec nie pasuje do `Record<string, unknown>`. Reszta pliku juz tak robi.
+          { ...walletImportKeyboard() }
         );
         return;
       }
@@ -1857,7 +3184,8 @@ export function registerBotHandlers(bot: Telegraf): void {
           netRatePerKm,
           status: 'PENDING',
         }),
-        offerDecisionKeyboard(offerId)
+        // Jak wyzej — `Markup` musi wejsc jako rozlozony obiekt.
+        { ...offerDecisionKeyboard(offerId) }
       );
     } catch (err) {
       console.error('[PhotoHandler]', err);
@@ -1956,6 +3284,89 @@ export const locationRequestKeyboard = () =>
 export const removeKeyboard = () => Markup.removeKeyboard();
 ```
 
+# Plik: src/bot/text-note.test.ts
+```typescript
+import { describe, expect, it } from 'vitest';
+import { shouldParseAsNote } from './text-note.js';
+
+const MAX = 200;
+
+describe('shouldParseAsNote', () => {
+  it('przepuszcza wiadomosci z liczba', () => {
+    expect(shouldParseAsNote('dzisiaj zarobiłem 500 zł', MAX)).toBe(true);
+    expect(shouldParseAsNote('przejechałem 52.3 km', MAX)).toBe(true);
+    expect(shouldParseAsNote('pracowałem od 11:30 do 21:15', MAX)).toBe(true);
+    expect(shouldParseAsNote('tankowanie 312,40 za 48 litrów', MAX)).toBe(true);
+  });
+
+  it('odrzuca gadanine bez liczb', () => {
+    expect(shouldParseAsNote('ok', MAX)).toBe(false);
+    expect(shouldParseAsNote('dzięki!', MAX)).toBe(false);
+    expect(shouldParseAsNote('hej, co słychać', MAX)).toBe(false);
+    expect(shouldParseAsNote('😀', MAX)).toBe(false);
+  });
+
+  it('odrzuca pusty tekst i same biale znaki', () => {
+    expect(shouldParseAsNote('', MAX)).toBe(false);
+    expect(shouldParseAsNote('   ', MAX)).toBe(false);
+    expect(shouldParseAsNote('\n\t 	', MAX)).toBe(false);
+  });
+
+  it('odrzuca tekst dluzszy niz limit', () => {
+    expect(shouldParseAsNote(`${'a'.repeat(MAX - 1)}5`, MAX)).toBe(true);
+    expect(shouldParseAsNote(`${'a'.repeat(MAX)}5`, MAX)).toBe(false);
+  });
+
+  it('liczy dlugosc PO przycieciu bialych znakow', () => {
+    expect(shouldParseAsNote(`   ${'a'.repeat(MAX - 1)}5   `, MAX)).toBe(true);
+  });
+
+  /** Zabezpieczenie na wypadek zmiany kolejnosci rejestracji handlerow (10a). */
+  it('nigdy nie oddaje komend do modelu', () => {
+    expect(shouldParseAsNote('/dzien 2026-08-16', MAX)).toBe(false);
+    expect(shouldParseAsNote('/cel 4500', MAX)).toBe(false);
+    expect(shouldParseAsNote('  /brutto 438.60', MAX)).toBe(false);
+  });
+
+  it('sama liczba wystarczy', () => {
+    expect(shouldParseAsNote('500', MAX)).toBe(true);
+  });
+});
+```
+
+# Plik: src/bot/text-note.ts
+```typescript
+/**
+ * Filtr decydujacy, czy wolny tekst warto oddac Gemini.
+ *
+ * Bez niego KAZDA nierozpoznana wiadomosc — „ok”, „dzięki”, przypadkowy
+ * klikniety emoji — bylaby wywolaniem modelu. Przy jednym uzytkowniku to
+ * jeszcze nie problem finansowy, ale zajmuje miejsce w kolejce i psuje
+ * czas odpowiedzi realnym wpisom.
+ *
+ * Kryterium: **kazdy sensowny wpis zawiera liczbe** — kwote, kilometry albo
+ * godzine. Tekst bez zadnej cyfry na pewno nie jest wpisem do zapisania.
+ *
+ * Czysta funkcja, bez odwolan do CFG — limit wchodzi parametrem, zeby dalo sie
+ * ja testowac bez ustawiania srodowiska.
+ */
+
+const HAS_DIGIT = /\d/;
+
+export function shouldParseAsNote(text: string, maxChars: number): boolean {
+  const trimmed = text.trim();
+
+  if (trimmed.length === 0) return false;
+  if (trimmed.length > maxChars) return false;
+
+  // Komendy obsluguje `bot.command`; tu trafic nie powinny, ale gdyby
+  // kiedys kolejnosc rejestracji sie zmienila (10a), niech nie ida do modelu.
+  if (trimmed.startsWith('/')) return false;
+
+  return HAS_DIGIT.test(trimmed);
+}
+```
+
 # Plik: src/config.ts
 ```typescript
 import 'dotenv/config';
@@ -2005,6 +3416,13 @@ export const CFG = {
   FALLBACK_HOURLY_RATE_NETTO: 35.0,
 
   /**
+   * Gorny limit dlugosci wiadomosci tekstowej oddawanej do Gemini.
+   * Dluzszy tekst na pewno nie jest wpisem o zarobku ani tankowaniu,
+   * a bylby najdrozszym wywolaniem modelu w calej aplikacji.
+   */
+  TEXT_NOTE_MAX_CHARS: 200,
+
+  /**
    * Domena webhooka (np. `bot.baranskiha.ovh`). Pusta = long polling.
    * Sam host, bez `https://` i bez sciezki.
    */
@@ -2041,11 +3459,39 @@ export const CFG = {
    * Pusta = bot otwarty dla wszystkich, ostrzezenie przy starcie.
    */
   ALLOWED_TELEGRAM_IDS: parseIdList(process.env.ALLOWED_TELEGRAM_IDS),
+
+  /**
+   * Token dostepu do REST API dla aplikacji mobilnej.
+   * PUSTY = API wylaczone, kazde zadanie spod /api/ dostaje 503.
+   * Generowanie: `openssl rand -base64 32`.
+   */
+  API_TOKEN: (process.env.API_TOKEN || '').trim(),
+
+  /**
+   * telegram_id wlasciciela danych, do ktorego odnosi sie API_TOKEN.
+   *
+   * Tozsamosc wynika z MAPOWANIA TOKENA, nie z wartosci zaszytej w kodzie —
+   * dzieki temu dolozenie drugiego uzytkownika zmienia to mapowanie,
+   * a nie kazdy endpoint z osobna.
+   *
+   * Puste = jedyny wpis z ALLOWED_TELEGRAM_IDS (patrz `apiUserId`).
+   */
+  API_TELEGRAM_ID: (process.env.API_TELEGRAM_ID || '').trim(),
 } as const;
 
 export function isAllowedUser(telegramId: string | number): boolean {
   if (CFG.ALLOWED_TELEGRAM_IDS.size === 0) return true;
   return CFG.ALLOWED_TELEGRAM_IDS.has(String(telegramId));
+}
+
+/**
+ * Wlasciciel danych widocznych przez API.
+ * `null` = konfiguracja niejednoznaczna; API ma wtedy nie odpowiadac danymi.
+ */
+export function apiUserId(): string | null {
+  if (CFG.API_TELEGRAM_ID) return CFG.API_TELEGRAM_ID;
+  if (CFG.ALLOWED_TELEGRAM_IDS.size === 1) return [...CFG.ALLOWED_TELEGRAM_IDS][0] ?? null;
+  return null;
 }
 ```
 
@@ -2316,6 +3762,44 @@ export const earningTargets = pgTable(
  * Reczna korekta salda zapisuje sie jako transakcja typu 'korekta',
  * dzieki czemu historia pozostaje audytowalna.
  */
+
+/**
+ * Pamiec idempotencji dla `POST /api/v1/*` (krok 5 planu aplikacji).
+ *
+ * Powod: `saveCashTip` i `saveFuelReceipt` to czyste `INSERT` — celowo, bo
+ * drugie tankowanie tego samego dnia ma sie dodawac (FIX 2.8). Kolejka offline
+ * ponawia zadania, wiec bez tej tabeli kazde ponowienie tworzyloby DRUGI wpis.
+ *
+ * Klient generuje `Idempotency-Key` (UUID) i wysyla go w naglowku. Ten sam
+ * klucz drugi raz nie wykonuje operacji, tylko odsyla zapamietana odpowiedz.
+ *
+ * `key` jest KLUCZEM GLOWNYM, nie unikalnym indeksem na kolumnie nullowalnej.
+ * W Postgresie `NULL != NULL`, wiec taki indeks nie blokowalby duplikatow (9a).
+ *
+ * `status_code = 0` oznacza wiersz ZAJETY, ale jeszcze nierozstrzygniety —
+ * pierwsze zadanie trwa. To jest mechanizm blokady, nie stan koncowy.
+ *
+ * `response_json` to `text`, nie `jsonb`: odpowiedz jest odsylana doslownie
+ * i nigdy po niej nie szukamy.
+ */
+export const apiIdempotency = pgTable(
+  'api_idempotency',
+  {
+    key: text('key').primaryKey(),
+    telegramId: text('telegram_id')
+      .notNull()
+      .references(() => users.telegramId, { onDelete: 'cascade' }),
+    endpoint: text('endpoint').notNull(),
+    /** 0 = zadanie w toku. >0 = zapamietany kod odpowiedzi. */
+    statusCode: integer('status_code').notNull(),
+    responseJson: text('response_json').notNull(),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => ({
+    // Wylacznie pod sprzatanie starych wierszy.
+    apiIdempotencyCreatedAtIdx: index('api_idempotency_created_at_idx').on(table.createdAt),
+  })
+);
 ```
 
 # Plik: src/index.ts
@@ -2328,10 +3812,21 @@ import { registerBotHandlers } from './bot/index.js';
 import { startWebhookServer, stopWebhookServer } from './server.js';
 import type { Server } from 'node:http';
 
-const botToken = process.env.BOT_TOKEN;
-if (!botToken) {
-  throw new Error('Brak zmiennej BOT_TOKEN w pliku .env!');
+/**
+ * Zawezenie typu zrobione na poziomie modulu (`if (!x) throw`) NIE przenosi sie
+ * do wnetrza `main()` — w srodku `botToken` mial dalej typ `string | undefined`
+ * i `startWebhookServer` zglaszal TS2345.
+ *
+ * Funkcja zwracajaca `string` rozwiazuje to bez rzutowania `as` i bez `!`,
+ * a przy okazji nadaje sie do kazdej innej wymaganej zmiennej srodowiskowej.
+ */
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Brak zmiennej ${name} w pliku .env!`);
+  return value;
 }
+
+const botToken = requireEnv('BOT_TOKEN');
 
 const bot = new Telegraf(botToken);
 
@@ -2719,6 +4214,7 @@ import { createServer, type RequestListener, type Server } from 'node:http';
 import type { Telegraf } from 'telegraf';
 import { CFG } from './config.js';
 import { geminiQueue } from './services/gemini.service.js';
+import { API_PREFIX, createApiSetup } from './api/router.js';
 
 /**
  * Tryb webhook.
@@ -2796,6 +4292,9 @@ export async function startWebhookServer(bot: Telegraf, botToken: string): Promi
     max_connections: CFG.WEBHOOK_MAX_CONNECTIONS,
   });
 
+  // REST API dla aplikacji mobilnej. Budowane raz, przy starcie.
+  const api = createApiSetup();
+
   const handler: RequestListener = (req, res) => {
     if (req.method === 'GET' && (req.url === '/healthz' || req.url === '/health')) {
       const body = JSON.stringify(healthPayload());
@@ -2806,6 +4305,20 @@ export async function startWebhookServer(bot: Telegraf, botToken: string): Promi
 
     if (req.url === path) {
       telegrafHandler(req, res);
+      return;
+    }
+
+    /**
+     * Cala reszta ruchu spod /api/ idzie do Hono.
+     *
+     * `startsWith` zamiast `===`, bo `req.url` zawiera query string —
+     * `/api/v1/okres?od=…` nigdy nie zrownalo by sie ze stala sciezka.
+     *
+     * Gdyby API mialo kiedykolwiek zaszkodzic botowi, usuniecie tego
+     * jednego `if` przywraca zachowanie sprzed zmiany.
+     */
+    if (req.url?.startsWith(API_PREFIX)) {
+      api.listener(req, res);
       return;
     }
 
@@ -2826,6 +4339,11 @@ export async function startWebhookServer(bot: Telegraf, botToken: string): Promi
 
   console.log(`🌐 Webhook: https://${domain}${path}`);
   console.log(`🩺 Health:  http://0.0.0.0:${CFG.WEBHOOK_PORT}/healthz`);
+  console.log(
+    api.enabled
+      ? `📱 API:     https://${domain}${API_PREFIX}v1/  (Bearer API_TOKEN)`
+      : `📱 API:     WYŁĄCZONE — ${api.disabledReason ?? 'nieznany powód'}`
+  );
 
   return server;
 }
@@ -3249,6 +4767,48 @@ export interface CourseOfferStats {
   worstNetRate: number | null;
   totalGross: number;
   totalDistanceKm: number;
+}
+
+/**
+ * Pojedyncza oferta w postaci gotowej do wyslania na zewnatrz (REST API).
+ * Wszystkie `numeric` sa juz przepuszczone przez `parseFloat` — patrz 9b.
+ */
+export interface CourseOfferItem {
+  id: number;
+  date: string;
+  time: string;
+  grossAmount: number;
+  netAmount: number;
+  appTotalKm: number | null;
+  mapsTotalKm: number | null;
+  distanceTotalKm: number;
+  /** Skad wziety dystans do stawki: 'APP' | 'MAPS' | 'NONE'. */
+  rateBasis: string;
+  netRatePerKm: number;
+  isProfitable: boolean;
+  /** 'PENDING' | 'ACCEPTED' | 'REJECTED' */
+  status: string;
+  pickupAddress: string | null;
+  deliveryAddress: string | null;
+}
+
+/**
+ * Lekki wiersz dzienny pod wykresy i kalendarz.
+ *
+ * NIE zawiera `doPrzelewu` — ta wartosc wymaga sumy wyplat z portfela, czyli
+ * czwartego zapytania na kazdy dzien. Do slupkow i heatmapy nie jest potrzebna,
+ * a podanie jej wyliczonej z zerowych wyplat byloby po prostu nieprawda.
+ */
+export interface DailyTotals {
+  date: string;
+  grossEarnings: number;
+  netEarnings: number;
+  cashTipsTotal: number;
+  totalNetto: number;
+  workHours: number;
+  hourlyRateNetto: number;
+  distanceKm: number;
+  fuelCost: number;
 }
 
 export interface WalletImportPreview {
@@ -4032,6 +5592,146 @@ export class FinanceService {
     };
   }
 
+  /**
+   * Lista ofert do wyswietlenia i do wykresow w aplikacji mobilnej.
+   *
+   * Celowo `null` zamiast pol opcjonalnych: przy `exactOptionalPropertyTypes`
+   * przekazanie `{ startDate: undefined }` jest bledem typu, a jawne `null`
+   * nie zostawia watpliwosci, co znaczy brak filtra.
+   *
+   * `limit` jest przycinany takze tutaj — warstwa HTTP nie moze byc jedynym
+   * miejscem, ktore pilnuje rozmiaru zapytania do bazy.
+   */
+  async listCourseOffers(
+    telegramId: string | number,
+    startDate: string | null,
+    endDate: string | null,
+    limit: number
+  ): Promise<CourseOfferItem[]> {
+    const tId = String(telegramId);
+
+    const conditions = [eq(courseOffers.telegramId, tId)];
+    if (startDate) conditions.push(gte(courseOffers.date, startDate));
+    if (endDate) conditions.push(lte(courseOffers.date, endDate));
+
+    const rows = await db
+      .select()
+      .from(courseOffers)
+      .where(and(...conditions))
+      .orderBy(desc(courseOffers.date), desc(courseOffers.time))
+      .limit(Math.min(Math.max(Math.trunc(limit), 1), 500));
+
+    return rows.map((o) => ({
+      id: o.id,
+      date: o.date,
+      time: o.time,
+      grossAmount: parseFloat(o.grossAmount),
+      netAmount: parseFloat(o.netAmount),
+      appTotalKm: numOrNull(o.appTotalKm),
+      mapsTotalKm: numOrNull(o.mapsTotalKm),
+      distanceTotalKm: parseFloat(o.distanceTotalKm),
+      rateBasis: o.rateBasis,
+      netRatePerKm: parseFloat(o.netRatePerKm),
+      isProfitable: o.isProfitable,
+      status: o.status,
+      pickupAddress: o.pickupAddress,
+      deliveryAddress: o.deliveryAddress,
+    }));
+  }
+
+  /**
+   * Dzienne sumy dla zakresu — jedno wywolanie zamiast N zapytan o `/dzien`.
+   *
+   * Trzy zapytania zgrupowane po dacie, scalone w pamieci. Miesiac heatmapy to
+   * 3 zapytania zamiast 31 × 4 = 124, ktore wyszlyby z petli po `getDailySummary`.
+   *
+   * Zwraca WYLACZNIE dni, ktore maja jakiekolwiek dane. Luki uzupelnia klient —
+   * inaczej trzeba by tu generowac kalendarz, a to nie jest rola serwisu.
+   */
+  async listDailyTotals(
+    telegramId: string | number,
+    startDate: string,
+    endDate: string
+  ): Promise<DailyTotals[]> {
+    const tId = String(telegramId);
+
+    const [rekordy, napiwki, paliwa] = await Promise.all([
+      db
+        .select({
+          date: dailyRecords.date,
+          gross: dailyRecords.grossEarnings,
+          hours: dailyRecords.workHours,
+          dist: dailyRecords.distanceKm,
+        })
+        .from(dailyRecords)
+        .where(
+          and(
+            eq(dailyRecords.telegramId, tId),
+            gte(dailyRecords.date, startDate),
+            lte(dailyRecords.date, endDate)
+          )
+        ),
+      db
+        .select({ date: cashTips.date, suma: sql<string>`sum(${cashTips.amount})` })
+        .from(cashTips)
+        .where(
+          and(eq(cashTips.telegramId, tId), gte(cashTips.date, startDate), lte(cashTips.date, endDate))
+        )
+        .groupBy(cashTips.date),
+      db
+        .select({ date: fuelReceipts.date, suma: sql<string>`sum(${fuelReceipts.totalCost})` })
+        .from(fuelReceipts)
+        .where(
+          and(
+            eq(fuelReceipts.telegramId, tId),
+            gte(fuelReceipts.date, startDate),
+            lte(fuelReceipts.date, endDate)
+          )
+        )
+        .groupBy(fuelReceipts.date),
+    ]);
+
+    const mapa = new Map<string, { gross: number; hours: number; dist: number; tips: number; fuel: number }>();
+    const wpis = (date: string) => {
+      const istniejacy = mapa.get(date);
+      if (istniejacy) return istniejacy;
+      const nowy = { gross: 0, hours: 0, dist: 0, tips: 0, fuel: 0 };
+      mapa.set(date, nowy);
+      return nowy;
+    };
+
+    for (const r of rekordy) {
+      const w = wpis(r.date);
+      w.gross = num(r.gross);
+      w.hours = num(r.hours);
+      w.dist = num(r.dist);
+    }
+    for (const r of napiwki) wpis(r.date).tips = num(r.suma);
+    for (const r of paliwa) wpis(r.date).fuel = num(r.suma);
+
+    return [...mapa.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, w]) => {
+        const { netEarnings, totalNetto, hourlyRateNetto } = computeDailyTotals({
+          grossEarnings: w.gross,
+          cashTipsTotal: round2(w.tips),
+          walletPayouts: 0,
+          workHours: w.hours,
+        });
+        return {
+          date,
+          grossEarnings: round2(w.gross),
+          netEarnings,
+          cashTipsTotal: round2(w.tips),
+          totalNetto,
+          workHours: round2(w.hours),
+          hourlyRateNetto,
+          distanceKm: round2(w.dist),
+          fuelCost: round2(w.fuel),
+        };
+      });
+  }
+
   // --- Cele -----------------------------------------------------------------
 
   /**
@@ -4389,6 +6089,36 @@ Ignoruj szum wiatru i wydechu motocykla.
       0.1,
       'voice'
     );
+  }
+
+  /**
+   * Ten sam schemat i ta sama sciezka zapisu co notatka glosowa — rozni sie
+   * wylacznie zrodlem. `VoiceExtractedSchema`, `saveVoiceEvent()` i cala reszta
+   * sa obojetne na to, czy dane przyszly z mikrofonu, czy z klawiatury.
+   *
+   * DELETE jest tu zabronione promptem, ale to NIE jest zabezpieczenie —
+   * model moze zwrocic cokolwiek. Twarde odsianie robi handler w `bot/index.ts`.
+   */
+  async parseTextNote(text: string): Promise<VoiceExtractedData> {
+    const prompt = `
+Jesteś asystentem kuriera. Przeanalizuj wiadomość tekstową i zwróć dane w JSON.
+Rozpoznajesz WYŁĄCZNIE zapis danych — pole "action" ma zawsze wartość "UPSERT".
+Nigdy nie zwracaj "DELETE": kasowanie danych nie jest dostępne z wiadomości tekstowej.
+
+Wyciągnij, jeśli występują: tankowanie (łączna kwota, litry, cena za litr),
+przejechany dystans, godziny od-do, zarobki brutto, napiwek gotówkowy.
+
+Uwaga: "distanceKm" to dystans PRZEJECHANY danego dnia, nie stan licznika pojazdu.
+Jeśli kurier poda stan licznika, zostaw distanceKm puste.
+Jeśli wiadomość nie zawiera żadnych danych do zapisania, zostaw wszystkie pola puste.
+W polu "transcription" przepisz wiadomość bez zmian.
+
+Wiadomość kuriera:
+"""
+${text}
+"""
+`;
+    return this.generate(VoiceExtractedSchema, voiceResponseSchema, [{ text: prompt }], 0.1, 'text');
   }
 
   async extractFuelReceipt(imageBuffer: Buffer, mimeType = 'image/jpeg'): Promise<FuelReceiptExtractedData> {
@@ -6068,6 +7798,35 @@ COMMIT;
 -- =============================================================================
 ```
 
+# Plik: drizzle/0002_api_idempotency.sql
+```sql
+-- Krok 5: pamiec idempotencji dla POST /api/v1/*
+--
+-- Migracja BEZPIECZNA: tworzy nowa tabele, nie dotyka zadnej istniejacej,
+-- nie przenosi ani nie kasuje danych. `drizzle-kit push` tez by sobie
+-- poradzil i NIE zapyta „created or renamed?" (9c), bo nic nie znika.
+-- Ten plik jest tu po to, zeby dalo sie ja wykonac wprost, bez trybu
+-- interaktywnego — na serwerze z prawdziwymi danymi to bezpieczniejsza droga.
+--
+-- Uruchomienie na serwerze:
+--   docker compose exec -T postgres psql -U postgres -d courierdb < drizzle/0002_api_idempotency.sql
+
+CREATE TABLE IF NOT EXISTS api_idempotency (
+  key           text PRIMARY KEY,
+  telegram_id   text NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+  endpoint      text NOT NULL,
+  -- 0 = zadanie w toku (wiersz zajety, jeszcze nierozstrzygniety).
+  -- >0 = zapamietany kod odpowiedzi.
+  status_code   integer NOT NULL,
+  response_json text NOT NULL,
+  created_at    timestamp NOT NULL DEFAULT now()
+);
+
+-- Wylacznie pod sprzatanie wierszy starszych niz 48 h.
+CREATE INDEX IF NOT EXISTS api_idempotency_created_at_idx
+  ON api_idempotency (created_at);
+```
+
 # Plik: .dockerignore
 ```gitignore
 # Bez tego `COPY . .` wciaga node_modules i .git do obrazu:
@@ -6121,6 +7880,168 @@ export default defineConfig({
 });
 ```
 
+# Plik: scripts/wdroz-serwer.sh
+```bash
+#!/bin/sh
+# Uruchamiany NA SERWERZE (Home Assistant OS), w /share/courier-bot.
+# Zwykle wywoływany zdalnie przez scripts/wdroz.sh — ręcznie nie musisz go pamiętać.
+#
+# Świadomie /bin/sh, nie bash: dodatek SSH w HA to Alpine.
+set -eu
+
+cd "$(dirname "$0")/.."
+echo "📂 $(pwd)"
+
+# `docker-compose` bywa ulotny po restarcie dodatku (§3a) — dokładamy, gdy zniknął.
+if ! docker compose version >/dev/null 2>&1; then
+  echo "📦 Brak docker compose — instaluję…"
+  apk add --no-cache docker-cli-compose
+fi
+
+echo "⬇️  Pobieram zmiany…"
+git pull --ff-only
+
+echo "🔨 Przebudowuję kontener bota…"
+docker compose --profile webhook up -d --build bot
+
+echo "⏳ Czekam na start…"
+sleep 6
+
+echo
+echo "📜 Log startowy:"
+docker compose --profile webhook logs --tail=20 bot
+
+# --- Smoke test API ---------------------------------------------------------
+# Wartości bierzemy z .env, bo ten plik nie jest w gicie i tylko on je zna.
+TOKEN="$(grep '^API_TOKEN=' .env | cut -d= -f2- || true)"
+DOMENA="$(grep '^WEBHOOK_DOMAIN=' .env | cut -d= -f2- | sed 's#^https\?://##; s#/*$##' || true)"
+
+echo
+if [ -z "$TOKEN" ] || [ -z "$DOMENA" ]; then
+  echo "⚠️  Pomijam smoke test — brak API_TOKEN albo WEBHOOK_DOMAIN w .env"
+  exit 0
+fi
+
+echo "🩺 Smoke test https://$DOMENA/api/v1/"
+
+Z_TOKENEM="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "https://$DOMENA/api/v1/info")"
+BEZ_TOKENA="$(curl -s -o /dev/null -w '%{http_code}' "https://$DOMENA/api/v1/saldo")"
+
+echo "   z tokenem  → $Z_TOKENEM   (oczekiwane 200)"
+echo "   bez tokena → $BEZ_TOKENA   (oczekiwane 401)"
+
+if [ "$Z_TOKENEM" = "200" ] && [ "$BEZ_TOKENA" = "401" ]; then
+  echo "✅ API odpowiada poprawnie."
+else
+  echo "❌ API zachowuje się inaczej niż powinno — sprawdź log wyżej."
+  exit 1
+fi
+```
+
+# Plik: scripts/wdroz.sh
+```bash
+#!/usr/bin/env bash
+# Pełne wdrożenie z WSL na serwer, jednym poleceniem: npm run wdroz
+#
+# Kolejność jest celowa: nic nie leci na serwer, dopóki typy i testy nie są zielone.
+set -euo pipefail
+
+SERWER="${SERWER:-root@192.168.1.50}"
+KATALOG_SERWERA="${KATALOG_SERWERA:-/share/courier-bot}"
+OPIS="${1:-wdrozenie $(date +%F' '%H:%M)}"
+
+echo "🔍 1/5  Sprawdzam typy…"
+npm run typecheck
+
+echo
+echo "🧪 2/5  Uruchamiam testy…"
+npm test
+
+echo
+if [ -z "$(git status --porcelain)" ]; then
+  echo "📦 3/5  Brak zmian do zacommitowania — pomijam."
+else
+  echo "📦 3/5  Commituję:"
+  git status --short
+  git add -A
+  git commit -m "$OPIS"
+fi
+
+echo
+echo "⬆️  4/5  Wypycham na GitHuba…"
+git push
+
+echo
+echo "🚀 5/5  Wdrażam na serwerze ($SERWER)…"
+echo "     (za chwilę zapyta o hasło — POCZEKAJ na pytanie, nie wpisuj nic wcześniej)"
+echo
+# `git pull` MUSI być tutaj, a nie tylko w skrypcie serwerowym.
+#
+# Jajko i kura: `wdroz-serwer.sh` trafia na serwer dopiero przez `git pull`,
+# więc dopóki tego pulla nie zrobimy stąd, nie ma czego uruchomić i wychodzi
+# `sh: can't open 'scripts/wdroz-serwer.sh'`.
+#
+# Ten sam `git pull` jest jeszcze raz w środku skryptu — celowo. Dzięki temu
+# działa też uruchomiony ręcznie na serwerze, a drugie wywołanie to no-op.
+ssh -t "$SERWER" "cd '$KATALOG_SERWERA' && git pull --ff-only && sh scripts/wdroz-serwer.sh"
+
+echo
+echo "🎉 Gotowe. Sprawdź jeszcze bota w Telegramie."
+```
+
+# Plik: scripts/zastosuj-patch.sh
+```bash
+#!/usr/bin/env bash
+# Nakłada patch przysłany w czacie. Uruchamiaj przez: npm run patch -- <plik>
+set -euo pipefail
+
+PATCH="${1:-}"
+
+if [ -z "$PATCH" ]; then
+  echo "Użycie: npm run patch -- /mnt/c/Users/micha/Downloads/nazwa.patch"
+  exit 1
+fi
+
+if [ ! -f "$PATCH" ]; then
+  echo "❌ Nie ma takiego pliku: $PATCH"
+  echo "   Sprawdź: ls /mnt/c/Users/*/Downloads/*.patch"
+  exit 1
+fi
+
+# Plik przeszedł przez Windowsa, więc mógł dostać końce linii CRLF.
+# Pracujemy na kopii, żeby nie ruszać oryginału w Pobranych.
+ROBOCZY="$(mktemp)"
+trap 'rm -f "$ROBOCZY"' EXIT
+sed 's/\r$//' "$PATCH" > "$ROBOCZY"
+
+echo "🔎 Sprawdzam, czy patch wejdzie…"
+
+if git apply --check "$ROBOCZY" 2>/dev/null; then
+  git apply "$ROBOCZY"
+  echo "✅ Nałożony."
+  git status --short
+  echo
+  echo "Następny krok:  npm run sprawdz"
+  exit 0
+fi
+
+# Najczęstszy przypadek: patch już jest nałożony (np. uruchomiony drugi raz).
+if git apply --reverse --check "$ROBOCZY" 2>/dev/null; then
+  echo "ℹ️  Ten patch JEST JUŻ nałożony — nie ma nic do zrobienia."
+  git status --short
+  exit 0
+fi
+
+echo "❌ Patch nie pasuje do obecnego stanu repozytorium."
+echo
+echo "Najczęstsze przyczyny:"
+echo "  • masz niezacommitowane zmiany  → git stash"
+echo "  • stoisz na innym commicie      → git log --oneline -3"
+echo
+echo "Pokaż mi wynik 'git log --oneline -3' i zrobię patch na Twój commit."
+exit 1
+```
+
 # Plik: vitest.config.ts
 ```typescript
 import { defineConfig } from 'vitest/config';
@@ -6132,6 +8053,100 @@ export default defineConfig({
   },
 });
 ```
+
+# Plik: WDRAZANIE.md
+````markdown
+# Wdrażanie — ściąga
+
+Trzy polecenia. Wszystkie uruchamiasz **w WSL**, w `~/projekty/telegram-bot`.
+
+```bash
+cd ~/projekty/telegram-bot
+```
+
+---
+
+## 1. Nałóż patch przysłany w czacie
+
+```bash
+npm run patch -- /mnt/c/Users/micha/Downloads/nazwa-pliku.patch
+```
+
+Skrypt sam naprawia końce linii z Windowsa i sam rozpoznaje, że patch jest **już nałożony** (wtedy tylko o tym mówi, zamiast sypać błędami).
+
+Nie pamiętasz nazwy pliku:
+
+```bash
+ls /mnt/c/Users/*/Downloads/*.patch
+```
+
+---
+
+## 2. Sprawdź, czy nic się nie zepsuło
+
+```bash
+npm run sprawdz
+```
+
+To `typecheck` i testy razem. **Musi być zielone**, zanim cokolwiek pójdzie dalej.
+
+---
+
+## 3. Wdróż
+
+```bash
+npm run wdroz
+```
+
+Robi po kolei: typecheck → testy → commit → push → SSH na serwer → `git pull` → przebudowa kontenera → log startowy → smoke test API.
+
+Zatrzyma się na pierwszym błędzie, więc **na serwer nie trafi kod, który nie przeszedł testów**.
+
+Własny opis commita:
+
+```bash
+npm run wdroz "obsluga tekstu"
+```
+
+### Zapyta o hasło do SSH
+
+Poczekaj na pytanie i dopiero wtedy pisz. Wklejenie czegokolwiek wcześniej kończy się tym, że tekst zostaje zjedzony jako odpowiedź na pytanie (§12f) — to najczęstsza wpadka w tym projekcie.
+
+Żeby przestało pytać, raz wgraj klucz:
+
+```bash
+ssh-copy-id root@192.168.1.50
+```
+
+Klucze na serwerze siedzą w `~/.ssh`, które prowadzi do trwałego `/data`, więc przeżyją restart dodatku.
+
+---
+
+## Coś poszło nie tak
+
+| objaw | co zrobić |
+|---|---|
+| `patch does not apply` | `git log --oneline -3` i wyślij mi wynik |
+| `already applied` | nic, patch jest na miejscu |
+| typecheck na czerwono | **nie wdrażaj**, wyślij mi treść błędu |
+| `no configuration file provided` | jesteś w złym katalogu — `cd /share/courier-bot` |
+| `📱 API: WYŁĄCZONE` w logu | brak `API_TOKEN` w `.env` **na serwerze** (ten plik nie jest w gicie) |
+| bot milczy po wdrożeniu | `docker compose --profile webhook logs --tail=40 bot` |
+
+---
+
+## Cofnięcie ostatniego wdrożenia
+
+Na serwerze:
+
+```bash
+cd /share/courier-bot
+git reset --hard HEAD~1
+docker compose --profile webhook up -d --build bot
+```
+
+Webhooka to nie kasuje, więc wiadomości z czasu przestoju nie giną — Telegram trzyma je do 24 h.
+````
 
 # Plik: ZMIANY.md
 ````markdown

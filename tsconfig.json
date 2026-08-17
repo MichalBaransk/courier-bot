@@ -34,6 +34,6 @@
     "skipLibCheck": true,
     "esModuleInterop": true
   },
-  "include": ["src/**/*", "scripts/make-codebase.mjs"],
+  "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]
 }
