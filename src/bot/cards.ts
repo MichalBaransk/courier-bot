@@ -107,9 +107,31 @@ export function targetCard(progress: TargetProgress): string {
     `📊 ${b('Wymagane tempo:')}`,
     ` • Dziennie: ${b(`${progress.dailyRequiredNetto.toFixed(2)} zł netto / dzień`)}`,
     ` • Czas pracy: ${b(`~${progress.estimatedHoursRemaining.toFixed(1)} h`)} (${progress.hoursPerDayRequired.toFixed(1)} h / dzień)`,
-    progress.usedFallbackRate &&
-      i(`Prognoza godzin liczona stawką zastępczą ${CFG.FALLBACK_HOURLY_RATE_NETTO.toFixed(2)} zł/h — brak własnej historii.`),
+    rateNote(progress),
   ]);
+}
+
+/**
+ * Skąd wzięła się stawka użyta do prognozy godzin.
+ *
+ * Przy `PERIOD` nie piszemy nic — to stan normalny i linijka byłaby szumem.
+ * Pozostałe dwa stany trzeba nazwać, bo prognoza opiera się wtedy na czymś
+ * innym, niż użytkownik zakłada, patrząc na kartę tygodnia.
+ */
+function rateNote(progress: TargetProgress): string | false {
+  if (progress.rateSource === 'ROLLING_30D') {
+    return i(
+      `Prognoza godzin liczona stawką ${progress.avgHourlyRate.toFixed(2)} zł/h ` +
+        `— średnią z ostatnich 30 dni, bo w tym okresie nie ma jeszcze godzin.`
+    );
+  }
+  if (progress.rateSource === 'FALLBACK') {
+    return i(
+      `Prognoza godzin liczona stawką zastępczą ${CFG.FALLBACK_HOURLY_RATE_NETTO.toFixed(2)} zł/h ` +
+        `— brak własnej historii z ostatnich 30 dni.`
+    );
+  }
+  return false;
 }
 
 export function startShiftCard(summary: DailySummary, balance: number, currentTime: string): string {
@@ -165,6 +187,13 @@ export function offerStatsCard(stats: CourseOfferStats): string {
     `📈 ${b('Średnia z ofert:')} ${rate(stats.avgNetRatePerKm)} ${i('— jakie oferty przychodzą')}`,
     `⚖️ ${b('Średnia ważona:')} ${rate(stats.weightedNetRatePerKm)} ${i('— ile realnie wychodzi na km')}`,
     `🥇 ${b('Najlepsza:')} ${rate(stats.bestNetRate)}  |  🥉 ${b('Najgorsza:')} ${rate(stats.worstNetRate)}`,
+    // Bez tej linijki różnica „sprawdzonych 7, a średnia z 5" jest niewidoczna
+    // i wygląda jak błąd liczenia.
+    stats.ratedOffers < stats.totalOffers &&
+      i(
+        `Stawki liczone z ${stats.ratedOffers} z ${stats.totalOffers} ofert — ` +
+          `reszta nie miała dystansu (brak adresu klienta na ekranie oferty).`
+      ),
     '',
     `🛣️ ${b('Łączny dystans ofert:')} ${b(km(stats.totalDistanceKm))}`,
     `💰 ${b('Suma stawek brutto:')} ${b(zl(stats.totalGross))}`,

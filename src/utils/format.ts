@@ -40,8 +40,20 @@ export function joinLines(lines: Array<string | false | null | undefined>): stri
   return compact(lines).join('\n');
 }
 
+/**
+ * Pasek postepu.
+ *
+ * `NaN` i nieskonczonosc traktujemy jak zero. Bez tego `Math.round(NaN)` daje
+ * `NaN`, `Math.max`/`Math.min` przepuszczaja go dalej, a `'█'.repeat(NaN)`
+ * zwraca pusty lancuch — cala karta celu pokazywala wtedy samo `[]` zamiast
+ * paska, bez zadnego bledu w logach.
+ *
+ * To nie jest przypadek teoretyczny: `progressPercent` liczy sie jako
+ * `currentNetto / targetAmount`, a cel 0 zl daje `0/0`, czyli `NaN`.
+ */
 export function progressBar(percent: number, totalBlocks = 10): string {
-  const filled = Math.min(totalBlocks, Math.max(0, Math.round((percent / 100) * totalBlocks)));
+  const safePercent = Number.isFinite(percent) ? percent : 0;
+  const filled = Math.min(totalBlocks, Math.max(0, Math.round((safePercent / 100) * totalBlocks)));
   return `[${'█'.repeat(filled)}${'░'.repeat(totalBlocks - filled)}]`;
 }
 

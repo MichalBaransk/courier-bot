@@ -149,3 +149,102 @@ export function computeOfferRate(input: OfferRateInput): OfferRate {
     isProfitable: input.totalKm > 0 && netRatePerKm >= CFG.MIN_STAWKA_NETTO_KM,
   };
 }
+
+export interface OfferStatsInput {
+  isProfitable: boolean;
+  status: string;
+  netRatePerKm: number;
+  grossAmount: number;
+  netAmount: number;
+  distanceTotalKm: number;
+}
+
+export interface OfferStats {
+  totalOffers: number;
+  profitable: number;
+  unprofitable: number;
+  accepted: number;
+  rejected: number;
+  pending: number;
+  /** Ile ofert weszlo do sredniej i do skrajnych wartosci. */
+  ratedOffers: number;
+  avgNetRatePerKm: number | null;
+  weightedNetRatePerKm: number | null;
+  bestNetRate: number | null;
+  worstNetRate: number | null;
+  totalGross: number;
+  totalNet: number;
+  totalDistanceKm: number;
+}
+
+/**
+ * Statystyki ofert z jednego dnia.
+ *
+ * OFERTY BEZ DYSTANSU SA POMIJANE w sredniej i w skrajnych wartosciach.
+ *
+ * Powod jest ten sam co w 8f: gdy ekran oferty nie pokazuje adresu klienta,
+ * `isSpecificAddress()` slusznie odmawia geokodowania, `rateBasis` konczy jako
+ * `'NONE'`, a `netRatePerKm` wynosi 0 — nie dlatego, ze kurs byl darmowy, tylko
+ * dlatego, ze nie ma z czego liczyc. Wliczenie takiego zera ustawialo
+ * "najgorsza stawke" na 0,00 zl/km i cicho zanizalo srednia.
+ *
+ * Do LICZNIKOW i do SUM te oferty nadal wchodza — zostaly sprawdzone, a ich
+ * kwota brutto jest prawdziwa. `ratedOffers` mowi, ile z nich mialo dystans,
+ * zeby roznica miedzy "sprawdzonych 7" a "srednia z 5" nie byla niewidoczna.
+ *
+ * Ta funkcja jest odpowiednikiem `policzOferty` z aplikacji mobilnej
+ * (`src/statystykiOfert.ts`). Obie musza dawac te same liczby — wczesniej
+ * dawaly rozne i to byl blad serwera, nie aplikacji.
+ */
+export function computeOfferStats(offers: readonly OfferStatsInput[]): OfferStats {
+  let profitable = 0;
+  let accepted = 0;
+  let rejected = 0;
+  let pending = 0;
+  let sumRates = 0;
+  let ratedOffers = 0;
+  let totalGross = 0;
+  let totalNet = 0;
+  let totalDistanceKm = 0;
+
+  // FIX (5.5): zamiast sentinela 999 uzywamy null — przy stawce > 999 zl/km
+  // albo ujemnej stary kod pokazywal bzdury.
+  let bestNetRate: number | null = null;
+  let worstNetRate: number | null = null;
+
+  for (const o of offers) {
+    if (o.isProfitable) profitable++;
+    if (o.status === 'ACCEPTED') accepted++;
+    else if (o.status === 'REJECTED') rejected++;
+    else pending++;
+
+    totalGross += o.grossAmount;
+    totalNet += o.netAmount;
+    totalDistanceKm += o.distanceTotalKm;
+
+    if (o.distanceTotalKm > 0 && o.netRatePerKm > 0) {
+      sumRates += o.netRatePerKm;
+      ratedOffers++;
+      if (bestNetRate === null || o.netRatePerKm > bestNetRate) bestNetRate = o.netRatePerKm;
+      if (worstNetRate === null || o.netRatePerKm < worstNetRate) worstNetRate = o.netRatePerKm;
+    }
+  }
+
+  return {
+    totalOffers: offers.length,
+    profitable,
+    unprofitable: offers.length - profitable,
+    accepted,
+    rejected,
+    pending,
+    ratedOffers,
+    // FIX (5.4): dwie rozne metryki, obie pokazywane w /statystyki.
+    avgNetRatePerKm: ratedOffers > 0 ? round2(sumRates / ratedOffers) : null,
+    weightedNetRatePerKm: totalDistanceKm > 0 ? round2(totalNet / totalDistanceKm) : null,
+    bestNetRate,
+    worstNetRate,
+    totalGross: round2(totalGross),
+    totalNet: round2(totalNet),
+    totalDistanceKm: Math.round(totalDistanceKm * 10) / 10,
+  };
+}

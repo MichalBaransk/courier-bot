@@ -26,6 +26,7 @@ import {
 } from '../utils/datetime.js';
 import {
   computeDailyTotals,
+  computeOfferStats,
   partitionNewTransactions,
   round2,
   sumWalletPayouts,
@@ -76,6 +77,14 @@ export interface TargetProgress {
   daysRemaining: number;
   dailyRequiredNetto: number;
   avgHourlyRate: number;
+  /**
+   * Skad wzieta jest stawka uzyta do prognozy godzin:
+   * - `PERIOD` — z tego samego okresu, ktorego dotyczy cel,
+   * - `ROLLING_30D` — srednia z ostatnich 30 dni (okres jeszcze pusty),
+   * - `FALLBACK` — stala `CFG.FALLBACK_HOURLY_RATE_NETTO`, czyli zgadywanka.
+   */
+  rateSource: 'PERIOD' | 'ROLLING_30D' | 'FALLBACK';
+  /** Zostawione dla zgodnosci ze starszymi wersjami aplikacji: `rateSource === 'FALLBACK'`. */
   usedFallbackRate: boolean;
   estimatedHoursRemaining: number;
   hoursPerDayRequired: number;
@@ -90,6 +99,12 @@ export interface CourseOfferStats {
   accepted: number;
   rejected: number;
   pending: number;
+  /**
+   * Ile ofert weszlo do sredniej i do skrajnych wartosci. Mniej niz
+   * `totalOffers` znaczy, ze czesc ofert nie miala dystansu (`rateBasis:
+   * 'NONE'`) — patrz `computeOfferStats`.
+   */
+  ratedOffers: number;
   /** Srednia arytmetyczna stawek pojedynczych ofert - "jakie oferty przychodza". */
   avgNetRatePerKm: number | null;
   /** Suma netto / suma km - "ile realnie wychodzi na kilometr". */
@@ -875,51 +890,35 @@ export class FinanceService {
       .from(courseOffers)
       .where(and(eq(courseOffers.telegramId, tId), eq(courseOffers.date, date)));
 
-    let profitable = 0;
-    let accepted = 0;
-    let rejected = 0;
-    let pending = 0;
-    let sumRates = 0;
-    let totalGross = 0;
-    let totalNet = 0;
-    let totalDistanceKm = 0;
-
-    // FIX (5.5): zamiast sentinela 999 uzywamy null - przy stawce > 999 zl/km
-    // albo ujemnej stary kod pokazywal bzdury.
-    let bestNetRate: number | null = null;
-    let worstNetRate: number | null = null;
-
-    for (const o of offers) {
-      if (o.isProfitable) profitable++;
-      if (o.status === 'ACCEPTED') accepted++;
-      else if (o.status === 'REJECTED') rejected++;
-      else pending++;
-
-      const rate = parseFloat(o.netRatePerKm);
-      sumRates += rate;
-      if (bestNetRate === null || rate > bestNetRate) bestNetRate = rate;
-      if (worstNetRate === null || rate < worstNetRate) worstNetRate = rate;
-
-      totalGross += parseFloat(o.grossAmount);
-      totalNet += parseFloat(o.netAmount);
-      totalDistanceKm += parseFloat(o.distanceTotalKm);
-    }
+    // Cala arytmetyka siedzi w `finance.calc.ts` — bez zaleznosci od bazy, wiec
+    // pod testem. Tutaj zostaje wylacznie parsowanie: `numeric` z Postgresa
+    // wraca jako string (9b).
+    const stats = computeOfferStats(
+      offers.map((o) => ({
+        isProfitable: o.isProfitable,
+        status: o.status,
+        netRatePerKm: parseFloat(o.netRatePerKm),
+        grossAmount: parseFloat(o.grossAmount),
+        netAmount: parseFloat(o.netAmount),
+        distanceTotalKm: parseFloat(o.distanceTotalKm),
+      }))
+    );
 
     return {
       date,
-      totalOffers: offers.length,
-      profitable,
-      unprofitable: offers.length - profitable,
-      accepted,
-      rejected,
-      pending,
-      // FIX (5.4): dwie rozne metryki, obie pokazywane w /statystyki.
-      avgNetRatePerKm: offers.length > 0 ? round2(sumRates / offers.length) : null,
-      weightedNetRatePerKm: totalDistanceKm > 0 ? round2(totalNet / totalDistanceKm) : null,
-      bestNetRate,
-      worstNetRate,
-      totalGross: round2(totalGross),
-      totalDistanceKm: Math.round(totalDistanceKm * 10) / 10,
+      totalOffers: stats.totalOffers,
+      profitable: stats.profitable,
+      unprofitable: stats.unprofitable,
+      accepted: stats.accepted,
+      rejected: stats.rejected,
+      pending: stats.pending,
+      ratedOffers: stats.ratedOffers,
+      avgNetRatePerKm: stats.avgNetRatePerKm,
+      weightedNetRatePerKm: stats.weightedNetRatePerKm,
+      bestNetRate: stats.bestNetRate,
+      worstNetRate: stats.worstNetRate,
+      totalGross: stats.totalGross,
+      totalDistanceKm: stats.totalDistanceKm,
     };
   }
 
@@ -1139,8 +1138,32 @@ export class FinanceService {
     const remainingNetto = round2(targetAmount - currentNetto);
     const progressPercent = targetAmount > 0 ? Math.round((currentNetto / targetAmount) * 1000) / 10 : 0;
 
-    const usedFallbackRate = summary.avgHourlyRateNetto <= 0;
-    const avgHourlyRate = usedFallbackRate ? CFG.FALLBACK_HOURLY_RATE_NETTO : summary.avgHourlyRateNetto;
+    // Stawka do prognozy godzin — trzy zrodla, od najlepszego do najgorszego.
+    //
+    // Sam okres celu jest pierwszym wyborem, ale w poniedzialek rano cel
+    // tygodniowy ma zero przejechanych godzin, a 1. dnia miesiaca to samo
+    // dotyczy celu miesiecznego. Stary kod szedl wtedy od razu na stala 35 zl/h
+    // — liczbe z konfiguracji, nie z zycia — i pokazywal ja jako prognoze,
+    // mimo ze wlasna historia kuriera lezala w bazie tuz obok.
+    //
+    // Aplikacja mobilna od poczatku liczyla srednia z 30 dni. Roznica byla
+    // widoczna: to samo "ile godzin zostalo" mialo dwie wartosci zaleznie od
+    // tego, gdzie sie patrzylo. To jest wyrownanie serwera do aplikacji.
+    let avgHourlyRate = summary.avgHourlyRateNetto;
+    let rateSource: TargetProgress['rateSource'] = 'PERIOD';
+
+    if (avgHourlyRate <= 0) {
+      const window30d = await this.getPeriodSummary(tId, addDays(today, -29), today);
+      if (window30d.avgHourlyRateNetto > 0) {
+        avgHourlyRate = window30d.avgHourlyRateNetto;
+        rateSource = 'ROLLING_30D';
+      } else {
+        avgHourlyRate = CFG.FALLBACK_HOURLY_RATE_NETTO;
+        rateSource = 'FALLBACK';
+      }
+    }
+
+    const usedFallbackRate = rateSource === 'FALLBACK';
 
     const estimatedHoursRemaining = remainingNetto > 0 ? Math.round((remainingNetto / avgHourlyRate) * 10) / 10 : 0;
 
@@ -1153,6 +1176,7 @@ export class FinanceService {
       daysRemaining,
       dailyRequiredNetto: remainingNetto > 0 ? round2(remainingNetto / daysRemaining) : 0,
       avgHourlyRate,
+      rateSource,
       usedFallbackRate,
       estimatedHoursRemaining,
       hoursPerDayRequired: estimatedHoursRemaining > 0 ? Math.round((estimatedHoursRemaining / daysRemaining) * 10) / 10 : 0,

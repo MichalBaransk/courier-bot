@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   computeDailyTotals,
   computeOfferRate,
+  computeOfferStats,
   partitionNewTransactions,
   sumWalletPayouts,
   walletBalanceFrom,
@@ -149,5 +150,113 @@ describe('computeOfferRate (FIX 2.3)', () => {
 
   it('kurs poniżej progu jest odrzucany', () => {
     expect(computeOfferRate({ grossAmount: 10, totalKm: 8 }).isProfitable).toBe(false);
+  });
+});
+
+/**
+ * Statystyki ofert.
+ *
+ * Sedno tych testów to jedna oferta bez dystansu. Realny przypadek z §8f:
+ * ekran oferty nie pokazuje adresu klienta, `isSpecificAddress()` odmawia
+ * geokodowania, `rateBasis` kończy jako `'NONE'`, a `netRatePerKm` wynosi 0.
+ * Zero nie znaczy „kurs za darmo", tylko „nie ma z czego liczyć" — i właśnie
+ * ta różnica ginęła w średniej.
+ */
+
+const oferta = (over: Partial<Parameters<typeof computeOfferStats>[0][number]> = {}) => ({
+  isProfitable: true,
+  status: 'PENDING',
+  netRatePerKm: 3,
+  grossAmount: 24.57,
+  netAmount: 20,
+  distanceTotalKm: 6.67,
+  ...over,
+});
+
+describe('computeOfferStats', () => {
+  it('brak ofert nie daje NaN, tylko null', () => {
+    const s = computeOfferStats([]);
+    expect(s.totalOffers).toBe(0);
+    expect(s.ratedOffers).toBe(0);
+    expect(s.avgNetRatePerKm).toBeNull();
+    expect(s.weightedNetRatePerKm).toBeNull();
+    expect(s.bestNetRate).toBeNull();
+    expect(s.worstNetRate).toBeNull();
+  });
+
+  it('oferta bez dystansu NIE zaniża średniej ani nie zostaje „najgorszą"', () => {
+    const s = computeOfferStats([
+      oferta({ netRatePerKm: 3, distanceTotalKm: 6 }),
+      oferta({ netRatePerKm: 2, distanceTotalKm: 10 }),
+      oferta({ netRatePerKm: 0, distanceTotalKm: 0, isProfitable: false }),
+    ]);
+
+    // Średnia z DWÓCH, nie z trzech: (3 + 2) / 2.
+    expect(s.avgNetRatePerKm).toBe(2.5);
+    expect(s.worstNetRate).toBe(2);
+    expect(s.bestNetRate).toBe(3);
+    expect(s.ratedOffers).toBe(2);
+  });
+
+  it('ale ta oferta nadal się liczy — była sprawdzona i ma prawdziwą kwotę', () => {
+    const s = computeOfferStats([
+      oferta({ grossAmount: 10, netAmount: 8.14, distanceTotalKm: 4 }),
+      oferta({ grossAmount: 22.04, netAmount: 17.94, distanceTotalKm: 0, netRatePerKm: 0, isProfitable: false }),
+    ]);
+
+    expect(s.totalOffers).toBe(2);
+    expect(s.ratedOffers).toBe(1);
+    expect(s.totalGross).toBe(32.04);
+    expect(s.unprofitable).toBe(1);
+  });
+
+  it('ujemna stawka nie jest „najlepszą" — sentinel 999 dawał tu bzdury (FIX 5.5)', () => {
+    const s = computeOfferStats([
+      oferta({ netRatePerKm: -1, distanceTotalKm: 5 }),
+      oferta({ netRatePerKm: 1200, distanceTotalKm: 0.01 }),
+    ]);
+
+    // Ujemna wypada razem z zerem: `netRatePerKm > 0` odsiewa oba.
+    expect(s.ratedOffers).toBe(1);
+    expect(s.bestNetRate).toBe(1200);
+    expect(s.worstNetRate).toBe(1200);
+  });
+
+  it('średnia ważona to co innego niż arytmetyczna', () => {
+    const s = computeOfferStats([
+      oferta({ netAmount: 10, distanceTotalKm: 2, netRatePerKm: 5 }),
+      oferta({ netAmount: 10, distanceTotalKm: 10, netRatePerKm: 1 }),
+    ]);
+
+    // Arytmetyczna: (5 + 1) / 2 = 3 — „jakie oferty przychodzą".
+    expect(s.avgNetRatePerKm).toBe(3);
+    // Ważona: 20 zł / 12 km = 1,67 — „ile realnie wychodzi na km".
+    expect(s.weightedNetRatePerKm).toBe(1.67);
+  });
+
+  it('statusy: wszystko, co nie jest ACCEPTED ani REJECTED, jest „bez decyzji"', () => {
+    const s = computeOfferStats([
+      oferta({ status: 'ACCEPTED' }),
+      oferta({ status: 'REJECTED' }),
+      oferta({ status: 'PENDING' }),
+      oferta({ status: 'COS_NOWEGO' }),
+    ]);
+
+    expect(s.accepted).toBe(1);
+    expect(s.rejected).toBe(1);
+    expect(s.pending).toBe(2);
+  });
+
+  it('daje te same liczby co `policzOferty` w aplikacji — to był cel tej zmiany', () => {
+    // Ten sam zestaw danych po obu stronach musi dawać ten sam wynik,
+    // inaczej `/statystyki` i zakładka Oferty znowu się rozjadą.
+    const s = computeOfferStats([
+      oferta({ netRatePerKm: 2.81, distanceTotalKm: 6.38, netAmount: 17.94, grossAmount: 22.04 }),
+      oferta({ netRatePerKm: 0, distanceTotalKm: 0, netAmount: 8.14, grossAmount: 10, isProfitable: false }),
+    ]);
+
+    expect(s.avgNetRatePerKm).toBe(2.81);
+    expect(s.ratedOffers).toBe(1);
+    expect(s.totalOffers).toBe(2);
   });
 });

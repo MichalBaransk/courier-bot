@@ -103,10 +103,23 @@ describe('progressBar', () => {
     expect(progressBar(-20)).toBe('[░░░░░░░░░░]');
   });
 
-  // ZNANY DEFEKT, NIEPOPRAWIONY: `progressBar(NaN)` zwraca `[]` — pusty tekst
-  // zamiast paska. `Math.round(NaN)` to `NaN`, `Math.max/min` przepuszczaja
-  // `NaN` dalej, a `'█'.repeat(NaN)` daje pusty lancuch. Poprawka to jedna
-  // linia (`Number.isFinite(percent) ? percent : 0`), ale to zmiana bazowego
-  // kodu i czeka na zgode. Celowo NIE zapisuje tu obecnego zachowania jako
-  // oczekiwanego — test utrwalajacy blad jest gorszy niz brak testu.
+  it('NaN i nieskonczonosc rysuja pusty pasek, a nie pusty tekst', () => {
+    // Bylo: `[]` — sam nawias, bo `'█'.repeat(NaN)` zwraca pusty lancuch.
+    // Cel 0 zl daje `0/0`, czyli `NaN`, wiec to nie byl przypadek teoretyczny.
+    expect(progressBar(NaN)).toBe('[░░░░░░░░░░]');
+    expect(progressBar(Infinity)).toBe('[░░░░░░░░░░]');
+    expect(progressBar(-Infinity)).toBe('[░░░░░░░░░░]');
+  });
+
+  it('pasek ma zawsze tyle samo znakow, cokolwiek dostanie', () => {
+    // Wlasciwa gwarancja: karta nie rozjedzie sie w pionie.
+    for (const v of [0, 37.5, 100, 140, -20, NaN, Infinity]) {
+      expect(progressBar(v)).toHaveLength(12);
+    }
+  });
+
+  it('inna liczba blokow tez dziala', () => {
+    expect(progressBar(50, 4)).toBe('[██░░]');
+    expect(progressBar(NaN, 4)).toBe('[░░░░]');
+  });
 });
