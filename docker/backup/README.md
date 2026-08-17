@@ -114,14 +114,51 @@ docker compose start bot
 
 ## Weryfikacja, że backup naprawdę działa
 
-Raz na jakiś czas warto odtworzyć kopię do bazy testowej — backup, którego
-nigdy nie przywracano, jest tylko przypuszczeniem:
+**Backup, którego nigdy nie przywracano, jest tylko przypuszczeniem.**
+
+Jedno polecenie — odszyfrowanie, sprawdzenie sumy kontrolnej archiwum,
+wgranie do bazy tymczasowej, porównanie liczby wierszy z produkcją
+i posprzątanie po sobie:
 
 ```bash
-docker compose exec postgres createdb -U postgres restore_test
-gunzip -c courierdb.sql.gz | docker compose exec -T postgres psql -U postgres -d restore_test
-docker compose exec -T postgres psql -U postgres -d restore_test -c "
-SELECT 'wallet_transactions' AS t, count(*) FROM wallet_transactions
-UNION ALL SELECT 'daily_records', count(*) FROM daily_records;"
-docker compose exec postgres dropdb -U postgres restore_test
+docker compose exec -T backup /usr/local/bin/test-odtworzenia.sh
 ```
+
+Konkretna kopia zamiast najnowszej:
+
+```bash
+docker compose exec -T backup /usr/local/bin/test-odtworzenia.sh /backups/courierdb-2026-08-16_1457.sql.gz.gpg
+```
+
+Skrypt **nie dotyka bazy produkcyjnej** — czyta z niej tylko liczby wierszy,
+a wszystko odtwarza w bazie `restore_test`, kasowanej na końcu (także wtedy,
+gdy coś padnie po drodze).
+
+### Werdykt
+
+- **Kopia mniejsza niż produkcja to norma** — powstała wcześniej, a od tego
+  czasu doszły wpisy.
+- **Pusta tabela, która na produkcji ma dane** → kod błędu. Zrzut nie objął
+  wszystkiego.
+- **Kopia większa niż produkcja** → ostrzeżenie. Backup jest sprawny, ale ktoś
+  skasował dane z produkcji.
+- **Tabela z `-`** → nie było jej jeszcze w chwili robienia kopii. Przy kopii
+  sprzed migracji to normalne i wręcz przydatne: pokazuje, z którego momentu
+  ona jest.
+
+### ⚠️ Czego ten skrypt NIE sprawdza
+
+**Czy hasło z menedżera haseł jest tym samym hasłem.** Domyślnie używa
+`BACKUP_PASSPHRASE` z kontenera, a prawdziwe odtworzenie to scenariusz,
+w którym serwera już nie ma i zostaje wyłącznie kopia hasła poza nim.
+Żeby sprawdzić to naprawdę, podaj hasło ręcznie:
+
+```bash
+docker compose exec -T backup sh -c 'BACKUP_PASSPHRASE="wklej-z-menedzera" /usr/local/bin/test-odtworzenia.sh'
+```
+
+**Czy cotygodniowa wysyłka na Telegram działa** — to osobna ścieżka
+(`backup.sh --send`) i osobny test.
+
+> Skrypt jest w obrazie, więc po jego dodaniu albo zmianie trzeba przebudować
+> kontener: `docker compose up -d --build backup`.

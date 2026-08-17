@@ -15,7 +15,12 @@ ENV TZ=Europe/Warsaw
 
 COPY backup.sh /usr/local/bin/backup.sh
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/backup.sh /usr/local/bin/entrypoint.sh
+# Test odtworzenia mieszka TUTAJ, a nie na hoście: dodatek SSH w Home Assistant
+# OS nie ma gpg ani psql, a `apk add` w nim jest ulotny (ginie przy restarcie).
+# Ten kontener ma komplet i widzi bazę po nazwie usługi.
+COPY test-odtworzenia.sh /usr/local/bin/test-odtworzenia.sh
+RUN chmod +x /usr/local/bin/backup.sh /usr/local/bin/entrypoint.sh \
+      /usr/local/bin/test-odtworzenia.sh
 
 VOLUME ["/backups"]
 
