@@ -1,6 +1,6 @@
 # GlovoBot — kod źródłowy
 
-Plików: 53 · linii: 8169
+Plików: 55 · linii: 8495
 
 ## Struktura
 
@@ -40,6 +40,7 @@ src/services/maps.service.ts
 src/services/user.service.ts
 src/utils/datetime.test.ts
 src/utils/datetime.ts
+src/utils/format.test.ts
 src/utils/format.ts
 src/utils/rate-limiter.test.ts
 src/utils/rate-limiter.ts
@@ -47,6 +48,7 @@ docker/backup/backup.sh
 docker/backup/Dockerfile
 docker/backup/entrypoint.sh
 docker/backup/README.md
+docker/backup/test-odtworzenia.sh
 drizzle/0001_rework.sql
 drizzle/0002_api_idempotency.sql
 .dockerignore
@@ -80,7 +82,8 @@ ZMIANY.md
     "db:push": "drizzle-kit push",
     "db:generate": "drizzle-kit generate",
     "db:studio": "drizzle-kit studio",
-    "import:sheets": "tsx src/scripts/import-sheets.ts"
+    "import:sheets": "tsx src/scripts/import-sheets.ts",
+    "codebase": "node src/scripts/make-codebase.mjs"
   },
   "keywords": [],
   "author": "",
@@ -146,7 +149,7 @@ ZMIANY.md
     "skipLibCheck": true,
     "esModuleInterop": true
   },
-  "include": ["src/**/*", "scripts/make-codebase.mjs"],
+  "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]
 }
 ```
@@ -6800,6 +6803,122 @@ export function calculateHours(fromStr: string, toStr: string): ShiftHours {
 }
 ```
 
+# Plik: src/utils/format.test.ts
+```typescript
+import { describe, expect, it } from 'vitest';
+import { b, code, compact, h, i, joinLines, km, progressBar, zl, zlSigned } from './format.js';
+
+/**
+ * Escapowanie HTML — jedyna rzecz w tym pliku, ktora naprawde boli, gdy padnie.
+ *
+ * FIX (3.3) opisuje realny przypadek: adres `ul. Sportowa 5_A` z OCR albo
+ * gwiazdka w transkrypcji glosowej wywalaly CALA wiadomosc bledem
+ * `400: can't parse entities`, a uzytkownik widzial tylko „Blad analizy
+ * obrazu". Bot poszedl na HTML wlasnie dlatego, ze tam escapowanie to trzy
+ * znaki i jest pewne — ale tylko dopoki `h()` faktycznie je robi.
+ *
+ * Dane od Gemini i od uzytkownika sa tu traktowane jak wrogie, bo takie
+ * bywaja przez przypadek.
+ */
+
+describe('h — escapowanie tresci obcej', () => {
+  it('zamienia trzy znaki, ktore psuja HTML Telegrama', () => {
+    expect(h('<b>')).toBe('&lt;b&gt;');
+    expect(h('a & b')).toBe('a &amp; b');
+  });
+
+  it('kolejnosc podmian nie robi podwojnego escapowania', () => {
+    // `&` musi isc PIERWSZE. Odwrotnie `<` stalby sie `&amp;lt;`.
+    expect(h('<')).toBe('&lt;');
+    expect(h('&lt;')).toBe('&amp;lt;');
+  });
+
+  it('probe wstrzykniecia znacznika zwija do tekstu', () => {
+    expect(h('<a href="http://zly">klik</a>')).toBe(
+      '&lt;a href="http://zly"&gt;klik&lt;/a&gt;'
+    );
+  });
+
+  it('podkreslenia i gwiazdki zostawia w spokoju — to problem Markdowna, nie HTML-a', () => {
+    // Dokladnie ten adres wywalal wiadomosc w wersji na Markdownie.
+    expect(h('ul. Sportowa 5_A')).toBe('ul. Sportowa 5_A');
+    expect(h('*gwiazdka*')).toBe('*gwiazdka*');
+  });
+
+  it('null i undefined daja pusty tekst, a nie slowo „null"', () => {
+    expect(h(null)).toBe('');
+    expect(h(undefined)).toBe('');
+  });
+
+  it('liczby i inne typy przechodza przez String()', () => {
+    expect(h(42)).toBe('42');
+    expect(h(0)).toBe('0');
+    expect(h(false)).toBe('false');
+  });
+});
+
+describe('b / i / code — escapuja zawartosc, nie tylko opakowuja', () => {
+  it('tresc w srodku jest escapowana', () => {
+    expect(b('<x>')).toBe('<b>&lt;x&gt;</b>');
+    expect(i('a & b')).toBe('<i>a &amp; b</i>');
+    expect(code('<script>')).toBe('<code>&lt;script&gt;</code>');
+  });
+});
+
+describe('kwoty i dystans', () => {
+  it('zawsze dwa miejsca po przecinku', () => {
+    expect(zl(0)).toBe('0.00 zł');
+    expect(zl(1234.5)).toBe('1234.50 zł');
+  });
+
+  it('zlSigned dodaje plus tylko wartosciom dodatnim', () => {
+    expect(zlSigned(12)).toBe('+12.00 zł');
+    expect(zlSigned(-8.5)).toBe('-8.50 zł');
+    expect(zlSigned(0)).toBe('0.00 zł');
+  });
+
+  it('km domyslnie z jednym miejscem', () => {
+    expect(km(142.35)).toBe('142.3 km');
+    expect(km(142.35, 2)).toBe('142.35 km');
+  });
+});
+
+describe('compact / joinLines — wiersze warunkowe', () => {
+  it('wyrzuca false, null, undefined i pusty tekst', () => {
+    expect(compact(['a', false, null, undefined, '', 'b'])).toEqual(['a', 'b']);
+  });
+
+  it('joinLines sklada to, co zostalo', () => {
+    expect(joinLines(['pierwszy', false, 'drugi'])).toBe('pierwszy\ndrugi');
+  });
+
+  it('sama pustka daje pusty tekst, nie serie nowych linii', () => {
+    expect(joinLines([false, null, ''])).toBe('');
+  });
+});
+
+describe('progressBar', () => {
+  it('krance', () => {
+    expect(progressBar(0)).toBe('[░░░░░░░░░░]');
+    expect(progressBar(100)).toBe('[██████████]');
+    expect(progressBar(50)).toBe('[█████░░░░░]');
+  });
+
+  it('wartosci spoza zakresu sa przycinane, a nie rysowane', () => {
+    // Cel przekroczony o 40% nie moze narysowac czternastu blokow.
+    expect(progressBar(140)).toBe('[██████████]');
+    expect(progressBar(-20)).toBe('[░░░░░░░░░░]');
+  });
+
+  // ZNANY DEFEKT, NIEPOPRAWIONY: `progressBar(NaN)` zwraca `[]` — pusty tekst
+  // zamiast paska. `Math.round(NaN)` to `NaN`, `Math.max/min` przepuszczaja
+  // `NaN` dalej, a `'█'.repeat(NaN)` daje pusty lancuch. Poprawka to jedna
+  // linia (`Number.isFinite(percent) ? percent : 0`), ale to zmiana bazowego
+  // kodu i czeka na zgode. Celowo NIE zapisuje tu obecnego zachowania jako
+  // oczekiwanego — test utrwalajacy blad jest gorszy niz brak testu.
+});
+```
+
 # Plik: src/utils/format.ts
 ```typescript
 /**
@@ -7433,7 +7552,12 @@ ENV TZ=Europe/Warsaw
 
 COPY backup.sh /usr/local/bin/backup.sh
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/backup.sh /usr/local/bin/entrypoint.sh
+# Test odtworzenia mieszka TUTAJ, a nie na hoście: dodatek SSH w Home Assistant
+# OS nie ma gpg ani psql, a `apk add` w nim jest ulotny (ginie przy restarcie).
+# Ten kontener ma komplet i widzi bazę po nazwie usługi.
+COPY test-odtworzenia.sh /usr/local/bin/test-odtworzenia.sh
+RUN chmod +x /usr/local/bin/backup.sh /usr/local/bin/entrypoint.sh \
+      /usr/local/bin/test-odtworzenia.sh
 
 VOLUME ["/backups"]
 
@@ -7597,18 +7721,186 @@ docker compose start bot
 
 ## Weryfikacja, że backup naprawdę działa
 
-Raz na jakiś czas warto odtworzyć kopię do bazy testowej — backup, którego
-nigdy nie przywracano, jest tylko przypuszczeniem:
+**Backup, którego nigdy nie przywracano, jest tylko przypuszczeniem.**
+
+Jedno polecenie — odszyfrowanie, sprawdzenie sumy kontrolnej archiwum,
+wgranie do bazy tymczasowej, porównanie liczby wierszy z produkcją
+i posprzątanie po sobie:
 
 ```bash
-docker compose exec postgres createdb -U postgres restore_test
-gunzip -c courierdb.sql.gz | docker compose exec -T postgres psql -U postgres -d restore_test
-docker compose exec -T postgres psql -U postgres -d restore_test -c "
-SELECT 'wallet_transactions' AS t, count(*) FROM wallet_transactions
-UNION ALL SELECT 'daily_records', count(*) FROM daily_records;"
-docker compose exec postgres dropdb -U postgres restore_test
+docker compose exec -T backup /usr/local/bin/test-odtworzenia.sh
 ```
+
+Konkretna kopia zamiast najnowszej:
+
+```bash
+docker compose exec -T backup /usr/local/bin/test-odtworzenia.sh /backups/courierdb-2026-08-16_1457.sql.gz.gpg
+```
+
+Skrypt **nie dotyka bazy produkcyjnej** — czyta z niej tylko liczby wierszy,
+a wszystko odtwarza w bazie `restore_test`, kasowanej na końcu (także wtedy,
+gdy coś padnie po drodze).
+
+### Werdykt
+
+- **Kopia mniejsza niż produkcja to norma** — powstała wcześniej, a od tego
+  czasu doszły wpisy.
+- **Pusta tabela, która na produkcji ma dane** → kod błędu. Zrzut nie objął
+  wszystkiego.
+- **Kopia większa niż produkcja** → ostrzeżenie. Backup jest sprawny, ale ktoś
+  skasował dane z produkcji.
+- **Tabela z `-`** → nie było jej jeszcze w chwili robienia kopii. Przy kopii
+  sprzed migracji to normalne i wręcz przydatne: pokazuje, z którego momentu
+  ona jest.
+
+### ⚠️ Czego ten skrypt NIE sprawdza
+
+**Czy hasło z menedżera haseł jest tym samym hasłem.** Domyślnie używa
+`BACKUP_PASSPHRASE` z kontenera, a prawdziwe odtworzenie to scenariusz,
+w którym serwera już nie ma i zostaje wyłącznie kopia hasła poza nim.
+Żeby sprawdzić to naprawdę, podaj hasło ręcznie:
+
+```bash
+docker compose exec -T backup sh -c 'BACKUP_PASSPHRASE="wklej-z-menedzera" /usr/local/bin/test-odtworzenia.sh'
+```
+
+**Czy cotygodniowa wysyłka na Telegram działa** — to osobna ścieżka
+(`backup.sh --send`) i osobny test.
+
+> Skrypt jest w obrazie, więc po jego dodaniu albo zmianie trzeba przebudować
+> kontener: `docker compose up -d --build backup`.
 ````
+
+# Plik: docker/backup/test-odtworzenia.sh
+```bash
+#!/bin/sh
+# Test odtworzenia backupu — sprawdza, czy kopia da sie ODSZYFROWAC i WGRAC.
+#
+#   docker compose exec -T backup /usr/local/bin/test-odtworzenia.sh
+#   docker compose exec -T backup /usr/local/bin/test-odtworzenia.sh /backups/courierdb-2026-08-16_1457.sql.gz.gpg
+#
+# Backup, ktorego nigdy nie przywracano, jest tylko przypuszczeniem. Ten skrypt
+# zamienia wielolinijkowa procedure z README w jedno polecenie, zeby nie bylo
+# wymowki, zeby jej nie uruchomic.
+#
+# CZEGO TEN SKRYPT NIE SPRAWDZA:
+#  - czy haslo z menedzera hasel jest tym samym haslem co `BACKUP_PASSPHRASE`
+#    w `.env` — uzywa tego z kontenera, a prawdziwe odtworzenie to scenariusz,
+#    w ktorym serwera juz nie ma. Zeby to sprawdzic, podaj haslo recznie:
+#       BACKUP_PASSPHRASE='...' /usr/local/bin/test-odtworzenia.sh
+#  - czy cotygodniowa wysylka na Telegram dziala (osobno: backup.sh --send).
+#
+# BEZPIECZENSTWO: nie dotyka bazy produkcyjnej. Wszystko ladzie w tymczasowej
+# bazie, ktora jest kasowana na koncu — takze wtedy, gdy cos padnie po drodze.
+
+set -eu
+
+: "${POSTGRES_HOST:?brak POSTGRES_HOST}"
+: "${POSTGRES_USER:?brak POSTGRES_USER}"
+: "${POSTGRES_DB:?brak POSTGRES_DB}"
+: "${PGPASSWORD:?brak PGPASSWORD}"
+
+BACKUP_DIR="${BACKUP_DIR:-/backups}"
+TESTOWA="${RESTORE_TEST_DB:-restore_test}"
+
+log() { echo "[test-odtworzenia] $*"; }
+psql_do() { psql -h "$POSTGRES_HOST" -p "${POSTGRES_PORT:-5432}" -U "$POSTGRES_USER" "$@"; }
+
+# --- Wybor pliku ------------------------------------------------------------
+PLIK="${1:-}"
+if [ -z "$PLIK" ]; then
+  PLIK="$(ls -1t "$BACKUP_DIR"/*.gpg "$BACKUP_DIR"/*.sql.gz 2>/dev/null | head -1 || true)"
+fi
+
+if [ -z "$PLIK" ] || [ ! -f "$PLIK" ]; then
+  log "BLAD: nie znalazlem zadnej kopii w ${BACKUP_DIR}."
+  exit 1
+fi
+
+log "kopia: $PLIK"
+
+ROBOCZY="$(mktemp -d)"
+# Sprzatanie ZAWSZE, takze po bledzie — inaczej `restore_test` zostaje
+# w klastrze i przy kolejnym uruchomieniu `createdb` sie wywala.
+sprzatnij() {
+  rm -rf "$ROBOCZY"
+  psql_do -d postgres -q -c "DROP DATABASE IF EXISTS ${TESTOWA}" >/dev/null 2>&1 || true
+}
+trap sprzatnij EXIT
+ARCHIWUM="$ROBOCZY/kopia.sql.gz"
+
+# --- 1. Odszyfrowanie -------------------------------------------------------
+# To jest wlasciwy test. Reszta tylko potwierdza, ze odszyfrowana tresc ma sens.
+case "$PLIK" in
+  *.gpg)
+    : "${BACKUP_PASSPHRASE:?kopia jest zaszyfrowana, a nie ma BACKUP_PASSPHRASE}"
+    log "odszyfrowuje…"
+    gpg --batch --quiet --decrypt --passphrase "$BACKUP_PASSPHRASE" \
+        --output "$ARCHIWUM" "$PLIK"
+    ;;
+  *)
+    log "UWAGA: kopia nie jest zaszyfrowana"
+    cp "$PLIK" "$ARCHIWUM"
+    ;;
+esac
+
+# --- 2. Calosc archiwum -----------------------------------------------------
+# Haslo moze pasowac, a plik i tak byc uciety — gzip trzyma sume kontrolna.
+log "sprawdzam sume kontrolna archiwum…"
+gunzip -t "$ARCHIWUM"
+
+ROZMIAR="$(stat -c %s "$ARCHIWUM")"
+log "odszyfrowane i cale ($(du -h "$ARCHIWUM" | cut -f1), ${ROZMIAR} B)"
+
+# --- 3. Odtworzenie do bazy tymczasowej -------------------------------------
+log "tworze baze ${TESTOWA}…"
+psql_do -d postgres -q -c "DROP DATABASE IF EXISTS ${TESTOWA}"
+psql_do -d postgres -q -c "CREATE DATABASE ${TESTOWA}"
+
+log "wgrywam zrzut…"
+gunzip -c "$ARCHIWUM" | psql_do -d "$TESTOWA" -q -v ON_ERROR_STOP=0 >/dev/null
+
+# --- 4. Porownanie liczby wierszy -------------------------------------------
+TABELE="users daily_records fuel_receipts cash_tips wallet_transactions course_offers earning_targets"
+
+echo
+printf '%-22s %10s %10s\n' 'tabela' 'kopia' 'produkcja'
+printf '%-22s %10s %10s\n' '----------------------' '----------' '----------'
+
+PUSTE=0
+WIECEJ=0
+for T in $TABELE; do
+  # Tabela moze nie istniec w kopii starszej niz migracja, ktora ja dodala.
+  K="$(psql_do -d "$TESTOWA" -tAc "SELECT count(*) FROM ${T}" 2>/dev/null || echo '-')"
+  P="$(psql_do -d "$POSTGRES_DB" -tAc "SELECT count(*) FROM ${T}" 2>/dev/null || echo '-')"
+  printf '%-22s %10s %10s\n' "$T" "$K" "$P"
+
+  [ "$K" = "0" ] && [ "$P" != "0" ] && PUSTE=$((PUSTE + 1))
+  if [ "$K" != "-" ] && [ "$P" != "-" ] && [ "$K" -gt "$P" ] 2>/dev/null; then
+    WIECEJ=$((WIECEJ + 1))
+  fi
+done
+echo
+
+# --- 5. Werdykt -------------------------------------------------------------
+#
+# Kopia MNIEJSZA od produkcji to norma — powstala wczesniej, a od tego czasu
+# doszly wpisy. Alarm to co innego: pusta tabela, ktora na produkcji ma dane
+# (zrzut nie objal wszystkiego), albo kopia WIEKSZA od produkcji (ktos skasowal
+# dane z produkcji i o tym nie wie).
+if [ "$PUSTE" -gt 0 ]; then
+  log "BLAD: ${PUSTE} tabel(a) jest w kopii PUSTA, choc na produkcji ma dane."
+  exit 1
+fi
+
+if [ "$WIECEJ" -gt 0 ]; then
+  log "UWAGA: ${WIECEJ} tabel(a) ma w kopii WIECEJ wierszy niz na produkcji."
+  log "Kopia jest sprawna, ale ktos skasowal dane z produkcji — sprawdz, czy celowo."
+fi
+
+log "OK — kopia jest czytelna, kompletna i da sie ja wgrac."
+log "Baza ${TESTOWA} zostala skasowana."
+```
 
 # Plik: drizzle/0001_rework.sql
 ```sql
@@ -8032,7 +8324,49 @@ if git apply --reverse --check "$ROBOCZY" 2>/dev/null; then
   exit 0
 fi
 
+# --- Diagnoza: złe repozytorium czy zły commit? ------------------------------
+#
+# To rozróżnienie kosztowało jedną rundę. Patch serwerowy nałożony w repo
+# aplikacji dawał komunikat „stoisz na innym commicie" i sugerował `git stash`,
+# bo skrypt nie miał pojęcia, że jest w niewłaściwym katalogu.
+#
+# Sprawdzenie jest proste: patch modyfikujący istniejące pliki musi trafić na
+# CHOĆ JEDEN plik, który tutaj istnieje. Zero trafień przy patchu na kilka
+# plików znaczy praktycznie zawsze złe repozytorium.
+PLIKI="$(grep -oE '^diff --git a/[^ ]+' "$ROBOCZY" | sed 's|^diff --git a/||' | sort -u || true)"
+NAZWA="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1)"
+
+ILE=0
+TRAFIONE=0
+while IFS= read -r F; do
+  [ -n "$F" ] || continue
+  ILE=$((ILE + 1))
+  [ -e "$F" ] && TRAFIONE=$((TRAFIONE + 1))
+done <<EOF
+$PLIKI
+EOF
+
+echo
+if [ "$ILE" -gt 1 ] && [ "$TRAFIONE" -eq 0 ]; then
+  echo "❌ Ten patch jest do INNEGO REPOZYTORIUM."
+  echo
+  echo "   Jesteś w:  ${NAZWA:-?}  ($(pwd))"
+  echo "   Patch rusza $ILE plików i ANI JEDEN z nich tu nie istnieje:"
+  echo "$PLIKI" | head -5 | sed 's/^/     /'
+  [ "$ILE" -gt 5 ] && echo "     … i $((ILE - 5)) więcej"
+  echo
+  echo "   Bot (courier-bot)          → ~/projekty/telegram-bot"
+  echo "   Aplikacja (courier-mobile) → ~/projekty/courier-app"
+  echo
+  echo "   Nazwy katalogów NIE pokrywają się z nazwami repozytoriów."
+  exit 1
+fi
+
 echo "❌ Patch nie pasuje do obecnego stanu repozytorium."
+echo "   (jesteś w: ${NAZWA:-?} — repo się zgadza, $TRAFIONE z $ILE plików istnieje)"
+echo
+echo "Patch rusza te pliki:"
+echo "$PLIKI" | sed 's/^/  /'
 echo
 echo "Najczęstsze przyczyny:"
 echo "  • masz niezacommitowane zmiany  → git stash"

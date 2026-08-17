@@ -100,6 +100,40 @@ gunzip -c courierdb.sql.gz | docker compose exec -T postgres psql -U postgres -d
 docker compose start bot
 ```
 
+## ⚠️ Błąd naprawiony 17.08.2026 — cron NIGDY nie robił zrzutu
+
+`entrypoint.sh` budował `/etc/backup.env` przez `sed 's/^/export /'`, bez
+cudzysłowów wokół wartości. Wystarczyło, że któraś zmienna ma spację —
+a `BACKUP_CRON=30 3 * * *` ma cztery:
+
+```
+export BACKUP_CRON=30 3 * * *
+```
+
+Powłoka czytała to jako „wyeksportuj `BACKUP_CRON`, a potem zmienne o nazwach
+`3`, `*`, `*`, `*`" i przerywała na `export: 3: bad variable name`. Zadanie
+crona wyglądało tak:
+
+```
+30 3 * * * . /etc/backup.env && /usr/local/bin/backup.sh >> /proc/1/fd/1 2>&1
+```
+
+Źródłowanie padało, `&&` zwierało, **`backup.sh` nigdy się nie uruchamiał**.
+
+Dlaczego nikt tego nie zauważył:
+
+1. **Zrzut startowy działał**, bo `entrypoint.sh` woła `backup.sh` wprost, ze
+   środowiskiem kontenera — bez źródłowania tego pliku. Kopie w wolumenie
+   powstawały przy każdym starcie kontenera, więc katalog nie był pusty.
+2. **Błąd był niewidoczny.** Przekierowanie `>> /proc/1/fd/1` obejmowało tylko
+   `backup.sh`, więc komunikat ze źródłowania szedł na stderr crond-a — a ten,
+   uruchamiany bez `-L`, loguje do sysloga, czyli w kontenerze donikąd.
+
+Trzy poprawki: wartości w apostrofach, klamry wokół całego polecenia crona
+(`{ … } >> /proc/1/fd/1 2>&1`), oraz `crond -L /proc/1/fd/1`. Do tego
+kontener **nie wstaje**, gdy `/etc/backup.env` nie da się źródłować — lepiej
+głośna awaria niż backup, który tylko udaje, że działa.
+
 ## Zabezpieczenia w skrypcie
 
 - **Zrzut mniejszy niż 1 KB przerywa proces** z kodem błędu — pusty plik
