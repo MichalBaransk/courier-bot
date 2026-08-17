@@ -21,6 +21,34 @@ ROBOCZY="$(mktemp)"
 trap 'rm -f "$ROBOCZY"' EXIT
 sed 's/\r$//' "$PATCH" > "$ROBOCZY"
 
+# --- Czy to na pewno TO repozytorium? ---------------------------------------
+#
+# Sprawdzane PRZED `git apply`, nie po nieudanej probie. Powod jest konkretny:
+# patch skladajacy sie z samych NOWYCH plikow nie ma kontekstu do dopasowania,
+# wiec `git apply --check` przechodzi w KAZDYM repozytorium. Kontrola po
+# nieudanym nalozeniu nigdy by sie dla niego nie uruchomila — i wlasnie tak
+# testy dat z aplikacji wyladowaly w repozytorium bota.
+#
+# Znacznik `# repo: <nazwa>` siedzi w naglowku patcha. `git apply` ignoruje
+# wszystko przed pierwszym `diff --git`, wiec ta linia nic nie kosztuje.
+NAZWA="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1)"
+REPO_Z_PATCHA="$(sed -n 's/^# repo:[[:space:]]*//p' "$ROBOCZY" | head -1 || true)"
+
+if [ -n "$REPO_Z_PATCHA" ] && [ -n "$NAZWA" ] && [ "$REPO_Z_PATCHA" != "$NAZWA" ]; then
+  echo "❌ Ten patch jest do INNEGO REPOZYTORIUM — nie ruszam niczego."
+  echo
+  echo "   Patch deklaruje: $REPO_Z_PATCHA"
+  echo "   A Ty jesteś w:   $NAZWA  ($(pwd))"
+  echo
+  echo "   telegram-bot  → cd ~/projekty/telegram-bot   (repo courier-bot)"
+  echo "   courier-app   → cd ~/projekty/courier-app    (repo courier-mobile-app)"
+  exit 1
+fi
+
+if [ -z "$REPO_Z_PATCHA" ]; then
+  echo "ℹ️  Patch bez nagłówka '# repo:' — nie mogę potwierdzić repozytorium."
+fi
+
 echo "🔎 Sprawdzam, czy patch wejdzie…"
 
 if git apply --check "$ROBOCZY" 2>/dev/null; then
@@ -49,16 +77,6 @@ fi
 # CHOĆ JEDEN plik, który tutaj istnieje. Zero trafień przy patchu na kilka
 # plików znaczy praktycznie zawsze złe repozytorium.
 PLIKI="$(grep -oE '^diff --git a/[^ ]+' "$ROBOCZY" | sed 's|^diff --git a/||' | sort -u || true)"
-NAZWA="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1)"
-
-# Znacznik w naglowku patcha: `# repo: courier-bot`.
-#
-# `git apply` ignoruje wszystko przed pierwszym `diff --git`, wiec ta linia
-# nic nie kosztuje, a rozstrzyga przypadek, ktorego heurystyka ponizej NIE
-# lapie: patch ruszajacy wylacznie pliki o nazwach wspolnych dla obu repo
-# (`package.json`, `tsconfig.json`, `scripts/zastosuj-patch.sh`). Wtedy
-# wszystkie sciezki „istnieja" i nic nie wygladalo podejrzanie.
-REPO_Z_PATCHA="$(sed -n 's/^# repo:[[:space:]]*//p' "$ROBOCZY" | head -1 || true)"
 
 ILE=0
 TRAFIONE=0
@@ -71,17 +89,6 @@ $PLIKI
 EOF
 
 echo
-if [ -n "$REPO_Z_PATCHA" ] && [ -n "$NAZWA" ] && [ "$REPO_Z_PATCHA" != "$NAZWA" ]; then
-  echo "❌ Ten patch jest do INNEGO REPOZYTORIUM."
-  echo
-  echo "   Patch deklaruje: $REPO_Z_PATCHA"
-  echo "   A Ty jesteś w:   $NAZWA  ($(pwd))"
-  echo
-  echo "   telegram-bot  → cd ~/projekty/telegram-bot   (repo courier-bot)"
-  echo "   courier-app   → cd ~/projekty/courier-app    (repo courier-mobile-app)"
-  exit 1
-fi
-
 if [ "$ILE" -gt 1 ] && [ "$TRAFIONE" -eq 0 ]; then
   echo "❌ Ten patch jest do INNEGO REPOZYTORIUM."
   echo
