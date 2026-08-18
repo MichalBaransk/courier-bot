@@ -1,0 +1,54 @@
+// Środowisko pracy w przeglądarce (GitHub Codespaces) — bot.
+//
+// PO CO TO JEST.
+//
+// Do tej pory kod dało się edytować tylko na jednym komputerze: w kopii
+// roboczej w WSL. Ten plik opisuje gotowe środowisko, które GitHub stawia
+// u siebie na żądanie — Linux, Node 22, terminal, VS Code w przeglądarce.
+// Otwierasz je z dowolnej maszyny, także cudzej, i masz to samo repo.
+//
+// Środowisko jest WERSJONOWANE RAZEM Z KODEM. Ta sama myśl co w Dockerfile:
+// opis maszyny leży obok tego, co na niej biegnie, więc nie da się ich
+// rozjechać po cichu.
+//
+// Docelowo to źródło prawdy przenosi się na GitHuba, a kopia w WSL przestaje
+// być potrzebna — znika dług „dwie kopie repozytorium" (§17).
+//
+// JAK URUCHOMIĆ: na stronie repozytorium zielony przycisk Code → zakładka
+// Codespaces → Create codespace on main. Pierwsze uruchomienie trwa 2–3
+// minuty, kolejne kilkanaście sekund.
+//
+// CZEGO TU NIE MA: PostgreSQL. `npm run typecheck` i `npm test` go nie
+// potrzebują — testy celowo nie dotykają bazy (§5: arytmetyka siedzi
+// w `finance.calc.ts`, bez zależności od `db/index.ts`). Żeby URUCHOMIĆ
+// bota w Codespace, trzeba by dołożyć usługę Postgresa; nie robimy tego,
+// dopóki nie okaże się potrzebne — bot i tak działa na serwerze.
+{
+  "name": "courier-bot",
+
+  // Obraz Microsoftu z Node 22, gitem i narzędziami powłoki. Ta sama główna
+  // wersja Node co w Dockerfile (`node:22-alpine`) — rozjazd tutaj oznaczałby
+  // pisanie kodu pod inny runtime niż ten, który go uruchamia.
+  "image": "mcr.microsoft.com/devcontainers/typescript-node:22",
+
+  // Uruchamiane raz, przy tworzeniu środowiska.
+  //
+  // `npm install`, nie `npm ci` — z tego samego powodu co w CI: esbuild ciągnie
+  // 27 pakietów platformowych jako opcjonalne, a różne wersje npm-a zapisują je
+  // w locku niezgodnie (npm/cli#8805). Szczegóły w `claude/ci-github-actions.md`.
+  "postCreateCommand": "npm install",
+
+  // Krótkie przypomnienie po każdym otwarciu — łatwo zapomnieć, gdzie się jest.
+  "postAttachCommand": "echo 'courier-bot — sprawdzenie: npm run sprawdz'",
+
+  "customizations": {
+    "vscode": {
+      "settings": {
+        // Ten projekt jest w całości po polsku, łącznie z nazwami plików
+        // i komentarzami. Domyślne sortowanie i tak działa, ale terminal
+        // zaczynamy w katalogu repo, nie w katalogu domowym.
+        "terminal.integrated.cwd": "${containerWorkspaceFolder}"
+      }
+    }
+  }
+}
