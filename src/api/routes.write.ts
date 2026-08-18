@@ -1,11 +1,14 @@
 import type { Context, Hono } from 'hono';
 import type { z } from 'zod';
+import { CFG } from '../config.js';
 import { financeService } from '../services/finance.service.js';
 import { ensureUserById } from '../services/user.service.js';
+import { lokalizacjaService } from '../services/lokalizacja.service.js';
 import {
   BruttoSchema,
   CelSchema,
   DystansSchema,
+  LokalizacjaSchema,
   NapiwekSchema,
   PaliwoSchema,
   UsunSchema,
@@ -76,6 +79,56 @@ export function registerWriteRoutes(app: Hono, userId: string): void {
     };
     return c.json(body, 201);
   };
+
+  /**
+   * Pozycja kuriera. JEDYNY endpoint zapisu, ktory NIE zwraca stanu dnia.
+   *
+   * Powod: pozycja nie jest wpisem do rozliczenia, tylko stanem chwilowym.
+   * Doklejanie do kazdej odpowiedzi podsumowania dnia oznaczaloby kilka
+   * zapytan do bazy co 20 sekund przez cala zmiane, bez zadnego pozytku —
+   * aplikacja i tak tej odpowiedzi nie wyswietla.
+   *
+   * Nie przechodzi tez sensownie przez idempotencje: `Idempotency-Key` nie ma
+   * tu czego chronic, bo zapis jest upsertem i powtorzenie go nic nie psuje.
+   * Aplikacja po prostu nie wysyla tego naglowka.
+   *
+   * `false` z serwisu znaczy „wspolrzedne bez sensu" — wtedy STARA pozycja
+   * zostaje nietknieta i odpowiadamy 400. Lepiej zostac ze znana pozycja
+   * sprzed minuty niz zastapic ja zerami (§8f).
+   */
+  app.post('/api/v1/lokalizacja', async (c) => {
+    const w = await czytajCialo(c, LokalizacjaSchema);
+    if (!w.ok) return c.json({ error: w.komunikat }, 400);
+
+    await ensureUserById(userId);
+    const zapisano = await lokalizacjaService.zapisz(userId, {
+      lat: w.wartosc.lat,
+      lon: w.wartosc.lon,
+      dokladnoscM: w.wartosc.dokladnoscM,
+      wiekMs: w.wartosc.wiekMs,
+      predkoscMps: w.wartosc.predkoscMps,
+      zrodlo: 'APP',
+    });
+
+    if (!zapisano) {
+      return c.json({ error: 'Wspolrzedne poza zakresem albo dokladne (0, 0).' }, 400);
+    }
+
+    // Serwer oddaje SWOJ budzet bledu, zeby aplikacja nie musiala go zgadywac
+    // ani powtarzac w swoim kodzie. Zmiana `LOKALIZACJA_MAKS_BLAD_M` w `.env`
+    // przestawia obie strony naraz.
+    //
+    // Aplikacja moze z tego wyliczyc wlasny odstep miedzy odczytami: przy
+    // predkosci `v` pozycja starzeje sie po `budzet / v` sekundach.
+    return c.json(
+      {
+        zapisano: true,
+        maksBladM: CFG.LOKALIZACJA_MAKS_BLAD_M,
+        zaporaS: CFG.LOKALIZACJA_ZAPORA_S,
+      },
+      201
+    );
+  });
 
   app.post('/api/v1/napiwek', async (c) => {
     const w = await czytajCialo(c, NapiwekSchema);

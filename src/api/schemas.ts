@@ -89,6 +89,42 @@ export const UsunSchema = z.object({
   data: dataWpisu,
 });
 
+/**
+ * Pozycja kuriera.
+ *
+ * `wiekMs` zamiast znacznika czasu — CELOWO. Wiek jest wielkoscia wzgledna,
+ * wiec nie ma w nim zegara telefonu, ktory moglby byc przestawiony. Znacznik
+ * czasu z klienta bylby drugim zrodlem prawdy obok serwera, a §8a mowi
+ * wyraznie, ze o czasie decyduje serwer.
+ *
+ * Zakresy sa tu twarde, bo to jedyne miejsce, gdzie da sie zatrzymac odczyt
+ * bez sensu. Dokladne (0, 0) odrzucamy osobno w `lokalizacja.rules.ts` —
+ * to Zatoka Gwinejska, w praktyce zawsze niezainicjowana struktura.
+ */
+export const LokalizacjaSchema = z.object({
+  lat: z
+    .number({ message: 'Pole "lat" musi byc liczba.' })
+    .refine(Number.isFinite, 'Pole "lat" musi byc skonczona liczba.')
+    .refine((v) => v >= -90 && v <= 90, 'Pole "lat" musi byc w zakresie -90..90.'),
+  lon: z
+    .number({ message: 'Pole "lon" musi byc liczba.' })
+    .refine(Number.isFinite, 'Pole "lon" musi byc skonczona liczba.')
+    .refine((v) => v >= -180 && v <= 180, 'Pole "lon" musi byc w zakresie -180..180.'),
+  /** Promien niepewnosci GPS w metrach, tak jak podaje go system. */
+  dokladnoscM: opcjonalna(liczbaNieujemna('dokladnoscM', 100_000)),
+  /** Ile ms uplynelo od zlapania pozycji do wyslania. Przycinane do 5 min. */
+  wiekMs: opcjonalna(liczbaNieujemna('wiekMs', 24 * 60 * 60 * 1000)),
+  /**
+   * Predkosc w metrach na sekunde w chwili odczytu.
+   *
+   * Od niej zalezy, jak dlugo pozycja jest cokolwiek warta — przy 100 km/h
+   * pozycja sprzed minuty jest o 1,7 km obok. Android potrafi zwrocic `-1`
+   * zamiast `null`, wiec ujemna wartosc traktujemy jak brak (w regułach,
+   * nie tutaj — schemat ma odrzucac, a nie naprawiac).
+   */
+  predkoscMps: opcjonalna(liczbaNieujemna('predkoscMps', 200)),
+});
+
 export type NapiwekBody = z.infer<typeof NapiwekSchema>;
 export type PaliwoBody = z.infer<typeof PaliwoSchema>;
 export type DystansBody = z.infer<typeof DystansSchema>;
@@ -111,3 +147,4 @@ export function pierwszyBlad(wynik: WynikWalidacji): string | null {
   if (wynik.success) return null;
   return wynik.error.issues[0]?.message ?? 'Nieprawidłowe dane.';
 }
+export type LokalizacjaBody = z.infer<typeof LokalizacjaSchema>;

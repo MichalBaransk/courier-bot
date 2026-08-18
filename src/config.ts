@@ -22,8 +22,38 @@ export const CFG = {
   /** Prog oplacalnosci kursu (zl netto / km calej trasy). */
   MIN_STAWKA_NETTO_KM: 2.0,
 
-  /** Waznosc lokalizacji GPS do weryfikacji tras (30 min). */
+  /**
+   * Waznosc pinezki przypietej RECZNIE w Telegramie (30 min).
+   *
+   * Szerokie okno jest tu uzasadnione: kurier wysyla pinezke swiadomie, tuz
+   * przed ocena oferty. Automatyczny odczyt z aplikacji ma wlasne, krotsze
+   * okno, liczone w metrach — patrz `LOKALIZACJA_MAKS_BLAD_M`.
+   */
   LOCATION_MAX_AGE_MS: 30 * 60 * 1000,
+
+  /**
+   * Ile metrow bledu wolno miec pozycji z aplikacji, zeby liczyc z niej dojazd.
+   *
+   * DLACZEGO METRY, A NIE SEKUNDY. Pierwsza wersja mowila „wazna 60 sekund".
+   * Przy 100 km/h (27,8 m/s) to 1,7 km bledu — reguła w sekundach nic o tym
+   * nie wie. Interesuje nas nie „ile minelo", tylko „jak daleko mogles
+   * odjechac", a to iloczyn predkosci i czasu.
+   *
+   * Reguła dostosowuje sie sama: pod swiatlami pozycja zyje minutami,
+   * przy 100 km/h okolo 11 sekund.
+   *
+   * `0` wylacza liczenie dojazdu z pozycji aplikacji bez wyjmowania kodu.
+   */
+  LOKALIZACJA_MAKS_BLAD_M: Number.parseInt(process.env.LOKALIZACJA_MAKS_BLAD_M ?? '300', 10) || 300,
+
+  /**
+   * Twarda zapora wieku pozycji (sekundy), niezalezna od predkosci.
+   *
+   * Bez niej telefon lezacy od godziny z predkoscia 0 uchodzilby za aktualny
+   * w nieskonczonosc. „Stoi" znaczy tylko tyle, ze nie ruszal sie W CHWILI
+   * ODCZYTU — od tamtej pory mogl przejechac pol miasta z wylaczonym GPS-em.
+   */
+  LOKALIZACJA_ZAPORA_S: Number.parseInt(process.env.LOKALIZACJA_ZAPORA_S ?? '300', 10) || 300,
   /** Od jakiej roznicy miedzy aplikacja a Google Maps ostrzegac (km). */
   DISTANCE_DIVERGENCE_KM: 1.5,
   /** Jak dlugo czeka potwierdzenie importu Portfela. */

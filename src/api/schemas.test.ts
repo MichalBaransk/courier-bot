@@ -3,6 +3,7 @@ import {
   BruttoSchema,
   CelSchema,
   DystansSchema,
+  LokalizacjaSchema,
   NapiwekSchema,
   PaliwoSchema,
   UsunSchema,
@@ -163,5 +164,73 @@ describe('UsunSchema', () => {
   it('odrzuca zakres spoza listy', () => {
     expect(UsunSchema.safeParse({ cel: 'WSZYSTKO' }).success).toBe(false);
     expect(UsunSchema.safeParse({}).success).toBe(false);
+  });
+});
+
+describe('LokalizacjaSchema', () => {
+  it('przyjmuje same współrzędne', () => {
+    const w = LokalizacjaSchema.safeParse({ lat: 50.2649, lon: 19.0238 });
+    expect(w.success).toBe(true);
+    if (w.success) {
+      expect(w.data.dokladnoscM).toBeNull();
+      expect(w.data.wiekMs).toBeNull();
+    }
+  });
+
+  it('przyjmuje dokładność, wiek i prędkość', () => {
+    const w = LokalizacjaSchema.safeParse({
+      lat: 50.2649,
+      lon: 19.0238,
+      dokladnoscM: 12,
+      wiekMs: 20_000,
+      predkoscMps: 27.8,
+    });
+    expect(w.success).toBe(true);
+    if (w.success) {
+      expect(w.data.wiekMs).toBe(20_000);
+      expect(w.data.predkoscMps).toBe(27.8);
+    }
+  });
+
+  it('prędkość jest opcjonalna — Android potrafi jej nie podać', () => {
+    const w = LokalizacjaSchema.safeParse({ lat: 50.2649, lon: 19.0238 });
+    expect(w.success).toBe(true);
+    if (w.success) expect(w.data.predkoscMps).toBeNull();
+  });
+
+  it('odrzuca prędkość ujemną i absurdalną', () => {
+    // Android zwraca -1 zamiast null. Schemat ma to ODRZUCIĆ, a nie naprawiać —
+    // klient wyśle wtedy `null` i warstwa reguł podstawi założenie ostrożne.
+    expect(LokalizacjaSchema.safeParse({ lat: 50, lon: 19, predkoscMps: -1 }).success).toBe(false);
+    expect(LokalizacjaSchema.safeParse({ lat: 50, lon: 19, predkoscMps: 500 }).success).toBe(false);
+  });
+
+  it('odrzuca współrzędne spoza mapy', () => {
+    expect(LokalizacjaSchema.safeParse({ lat: 91, lon: 19 }).success).toBe(false);
+    expect(LokalizacjaSchema.safeParse({ lat: 50, lon: -181 }).success).toBe(false);
+  });
+
+  it('odrzuca brak którejkolwiek współrzędnej', () => {
+    expect(LokalizacjaSchema.safeParse({ lat: 50.26 }).success).toBe(false);
+    expect(LokalizacjaSchema.safeParse({}).success).toBe(false);
+  });
+
+  it('odrzuca współrzędne przysłane jako tekst', () => {
+    // Telefon potrafi wysłać "50.2649" zamiast liczby — po cichu
+    // zinterpretowane dałoby pozycję, która wygląda dobrze i jest zmyślona.
+    expect(LokalizacjaSchema.safeParse({ lat: '50.2649', lon: '19.0238' }).success).toBe(false);
+  });
+
+  it('odrzuca ujemny wiek odczytu', () => {
+    expect(
+      LokalizacjaSchema.safeParse({ lat: 50.26, lon: 19.02, wiekMs: -1 }).success
+    ).toBe(false);
+  });
+
+  // Zero na zero przechodzi przez schemat, a odrzuca je dopiero
+  // `czyPoprawneWspolrzedne` — bo ta sama kontrola musi obowiązywać także
+  // pinezkę z Telegrama, która przez ten schemat nigdy nie przechodzi.
+  it('(0, 0) przechodzi przez schemat — łapie je dopiero warstwa reguł', () => {
+    expect(LokalizacjaSchema.safeParse({ lat: 0, lon: 0 }).success).toBe(true);
   });
 });

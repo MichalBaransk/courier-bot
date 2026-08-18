@@ -257,3 +257,43 @@ export const apiIdempotency = pgTable(
     apiIdempotencyCreatedAtIdx: index('api_idempotency_created_at_idx').on(table.createdAt),
   })
 );
+
+/**
+ * Ostatnia znana pozycja kuriera — JEDEN WIERSZ NA UZYTKOWNIKA.
+ *
+ * Dlaczego w bazie, a nie w pamieci procesu: `lastCourierLocation` w
+ * `bot/index.ts` to zwykla `Map`, ktora ginie przy restarcie (10e). Oferta
+ * potrafi przyjsc minute po `docker compose up -d --build bot`, a wtedy bot
+ * nie ma pozycji i liczy dojazd od niczego.
+ *
+ * Dlaczego bez historii: do naprawy 8f wystarczy „gdzie jestes TERAZ".
+ * Historia przejazdu to osobny temat (liczenie realnego dystansu zamiast
+ * wpisywania go recznie) i osobna decyzja — przy odczycie co 20 s to setki
+ * wierszy dziennie i wlasny problem czyszczenia.
+ *
+ * `recorded_at` to moment ZLAPANIA pozycji, nie moment zapisu. Roznica ma
+ * znaczenie przy kolejce offline, gdzie odczyt lezy kilkadziesiat sekund
+ * zanim dojdzie. Telefon przysyla WIEK odczytu, a nie znacznik czasu —
+ * wiek jest wielkoscia wzgledna, wiec nie ma w nim zegara, ktory moglby byc
+ * przestawiony (8a).
+ */
+export const courierLocations = pgTable('courier_locations', {
+  telegramId: text('telegram_id')
+    .primaryKey()
+    .references(() => users.telegramId, { onDelete: 'cascade' }),
+  latitude: numeric('latitude', { precision: 9, scale: 6 }).notNull(),
+  longitude: numeric('longitude', { precision: 9, scale: 6 }).notNull(),
+  /** Promien niepewnosci w metrach, tak jak podaje go GPS. `null` = nie podano. */
+  accuracyM: integer('accuracy_m'),
+  /**
+   * Predkosc w metrach na sekunde w chwili odczytu. `null` = GPS nie podal.
+   *
+   * To NIE jest ciekawostka — od niej zalezy, jak dlugo pozycja jest cokolwiek
+   * warta. Przy 100 km/h pozycja sprzed minuty jest o 1,7 km obok.
+   */
+  speedMps: numeric('speed_mps', { precision: 6, scale: 2 }),
+  /** `APP` (automat z telefonu) albo `TELEGRAM` (przypieta pinezka). */
+  source: text('source').default('APP').notNull(),
+  recordedAt: timestamp('recorded_at').notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
