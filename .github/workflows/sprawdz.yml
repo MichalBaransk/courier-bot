@@ -46,13 +46,34 @@ jobs:
           node-version: '22'
           cache: npm
 
-      # `npm ci` zamiast `npm install` — instaluje DOKŁADNIE to, co w
-      # `package-lock.json`, więc przebieg jest powtarzalny.
+      # `npm install`, NIE `npm ci` — decyzja świadoma, nie niedopatrzenie.
       #
-      # Uwaga: to nie jest sprzeczne z §12d. Tamten problem dotyczył Alpine
-      # w kontenerze (podpakiety esbuild); tutaj biegniemy na Ubuntu.
-      # Gdyby `npm ci` jednak padł, znaczy to, że lockfile rozjechał się
-      # z `package.json` — i wtedy naprawiamy lockfile, nie ten plik.
-      - run: npm ci
+      # `npm ci` byłby tu właściwszy, bo instaluje dokładnie to, co w locku.
+      # Ale ten stos ma z lockfile'ami trwały kłopot: esbuild ciągnie 27
+      # pakietów platformowych jako zależności OPCJONALNE, a npm od 11.6.2
+      # zapisuje je w locku inaczej niż wersje wcześniejsze (npm/cli#8805).
+      # Lokalnie stoi npm 11.17.0, a runner bierze npm-a dołączonego do
+      # Node 22 — lock napisany przez jeden bywa nieczytelny dla drugiego.
+      #
+      # Dwie próby naprawy dały dwa RÓŻNE błędy, co samo w sobie jest
+      # diagnozą (rozjazd wersji, nie zepsuty lock):
+      #   1. `Missing: esbuild@0.28.2 from lock file` — lock ich nie miał,
+      #   2. po przebudowie locka: `EBADPLATFORM: @esbuild/aix-ppc64` — czyli
+      #      esbuild na IBM AIX/PowerPC, którego na Linuksie zainstalować
+      #      się nie da i nie trzeba, a npm na runnerze uznał go za wymagany.
+      #
+      # `npm install` rozwiązuje zależności od nowa i pakiety nie na tę
+      # platformę zwyczajnie pomija.
+      #
+      # CO PRZEZ TO TRACIMY, wprost: CI nie sprawdza już dokładnie tych wersji
+      # pakietów, które masz u siebie — w ramach zakresów `^` może wziąć
+      # nowsze. Przy tym projekcie strata jest umiarkowana, bo testy sprawdzają
+      # NASZ kod, nie cudze biblioteki. Ten sam kompromis stoi w Dockerfile
+      # i z tego samego powodu (§12d).
+      #
+      # Gdyby kiedyś wrócić do `npm ci`: trzeba wymusić po obu stronach tę samą
+      # wersję npm-a (`npm install -g npm@<wersja>` przed instalacją), a nie
+      # liczyć na to, że przypadkiem się zgodzą.
+      - run: npm install --no-audit --no-fund
 
       - run: npm run sprawdz
