@@ -1,0 +1,58 @@
+# Kontrola jakości przy każdym pushu — bot.
+#
+# DLACZEGO TO ISTNIEJE.
+#
+# `tsx` nie sprawdza typów (§6d). Dockerfile odpala `npx tsx src/index.ts`,
+# co tylko wycina adnotacje — błąd typu nie wyjdzie ani przy budowaniu obrazu,
+# ani w runtime, dopóki nie trafi się na tę jedną linię. Jedynym miejscem,
+# które te typy sprawdza, jest `npm run typecheck`, uruchamiany ręcznie.
+#
+# Do tej pory pilnowała tego wyłącznie pamięć człowieka. Teraz pilnuje tego
+# GitHub, na każdym pushu, niezależnie od tego, z jakiego komputera poszedł.
+#
+# Komenda jest CELOWO ta sama, którą uruchamiasz u siebie (`npm run sprawdz`
+# = `typecheck && test`). Gdyby CI odpalało coś innego, „u mnie działa"
+# przestałoby cokolwiek znaczyć.
+
+name: sprawdz
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Pozwala odpalić ręcznie z zakładki Actions — przydatne, gdy chcesz
+  # potwierdzić stan repo bez robienia pustego commita.
+  workflow_dispatch:
+
+# Nowy push na tę samą gałąź anuluje poprzedni, jeszcze trwający przebieg.
+# Bez tego trzy pushe pod rząd zajmują trzy razy tyle minut, a interesuje
+# nas i tak tylko wynik ostatniego.
+concurrency:
+  group: sprawdz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sprawdz:
+    name: typy i testy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Ta sama wersja co w Dockerfile. Rozjazd tutaj oznaczałby, że CI
+          # sprawdza inny runtime niż ten, który faktycznie uruchamia bota.
+          node-version: '22'
+          cache: npm
+
+      # `npm ci` zamiast `npm install` — instaluje DOKŁADNIE to, co w
+      # `package-lock.json`, więc przebieg jest powtarzalny.
+      #
+      # Uwaga: to nie jest sprzeczne z §12d. Tamten problem dotyczył Alpine
+      # w kontenerze (podpakiety esbuild); tutaj biegniemy na Ubuntu.
+      # Gdyby `npm ci` jednak padł, znaczy to, że lockfile rozjechał się
+      # z `package.json` — i wtedy naprawiamy lockfile, nie ten plik.
+      - run: npm ci
+
+      - run: npm run sprawdz

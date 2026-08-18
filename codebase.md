@@ -1,6 +1,6 @@
 # GlovoBot — kod źródłowy
 
-Plików: 55 · linii: 8495
+Plików: 55 · linii: 8879
 
 ## Struktura
 
@@ -1648,9 +1648,31 @@ export function targetCard(progress: TargetProgress): string {
     `📊 ${b('Wymagane tempo:')}`,
     ` • Dziennie: ${b(`${progress.dailyRequiredNetto.toFixed(2)} zł netto / dzień`)}`,
     ` • Czas pracy: ${b(`~${progress.estimatedHoursRemaining.toFixed(1)} h`)} (${progress.hoursPerDayRequired.toFixed(1)} h / dzień)`,
-    progress.usedFallbackRate &&
-      i(`Prognoza godzin liczona stawką zastępczą ${CFG.FALLBACK_HOURLY_RATE_NETTO.toFixed(2)} zł/h — brak własnej historii.`),
+    rateNote(progress),
   ]);
+}
+
+/**
+ * Skąd wzięła się stawka użyta do prognozy godzin.
+ *
+ * Przy `PERIOD` nie piszemy nic — to stan normalny i linijka byłaby szumem.
+ * Pozostałe dwa stany trzeba nazwać, bo prognoza opiera się wtedy na czymś
+ * innym, niż użytkownik zakłada, patrząc na kartę tygodnia.
+ */
+function rateNote(progress: TargetProgress): string | false {
+  if (progress.rateSource === 'ROLLING_30D') {
+    return i(
+      `Prognoza godzin liczona stawką ${progress.avgHourlyRate.toFixed(2)} zł/h ` +
+        `— średnią z ostatnich 30 dni, bo w tym okresie nie ma jeszcze godzin.`
+    );
+  }
+  if (progress.rateSource === 'FALLBACK') {
+    return i(
+      `Prognoza godzin liczona stawką zastępczą ${CFG.FALLBACK_HOURLY_RATE_NETTO.toFixed(2)} zł/h ` +
+        `— brak własnej historii z ostatnich 30 dni.`
+    );
+  }
+  return false;
 }
 
 export function startShiftCard(summary: DailySummary, balance: number, currentTime: string): string {
@@ -1706,6 +1728,13 @@ export function offerStatsCard(stats: CourseOfferStats): string {
     `📈 ${b('Średnia z ofert:')} ${rate(stats.avgNetRatePerKm)} ${i('— jakie oferty przychodzą')}`,
     `⚖️ ${b('Średnia ważona:')} ${rate(stats.weightedNetRatePerKm)} ${i('— ile realnie wychodzi na km')}`,
     `🥇 ${b('Najlepsza:')} ${rate(stats.bestNetRate)}  |  🥉 ${b('Najgorsza:')} ${rate(stats.worstNetRate)}`,
+    // Bez tej linijki różnica „sprawdzonych 7, a średnia z 5" jest niewidoczna
+    // i wygląda jak błąd liczenia.
+    stats.ratedOffers < stats.totalOffers &&
+      i(
+        `Stawki liczone z ${stats.ratedOffers} z ${stats.totalOffers} ofert — ` +
+          `reszta nie miała dystansu (brak adresu klienta na ekranie oferty).`
+      ),
     '',
     `🛣️ ${b('Łączny dystans ofert:')} ${b(km(stats.totalDistanceKm))}`,
     `💰 ${b('Suma stawek brutto:')} ${b(zl(stats.totalGross))}`,
@@ -4362,6 +4391,7 @@ import { describe, expect, it } from 'vitest';
 import {
   computeDailyTotals,
   computeOfferRate,
+  computeOfferStats,
   partitionNewTransactions,
   sumWalletPayouts,
   walletBalanceFrom,
@@ -4509,6 +4539,114 @@ describe('computeOfferRate (FIX 2.3)', () => {
 
   it('kurs poniżej progu jest odrzucany', () => {
     expect(computeOfferRate({ grossAmount: 10, totalKm: 8 }).isProfitable).toBe(false);
+  });
+});
+
+/**
+ * Statystyki ofert.
+ *
+ * Sedno tych testów to jedna oferta bez dystansu. Realny przypadek z §8f:
+ * ekran oferty nie pokazuje adresu klienta, `isSpecificAddress()` odmawia
+ * geokodowania, `rateBasis` kończy jako `'NONE'`, a `netRatePerKm` wynosi 0.
+ * Zero nie znaczy „kurs za darmo", tylko „nie ma z czego liczyć" — i właśnie
+ * ta różnica ginęła w średniej.
+ */
+
+const oferta = (over: Partial<Parameters<typeof computeOfferStats>[0][number]> = {}) => ({
+  isProfitable: true,
+  status: 'PENDING',
+  netRatePerKm: 3,
+  grossAmount: 24.57,
+  netAmount: 20,
+  distanceTotalKm: 6.67,
+  ...over,
+});
+
+describe('computeOfferStats', () => {
+  it('brak ofert nie daje NaN, tylko null', () => {
+    const s = computeOfferStats([]);
+    expect(s.totalOffers).toBe(0);
+    expect(s.ratedOffers).toBe(0);
+    expect(s.avgNetRatePerKm).toBeNull();
+    expect(s.weightedNetRatePerKm).toBeNull();
+    expect(s.bestNetRate).toBeNull();
+    expect(s.worstNetRate).toBeNull();
+  });
+
+  it('oferta bez dystansu NIE zaniża średniej ani nie zostaje „najgorszą"', () => {
+    const s = computeOfferStats([
+      oferta({ netRatePerKm: 3, distanceTotalKm: 6 }),
+      oferta({ netRatePerKm: 2, distanceTotalKm: 10 }),
+      oferta({ netRatePerKm: 0, distanceTotalKm: 0, isProfitable: false }),
+    ]);
+
+    // Średnia z DWÓCH, nie z trzech: (3 + 2) / 2.
+    expect(s.avgNetRatePerKm).toBe(2.5);
+    expect(s.worstNetRate).toBe(2);
+    expect(s.bestNetRate).toBe(3);
+    expect(s.ratedOffers).toBe(2);
+  });
+
+  it('ale ta oferta nadal się liczy — była sprawdzona i ma prawdziwą kwotę', () => {
+    const s = computeOfferStats([
+      oferta({ grossAmount: 10, netAmount: 8.14, distanceTotalKm: 4 }),
+      oferta({ grossAmount: 22.04, netAmount: 17.94, distanceTotalKm: 0, netRatePerKm: 0, isProfitable: false }),
+    ]);
+
+    expect(s.totalOffers).toBe(2);
+    expect(s.ratedOffers).toBe(1);
+    expect(s.totalGross).toBe(32.04);
+    expect(s.unprofitable).toBe(1);
+  });
+
+  it('ujemna stawka nie jest „najlepszą" — sentinel 999 dawał tu bzdury (FIX 5.5)', () => {
+    const s = computeOfferStats([
+      oferta({ netRatePerKm: -1, distanceTotalKm: 5 }),
+      oferta({ netRatePerKm: 1200, distanceTotalKm: 0.01 }),
+    ]);
+
+    // Ujemna wypada razem z zerem: `netRatePerKm > 0` odsiewa oba.
+    expect(s.ratedOffers).toBe(1);
+    expect(s.bestNetRate).toBe(1200);
+    expect(s.worstNetRate).toBe(1200);
+  });
+
+  it('średnia ważona to co innego niż arytmetyczna', () => {
+    const s = computeOfferStats([
+      oferta({ netAmount: 10, distanceTotalKm: 2, netRatePerKm: 5 }),
+      oferta({ netAmount: 10, distanceTotalKm: 10, netRatePerKm: 1 }),
+    ]);
+
+    // Arytmetyczna: (5 + 1) / 2 = 3 — „jakie oferty przychodzą".
+    expect(s.avgNetRatePerKm).toBe(3);
+    // Ważona: 20 zł / 12 km = 1,67 — „ile realnie wychodzi na km".
+    expect(s.weightedNetRatePerKm).toBe(1.67);
+  });
+
+  it('statusy: wszystko, co nie jest ACCEPTED ani REJECTED, jest „bez decyzji"', () => {
+    const s = computeOfferStats([
+      oferta({ status: 'ACCEPTED' }),
+      oferta({ status: 'REJECTED' }),
+      oferta({ status: 'PENDING' }),
+      oferta({ status: 'COS_NOWEGO' }),
+    ]);
+
+    expect(s.accepted).toBe(1);
+    expect(s.rejected).toBe(1);
+    expect(s.pending).toBe(2);
+  });
+
+  it('daje te same liczby co `policzOferty` w aplikacji — to był cel tej zmiany', () => {
+    // Ten sam zestaw danych po obu stronach musi dawać ten sam wynik,
+    // inaczej `/statystyki` i zakładka Oferty znowu się rozjadą.
+    const s = computeOfferStats([
+      oferta({ netRatePerKm: 2.81, distanceTotalKm: 6.38, netAmount: 17.94, grossAmount: 22.04 }),
+      oferta({ netRatePerKm: 0, distanceTotalKm: 0, netAmount: 8.14, grossAmount: 10, isProfitable: false }),
+    ]);
+
+    expect(s.avgNetRatePerKm).toBe(2.81);
+    expect(s.ratedOffers).toBe(1);
+    expect(s.totalOffers).toBe(2);
   });
 });
 ```
@@ -4666,6 +4804,105 @@ export function computeOfferRate(input: OfferRateInput): OfferRate {
     isProfitable: input.totalKm > 0 && netRatePerKm >= CFG.MIN_STAWKA_NETTO_KM,
   };
 }
+
+export interface OfferStatsInput {
+  isProfitable: boolean;
+  status: string;
+  netRatePerKm: number;
+  grossAmount: number;
+  netAmount: number;
+  distanceTotalKm: number;
+}
+
+export interface OfferStats {
+  totalOffers: number;
+  profitable: number;
+  unprofitable: number;
+  accepted: number;
+  rejected: number;
+  pending: number;
+  /** Ile ofert weszlo do sredniej i do skrajnych wartosci. */
+  ratedOffers: number;
+  avgNetRatePerKm: number | null;
+  weightedNetRatePerKm: number | null;
+  bestNetRate: number | null;
+  worstNetRate: number | null;
+  totalGross: number;
+  totalNet: number;
+  totalDistanceKm: number;
+}
+
+/**
+ * Statystyki ofert z jednego dnia.
+ *
+ * OFERTY BEZ DYSTANSU SA POMIJANE w sredniej i w skrajnych wartosciach.
+ *
+ * Powod jest ten sam co w 8f: gdy ekran oferty nie pokazuje adresu klienta,
+ * `isSpecificAddress()` slusznie odmawia geokodowania, `rateBasis` konczy jako
+ * `'NONE'`, a `netRatePerKm` wynosi 0 — nie dlatego, ze kurs byl darmowy, tylko
+ * dlatego, ze nie ma z czego liczyc. Wliczenie takiego zera ustawialo
+ * "najgorsza stawke" na 0,00 zl/km i cicho zanizalo srednia.
+ *
+ * Do LICZNIKOW i do SUM te oferty nadal wchodza — zostaly sprawdzone, a ich
+ * kwota brutto jest prawdziwa. `ratedOffers` mowi, ile z nich mialo dystans,
+ * zeby roznica miedzy "sprawdzonych 7" a "srednia z 5" nie byla niewidoczna.
+ *
+ * Ta funkcja jest odpowiednikiem `policzOferty` z aplikacji mobilnej
+ * (`src/statystykiOfert.ts`). Obie musza dawac te same liczby — wczesniej
+ * dawaly rozne i to byl blad serwera, nie aplikacji.
+ */
+export function computeOfferStats(offers: readonly OfferStatsInput[]): OfferStats {
+  let profitable = 0;
+  let accepted = 0;
+  let rejected = 0;
+  let pending = 0;
+  let sumRates = 0;
+  let ratedOffers = 0;
+  let totalGross = 0;
+  let totalNet = 0;
+  let totalDistanceKm = 0;
+
+  // FIX (5.5): zamiast sentinela 999 uzywamy null — przy stawce > 999 zl/km
+  // albo ujemnej stary kod pokazywal bzdury.
+  let bestNetRate: number | null = null;
+  let worstNetRate: number | null = null;
+
+  for (const o of offers) {
+    if (o.isProfitable) profitable++;
+    if (o.status === 'ACCEPTED') accepted++;
+    else if (o.status === 'REJECTED') rejected++;
+    else pending++;
+
+    totalGross += o.grossAmount;
+    totalNet += o.netAmount;
+    totalDistanceKm += o.distanceTotalKm;
+
+    if (o.distanceTotalKm > 0 && o.netRatePerKm > 0) {
+      sumRates += o.netRatePerKm;
+      ratedOffers++;
+      if (bestNetRate === null || o.netRatePerKm > bestNetRate) bestNetRate = o.netRatePerKm;
+      if (worstNetRate === null || o.netRatePerKm < worstNetRate) worstNetRate = o.netRatePerKm;
+    }
+  }
+
+  return {
+    totalOffers: offers.length,
+    profitable,
+    unprofitable: offers.length - profitable,
+    accepted,
+    rejected,
+    pending,
+    ratedOffers,
+    // FIX (5.4): dwie rozne metryki, obie pokazywane w /statystyki.
+    avgNetRatePerKm: ratedOffers > 0 ? round2(sumRates / ratedOffers) : null,
+    weightedNetRatePerKm: totalDistanceKm > 0 ? round2(totalNet / totalDistanceKm) : null,
+    bestNetRate,
+    worstNetRate,
+    totalGross: round2(totalGross),
+    totalNet: round2(totalNet),
+    totalDistanceKm: Math.round(totalDistanceKm * 10) / 10,
+  };
+}
 ```
 
 # Plik: src/services/finance.service.ts
@@ -4698,6 +4935,7 @@ import {
 } from '../utils/datetime.js';
 import {
   computeDailyTotals,
+  computeOfferStats,
   partitionNewTransactions,
   round2,
   sumWalletPayouts,
@@ -4748,6 +4986,14 @@ export interface TargetProgress {
   daysRemaining: number;
   dailyRequiredNetto: number;
   avgHourlyRate: number;
+  /**
+   * Skad wzieta jest stawka uzyta do prognozy godzin:
+   * - `PERIOD` — z tego samego okresu, ktorego dotyczy cel,
+   * - `ROLLING_30D` — srednia z ostatnich 30 dni (okres jeszcze pusty),
+   * - `FALLBACK` — stala `CFG.FALLBACK_HOURLY_RATE_NETTO`, czyli zgadywanka.
+   */
+  rateSource: 'PERIOD' | 'ROLLING_30D' | 'FALLBACK';
+  /** Zostawione dla zgodnosci ze starszymi wersjami aplikacji: `rateSource === 'FALLBACK'`. */
   usedFallbackRate: boolean;
   estimatedHoursRemaining: number;
   hoursPerDayRequired: number;
@@ -4762,6 +5008,12 @@ export interface CourseOfferStats {
   accepted: number;
   rejected: number;
   pending: number;
+  /**
+   * Ile ofert weszlo do sredniej i do skrajnych wartosci. Mniej niz
+   * `totalOffers` znaczy, ze czesc ofert nie miala dystansu (`rateBasis:
+   * 'NONE'`) — patrz `computeOfferStats`.
+   */
+  ratedOffers: number;
   /** Srednia arytmetyczna stawek pojedynczych ofert - "jakie oferty przychodza". */
   avgNetRatePerKm: number | null;
   /** Suma netto / suma km - "ile realnie wychodzi na kilometr". */
@@ -5547,51 +5799,35 @@ export class FinanceService {
       .from(courseOffers)
       .where(and(eq(courseOffers.telegramId, tId), eq(courseOffers.date, date)));
 
-    let profitable = 0;
-    let accepted = 0;
-    let rejected = 0;
-    let pending = 0;
-    let sumRates = 0;
-    let totalGross = 0;
-    let totalNet = 0;
-    let totalDistanceKm = 0;
-
-    // FIX (5.5): zamiast sentinela 999 uzywamy null - przy stawce > 999 zl/km
-    // albo ujemnej stary kod pokazywal bzdury.
-    let bestNetRate: number | null = null;
-    let worstNetRate: number | null = null;
-
-    for (const o of offers) {
-      if (o.isProfitable) profitable++;
-      if (o.status === 'ACCEPTED') accepted++;
-      else if (o.status === 'REJECTED') rejected++;
-      else pending++;
-
-      const rate = parseFloat(o.netRatePerKm);
-      sumRates += rate;
-      if (bestNetRate === null || rate > bestNetRate) bestNetRate = rate;
-      if (worstNetRate === null || rate < worstNetRate) worstNetRate = rate;
-
-      totalGross += parseFloat(o.grossAmount);
-      totalNet += parseFloat(o.netAmount);
-      totalDistanceKm += parseFloat(o.distanceTotalKm);
-    }
+    // Cala arytmetyka siedzi w `finance.calc.ts` — bez zaleznosci od bazy, wiec
+    // pod testem. Tutaj zostaje wylacznie parsowanie: `numeric` z Postgresa
+    // wraca jako string (9b).
+    const stats = computeOfferStats(
+      offers.map((o) => ({
+        isProfitable: o.isProfitable,
+        status: o.status,
+        netRatePerKm: parseFloat(o.netRatePerKm),
+        grossAmount: parseFloat(o.grossAmount),
+        netAmount: parseFloat(o.netAmount),
+        distanceTotalKm: parseFloat(o.distanceTotalKm),
+      }))
+    );
 
     return {
       date,
-      totalOffers: offers.length,
-      profitable,
-      unprofitable: offers.length - profitable,
-      accepted,
-      rejected,
-      pending,
-      // FIX (5.4): dwie rozne metryki, obie pokazywane w /statystyki.
-      avgNetRatePerKm: offers.length > 0 ? round2(sumRates / offers.length) : null,
-      weightedNetRatePerKm: totalDistanceKm > 0 ? round2(totalNet / totalDistanceKm) : null,
-      bestNetRate,
-      worstNetRate,
-      totalGross: round2(totalGross),
-      totalDistanceKm: Math.round(totalDistanceKm * 10) / 10,
+      totalOffers: stats.totalOffers,
+      profitable: stats.profitable,
+      unprofitable: stats.unprofitable,
+      accepted: stats.accepted,
+      rejected: stats.rejected,
+      pending: stats.pending,
+      ratedOffers: stats.ratedOffers,
+      avgNetRatePerKm: stats.avgNetRatePerKm,
+      weightedNetRatePerKm: stats.weightedNetRatePerKm,
+      bestNetRate: stats.bestNetRate,
+      worstNetRate: stats.worstNetRate,
+      totalGross: stats.totalGross,
+      totalDistanceKm: stats.totalDistanceKm,
     };
   }
 
@@ -5811,8 +6047,32 @@ export class FinanceService {
     const remainingNetto = round2(targetAmount - currentNetto);
     const progressPercent = targetAmount > 0 ? Math.round((currentNetto / targetAmount) * 1000) / 10 : 0;
 
-    const usedFallbackRate = summary.avgHourlyRateNetto <= 0;
-    const avgHourlyRate = usedFallbackRate ? CFG.FALLBACK_HOURLY_RATE_NETTO : summary.avgHourlyRateNetto;
+    // Stawka do prognozy godzin — trzy zrodla, od najlepszego do najgorszego.
+    //
+    // Sam okres celu jest pierwszym wyborem, ale w poniedzialek rano cel
+    // tygodniowy ma zero przejechanych godzin, a 1. dnia miesiaca to samo
+    // dotyczy celu miesiecznego. Stary kod szedl wtedy od razu na stala 35 zl/h
+    // — liczbe z konfiguracji, nie z zycia — i pokazywal ja jako prognoze,
+    // mimo ze wlasna historia kuriera lezala w bazie tuz obok.
+    //
+    // Aplikacja mobilna od poczatku liczyla srednia z 30 dni. Roznica byla
+    // widoczna: to samo "ile godzin zostalo" mialo dwie wartosci zaleznie od
+    // tego, gdzie sie patrzylo. To jest wyrownanie serwera do aplikacji.
+    let avgHourlyRate = summary.avgHourlyRateNetto;
+    let rateSource: TargetProgress['rateSource'] = 'PERIOD';
+
+    if (avgHourlyRate <= 0) {
+      const window30d = await this.getPeriodSummary(tId, addDays(today, -29), today);
+      if (window30d.avgHourlyRateNetto > 0) {
+        avgHourlyRate = window30d.avgHourlyRateNetto;
+        rateSource = 'ROLLING_30D';
+      } else {
+        avgHourlyRate = CFG.FALLBACK_HOURLY_RATE_NETTO;
+        rateSource = 'FALLBACK';
+      }
+    }
+
+    const usedFallbackRate = rateSource === 'FALLBACK';
 
     const estimatedHoursRemaining = remainingNetto > 0 ? Math.round((remainingNetto / avgHourlyRate) * 10) / 10 : 0;
 
@@ -5825,6 +6085,7 @@ export class FinanceService {
       daysRemaining,
       dailyRequiredNetto: remainingNetto > 0 ? round2(remainingNetto / daysRemaining) : 0,
       avgHourlyRate,
+      rateSource,
       usedFallbackRate,
       estimatedHoursRemaining,
       hoursPerDayRequired: estimatedHoursRemaining > 0 ? Math.round((estimatedHoursRemaining / daysRemaining) * 10) / 10 : 0,
@@ -6910,12 +7171,25 @@ describe('progressBar', () => {
     expect(progressBar(-20)).toBe('[░░░░░░░░░░]');
   });
 
-  // ZNANY DEFEKT, NIEPOPRAWIONY: `progressBar(NaN)` zwraca `[]` — pusty tekst
-  // zamiast paska. `Math.round(NaN)` to `NaN`, `Math.max/min` przepuszczaja
-  // `NaN` dalej, a `'█'.repeat(NaN)` daje pusty lancuch. Poprawka to jedna
-  // linia (`Number.isFinite(percent) ? percent : 0`), ale to zmiana bazowego
-  // kodu i czeka na zgode. Celowo NIE zapisuje tu obecnego zachowania jako
-  // oczekiwanego — test utrwalajacy blad jest gorszy niz brak testu.
+  it('NaN i nieskonczonosc rysuja pusty pasek, a nie pusty tekst', () => {
+    // Bylo: `[]` — sam nawias, bo `'█'.repeat(NaN)` zwraca pusty lancuch.
+    // Cel 0 zl daje `0/0`, czyli `NaN`, wiec to nie byl przypadek teoretyczny.
+    expect(progressBar(NaN)).toBe('[░░░░░░░░░░]');
+    expect(progressBar(Infinity)).toBe('[░░░░░░░░░░]');
+    expect(progressBar(-Infinity)).toBe('[░░░░░░░░░░]');
+  });
+
+  it('pasek ma zawsze tyle samo znakow, cokolwiek dostanie', () => {
+    // Wlasciwa gwarancja: karta nie rozjedzie sie w pionie.
+    for (const v of [0, 37.5, 100, 140, -20, NaN, Infinity]) {
+      expect(progressBar(v)).toHaveLength(12);
+    }
+  });
+
+  it('inna liczba blokow tez dziala', () => {
+    expect(progressBar(50, 4)).toBe('[██░░]');
+    expect(progressBar(NaN, 4)).toBe('[░░░░]');
+  });
 });
 ```
 
@@ -6963,8 +7237,20 @@ export function joinLines(lines: Array<string | false | null | undefined>): stri
   return compact(lines).join('\n');
 }
 
+/**
+ * Pasek postepu.
+ *
+ * `NaN` i nieskonczonosc traktujemy jak zero. Bez tego `Math.round(NaN)` daje
+ * `NaN`, `Math.max`/`Math.min` przepuszczaja go dalej, a `'█'.repeat(NaN)`
+ * zwraca pusty lancuch — cala karta celu pokazywala wtedy samo `[]` zamiast
+ * paska, bez zadnego bledu w logach.
+ *
+ * To nie jest przypadek teoretyczny: `progressPercent` liczy sie jako
+ * `currentNetto / targetAmount`, a cel 0 zl daje `0/0`, czyli `NaN`.
+ */
 export function progressBar(percent: number, totalBlocks = 10): string {
-  const filled = Math.min(totalBlocks, Math.max(0, Math.round((percent / 100) * totalBlocks)));
+  const safePercent = Number.isFinite(percent) ? percent : 0;
+  const filled = Math.min(totalBlocks, Math.max(0, Math.round((safePercent / 100) * totalBlocks)));
   return `[${'█'.repeat(filled)}${'░'.repeat(totalBlocks - filled)}]`;
 }
 
@@ -7580,12 +7866,43 @@ WEEKLY_CRON="${BACKUP_SEND_CRON:-0 4 * * 0}"   # niedziela 04:00 — wysylka na 
 
 # Crond nie dziedziczy srodowiska kontenera, wiec zrzucamy je do pliku
 # i ladujemy w kazdym zadaniu.
-env | grep -E '^(POSTGRES_|PG|BACKUP_|BOT_TOKEN)' | sed 's/^/export /' > /etc/backup.env
+#
+# ⚠️ WARTOSCI MUSZA BYC W APOSTROFACH. Poprzednia wersja robila zwykle
+# `sed 's/^/export /'`, przez co `BACKUP_CRON=30 3 * * *` stawalo sie linia
+# `export BACKUP_CRON=30 3 * * *`. Powloka czytala to jako „wyeksportuj
+# BACKUP_CRON, a potem zmienne o nazwach 3, *, *, *" i wywalala sie na
+# `export: 3: bad variable name`. Efekt: `. /etc/backup.env && backup.sh`
+# przerywalo sie na pierwszym czlonie, `&&` zwieralo, a zrzut Z CRONA NIGDY
+# SIE NIE WYKONYWAL. Zrzut startowy dzialal, bo `entrypoint.sh` wola
+# `backup.sh` wprost, ze srodowiskiem kontenera, bez zrodlowania tego pliku.
+#
+# Dlatego wartosc idzie w apostrofy, a apostrof w srodku jest escapowany
+# wzorem '\'' — dziala tez dla hasel ze spacja, dolarem i cudzyslowem.
+env | grep -E '^(POSTGRES_|PG|BACKUP_|BOT_TOKEN)' | while IFS='=' read -r NAZWA WARTOSC; do
+  printf "export %s='%s'\n" "$NAZWA" "$(printf '%s' "$WARTOSC" | sed "s/'/'\\\\''/g")"
+done > /etc/backup.env
 chmod 600 /etc/backup.env
 
+# Blad w tym pliku zabija WYLACZNIE zadania crona i robi to po cichu — przez
+# ponad dobe nikt sie nie zorientowal. Lepiej nie wstac wcale niz udawac,
+# ze backup dziala.
+if ! sh -c '. /etc/backup.env' 2>/dev/null; then
+  echo "[backup] BLAD KRYTYCZNY: /etc/backup.env nie daje sie zrodlowac."
+  echo "[backup] Zadania crona nie mialyby szans sie wykonac. Przerywam."
+  sh -c '. /etc/backup.env' || true
+  exit 1
+fi
+
+# Klamry wokol CALEGO polecenia, nie tylko wokol `backup.sh`.
+#
+# Bez nich przekierowanie na `/proc/1/fd/1` obejmowalo wylacznie `backup.sh`,
+# wiec blad zrodlowania `/etc/backup.env` szedl na stderr crond-a — a ten,
+# uruchomiony bez `-L`, loguje do sysloga, ktory w kontenerze prowadzi
+# donikad. Awaria byla wiec nie tylko cicha, ale i niewidoczna w
+# `docker compose logs`.
 cat > /etc/crontabs/root <<EOF
-${DAILY_CRON} . /etc/backup.env && /usr/local/bin/backup.sh >> /proc/1/fd/1 2>&1
-${WEEKLY_CRON} . /etc/backup.env && /usr/local/bin/backup.sh --send >> /proc/1/fd/1 2>&1
+${DAILY_CRON} { . /etc/backup.env && /usr/local/bin/backup.sh; } >> /proc/1/fd/1 2>&1
+${WEEKLY_CRON} { . /etc/backup.env && /usr/local/bin/backup.sh --send; } >> /proc/1/fd/1 2>&1
 EOF
 
 echo "[backup] harmonogram:"
@@ -7600,7 +7917,10 @@ if [ "${BACKUP_ON_START:-true}" = "true" ]; then
   /usr/local/bin/backup.sh || echo "[backup] zrzut startowy nieudany — crond i tak wystartuje"
 fi
 
-exec crond -f -l 8
+# `-L /proc/1/fd/1` kieruje log crond-a na stdout kontenera. Bez tego trafia
+# do sysloga, czyli w kontenerze donikad — i nie widac nawet tego, ze zadanie
+# w ogole zostalo odpalone.
+exec crond -f -l 8 -L /proc/1/fd/1
 ```
 
 # Plik: docker/backup/README.md
@@ -7706,6 +8026,40 @@ docker compose stop bot
 gunzip -c courierdb.sql.gz | docker compose exec -T postgres psql -U postgres -d courierdb
 docker compose start bot
 ```
+
+## ⚠️ Błąd naprawiony 17.08.2026 — cron NIGDY nie robił zrzutu
+
+`entrypoint.sh` budował `/etc/backup.env` przez `sed 's/^/export /'`, bez
+cudzysłowów wokół wartości. Wystarczyło, że któraś zmienna ma spację —
+a `BACKUP_CRON=30 3 * * *` ma cztery:
+
+```
+export BACKUP_CRON=30 3 * * *
+```
+
+Powłoka czytała to jako „wyeksportuj `BACKUP_CRON`, a potem zmienne o nazwach
+`3`, `*`, `*`, `*`" i przerywała na `export: 3: bad variable name`. Zadanie
+crona wyglądało tak:
+
+```
+30 3 * * * . /etc/backup.env && /usr/local/bin/backup.sh >> /proc/1/fd/1 2>&1
+```
+
+Źródłowanie padało, `&&` zwierało, **`backup.sh` nigdy się nie uruchamiał**.
+
+Dlaczego nikt tego nie zauważył:
+
+1. **Zrzut startowy działał**, bo `entrypoint.sh` woła `backup.sh` wprost, ze
+   środowiskiem kontenera — bez źródłowania tego pliku. Kopie w wolumenie
+   powstawały przy każdym starcie kontenera, więc katalog nie był pusty.
+2. **Błąd był niewidoczny.** Przekierowanie `>> /proc/1/fd/1` obejmowało tylko
+   `backup.sh`, więc komunikat ze źródłowania szedł na stderr crond-a — a ten,
+   uruchamiany bez `-L`, loguje do sysloga, czyli w kontenerze donikąd.
+
+Trzy poprawki: wartości w apostrofach, klamry wokół całego polecenia crona
+(`{ … } >> /proc/1/fd/1 2>&1`), oraz `crond -L /proc/1/fd/1`. Do tego
+kontener **nie wstaje**, gdy `/etc/backup.env` nie da się źródłować — lepiej
+głośna awaria niż backup, który tylko udaje, że działa.
 
 ## Zabezpieczenia w skrypcie
 
@@ -8306,6 +8660,34 @@ ROBOCZY="$(mktemp)"
 trap 'rm -f "$ROBOCZY"' EXIT
 sed 's/\r$//' "$PATCH" > "$ROBOCZY"
 
+# --- Czy to na pewno TO repozytorium? ---------------------------------------
+#
+# Sprawdzane PRZED `git apply`, nie po nieudanej probie. Powod jest konkretny:
+# patch skladajacy sie z samych NOWYCH plikow nie ma kontekstu do dopasowania,
+# wiec `git apply --check` przechodzi w KAZDYM repozytorium. Kontrola po
+# nieudanym nalozeniu nigdy by sie dla niego nie uruchomila — i wlasnie tak
+# testy dat z aplikacji wyladowaly w repozytorium bota.
+#
+# Znacznik `# repo: <nazwa>` siedzi w naglowku patcha. `git apply` ignoruje
+# wszystko przed pierwszym `diff --git`, wiec ta linia nic nie kosztuje.
+NAZWA="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1)"
+REPO_Z_PATCHA="$(sed -n 's/^# repo:[[:space:]]*//p' "$ROBOCZY" | head -1 || true)"
+
+if [ -n "$REPO_Z_PATCHA" ] && [ -n "$NAZWA" ] && [ "$REPO_Z_PATCHA" != "$NAZWA" ]; then
+  echo "❌ Ten patch jest do INNEGO REPOZYTORIUM — nie ruszam niczego."
+  echo
+  echo "   Patch deklaruje: $REPO_Z_PATCHA"
+  echo "   A Ty jesteś w:   $NAZWA  ($(pwd))"
+  echo
+  echo "   telegram-bot  → cd ~/projekty/telegram-bot   (repo courier-bot)"
+  echo "   courier-app   → cd ~/projekty/courier-app    (repo courier-mobile-app)"
+  exit 1
+fi
+
+if [ -z "$REPO_Z_PATCHA" ]; then
+  echo "ℹ️  Patch bez nagłówka '# repo:' — nie mogę potwierdzić repozytorium."
+fi
+
 echo "🔎 Sprawdzam, czy patch wejdzie…"
 
 if git apply --check "$ROBOCZY" 2>/dev/null; then
@@ -8334,7 +8716,6 @@ fi
 # CHOĆ JEDEN plik, który tutaj istnieje. Zero trafień przy patchu na kilka
 # plików znaczy praktycznie zawsze złe repozytorium.
 PLIKI="$(grep -oE '^diff --git a/[^ ]+' "$ROBOCZY" | sed 's|^diff --git a/||' | sort -u || true)"
-NAZWA="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1)"
 
 ILE=0
 TRAFIONE=0
@@ -8355,15 +8736,18 @@ if [ "$ILE" -gt 1 ] && [ "$TRAFIONE" -eq 0 ]; then
   echo "$PLIKI" | head -5 | sed 's/^/     /'
   [ "$ILE" -gt 5 ] && echo "     … i $((ILE - 5)) więcej"
   echo
-  echo "   Bot (courier-bot)          → ~/projekty/telegram-bot"
-  echo "   Aplikacja (courier-mobile) → ~/projekty/courier-app"
-  echo
-  echo "   Nazwy katalogów NIE pokrywają się z nazwami repozytoriów."
+  echo "   telegram-bot  → cd ~/projekty/telegram-bot   (repo courier-bot)"
+  echo "   courier-app   → cd ~/projekty/courier-app    (repo courier-mobile-app)"
   exit 1
 fi
 
 echo "❌ Patch nie pasuje do obecnego stanu repozytorium."
-echo "   (jesteś w: ${NAZWA:-?} — repo się zgadza, $TRAFIONE z $ILE plików istnieje)"
+if [ -n "$REPO_Z_PATCHA" ]; then
+  echo "   (repo się zgadza: $NAZWA — patch też deklaruje $REPO_Z_PATCHA)"
+else
+  echo "   (jesteś w: ${NAZWA:-?}, $TRAFIONE z $ILE plików patcha tu istnieje)"
+  echo "   Patch nie ma nagłówka '# repo:', więc nie mam pewności co do repozytorium."
+fi
 echo
 echo "Patch rusza te pliki:"
 echo "$PLIKI" | sed 's/^/  /'
