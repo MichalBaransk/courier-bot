@@ -1,5 +1,5 @@
 import { CFG } from '../config.js';
-import { b, code, i, joinLines, km, progressBar, zl, zlSigned, SEPARATOR } from '../utils/format.js';
+import { b, code, i, joinLines, km, numerZmiany, progressBar, zl, zlSigned, SEPARATOR } from '../utils/format.js';
 import { dlugoscSesjiH } from '../services/finance.calc.js';
 import type {
   CourseOfferStats,
@@ -39,8 +39,8 @@ export function sesjeLinie(sesje: readonly SesjaItem[]): string[] {
     const dlugosc = dlugoscSesjiH(s);
     const zakres = `${s.od} – ${s.do ?? '…'}`;
     return s.do === null
-      ? ` ${idx + 1}. ${code(zakres)} ${i('(trwa)')}`
-      : ` ${idx + 1}. ${code(zakres)} — ${b(`${dlugosc.toFixed(2)} h`)}`;
+      ? `${b(`${numerZmiany(idx + 1)} zmiana:`)} ${code(zakres)} ${i('(trwa)')}`
+      : `${b(`${numerZmiany(idx + 1)} zmiana:`)} ${code(zakres)} — ${b(`${dlugosc.toFixed(2)} h`)}`;
   });
 }
 

@@ -8,14 +8,17 @@ import { nowTimeWarsaw } from '../utils/datetime.js';
 import {
   BruttoSchema,
   CelSchema,
+  DecyzjaOfertySchema,
   DystansSchema,
   LokalizacjaSchema,
   NapiwekSchema,
+  OcenOferteSchema,
   PaliwoSchema,
   UsunSchema,
   ZmianaSchema,
   pierwszyBlad,
 } from './schemas.js';
+import { ocenOferte } from '../services/oferta.service.js';
 
 /**
  * Endpointy REST do ZAPISU (krok 3a planu aplikacji mobilnej).
@@ -242,6 +245,63 @@ export function registerWriteRoutes(app: Hono, userId: string): void {
     const r = await financeService.zamknijSesje(userId, doGodz!);
     if (r.blad) return c.json({ error: r.blad }, 400);
     return odpowiedz(c, date, null);
+  });
+
+  /**
+   * Ocena oferty kursu ze zrzutu ekranu — to samo, co zdjęcie wysłane do bota.
+   *
+   * Przebieg siedzi w `oferta.service.ts` i jest WSPÓLNY z Telegramem. Gdyby
+   * był tu przepisany, próg opłacalności albo zasada „dystans z aplikacji,
+   * nie z Maps" (§8f) mogłyby się kiedyś rozejść między telefonem a botem —
+   * a taki rozjazd objawia się dopiero dwiema różnymi decyzjami dla tego
+   * samego kursu.
+   *
+   * ⚠️ To jedyny endpoint, który woła Gemini, więc odpowiedź potrafi trwać
+   * kilka sekund i przechodzi przez kolejkę zapytań (`rate-limiter.ts`).
+   * Aplikacja ma na to własny, dłuższy timeout.
+   *
+   * NIE zwraca stanu dnia. Oferta nie jest wpisem do rozliczenia — to ocena
+   * kursu, którego jeszcze nie ma. Odpowiedzią jest werdykt.
+   */
+  app.post('/api/v1/oferta', async (c) => {
+    const w = await czytajCialo(c, OcenOferteSchema);
+    if (!w.ok) return c.json({ error: w.komunikat }, 400);
+
+    await ensureUserById(userId);
+
+    let obraz: Buffer;
+    try {
+      obraz = Buffer.from(w.wartosc.obraz, 'base64');
+    } catch {
+      return c.json({ error: 'Pole "obraz" nie jest poprawnym base64.' }, 400);
+    }
+    if (obraz.length === 0) {
+      return c.json({ error: 'Pole "obraz" nie jest poprawnym base64.' }, 400);
+    }
+
+    // Wiek zamiast znacznika czasu — zegar telefonu nie decyduje o niczym
+    // (ta sama zasada co w `/lokalizacja`). Znacznik składamy z NASZEGO zegara.
+    const p = w.wartosc.pozycja;
+    const pozycja =
+      p === null ? null : { lat: p.lat, lng: p.lon, ts: Date.now() - (p.wiekMs ?? 0) };
+
+    const wynik = await ocenOferte(userId, obraz, pozycja, w.wartosc.typ ?? 'image/jpeg');
+    return c.json(wynik, 201);
+  });
+
+  /** Decyzja o ofercie — odpowiednik przycisków pod kartą w Telegramie. */
+  app.post('/api/v1/oferta/decyzja', async (c) => {
+    const w = await czytajCialo(c, DecyzjaOfertySchema);
+    if (!w.ok) return c.json({ error: w.komunikat }, 400);
+
+    const oferta = await financeService.updateCourseOfferStatus(
+      w.wartosc.id,
+      userId,
+      w.wartosc.decyzja
+    );
+    if (!oferta) return c.json({ error: `Nie ma oferty o numerze ${w.wartosc.id}.` }, 404);
+
+    return c.json({ id: oferta.id, status: oferta.status });
   });
 
   /** Cel zarobkowy na bieżący miesiąc albo tydzień ISO (§8e). */

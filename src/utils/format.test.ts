@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { b, code, compact, h, i, joinLines, km, progressBar, zl, zlSigned } from './format.js';
+import { b, code, compact, h, i, joinLines, km, numerZmiany, progressBar, zl, zlSigned } from './format.js';
 
 /**
  * Escapowanie HTML — jedyna rzecz w tym pliku, ktora naprawde boli, gdy padnie.
@@ -121,5 +121,34 @@ describe('progressBar', () => {
   it('inna liczba blokow tez dziala', () => {
     expect(progressBar(50, 4)).toBe('[██░░]');
     expect(progressBar(NaN, 4)).toBe('[░░░░]');
+  });
+});
+
+describe('numerZmiany', () => {
+  it('jednocyfrowe', () => {
+    expect(numerZmiany(1)).toBe('1-sza');
+    expect(numerZmiany(2)).toBe('2-ga');
+    expect(numerZmiany(3)).toBe('3-cia');
+    expect(numerZmiany(4)).toBe('4-ta');
+    expect(numerZmiany(7)).toBe('7-ma');
+    expect(numerZmiany(8)).toBe('8-ma');
+  });
+
+  it('nastki zawsze biorą -ta, choćby kończyły się na 7 albo 8', () => {
+    expect(numerZmiany(11)).toBe('11-ta');
+    expect(numerZmiany(17)).toBe('17-ta');
+    expect(numerZmiany(18)).toBe('18-ta');
+  });
+
+  it('powyżej nastek decyduje OSTATNIA CYFRA — 21 to „dwudziesta pierwsza"', () => {
+    expect(numerZmiany(21)).toBe('21-sza');
+    expect(numerZmiany(22)).toBe('22-ga');
+    expect(numerZmiany(23)).toBe('23-cia');
+    expect(numerZmiany(27)).toBe('27-ma');
+  });
+
+  it('daje to samo co `numerZmiany` w aplikacji — obie strony muszą mówić tak samo', () => {
+    const oczekiwane = ['1-sza', '2-ga', '3-cia', '4-ta', '5-ta', '6-ta', '7-ma', '8-ma', '9-ta', '10-ta'];
+    expect([1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(numerZmiany)).toEqual(oczekiwane);
   });
 });

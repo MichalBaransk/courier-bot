@@ -4,7 +4,7 @@ import { CFG, isAllowedUser } from '../config.js';
 import { financeService } from '../services/finance.service.js';
 import { computeOfferRate } from '../services/finance.calc.js';
 import { geminiService, geminiQueue } from '../services/gemini.service.js';
-import { verifyOfferDistance } from '../services/maps.service.js';
+import { ocenOferte } from '../services/oferta.service.js';
 import { ensureUser } from '../services/user.service.js';
 import { isValidDateStr, monthRange, normalizeTime, nowTimeWarsaw, splitDate } from '../utils/datetime.js';
 import { b, code, h, i, joinLines, zl, zlSigned, SEPARATOR } from '../utils/format.js';
@@ -1273,81 +1273,20 @@ export function registerBotHandlers(bot: Telegraf): void {
       }
 
       // --- Oferta kursu ---
-      const offer = await geminiService.analyzeCourseOffer(image);
+      //
+      // Caly przebieg (Gemini -> Maps -> stawka -> zapis) siedzi w
+      // `oferta.service.ts`, bo od P7 wola go takze aplikacja mobilna przez
+      // `POST /api/v1/oferta`. Handler ma tylko wziac zdjecie i pokazac karte.
       const userLoc = freshLocation(tId);
-
-      const route = await verifyOfferDistance(
-        userLoc ? { lat: userLoc.latitude, lng: userLoc.longitude, ts: userLoc.updatedAt } : null,
-        offer.pickupAddress,
-        offer.deliveryAddress
+      const wynik = await ocenOferte(
+        tId,
+        image,
+        userLoc ? { lat: userLoc.latitude, lng: userLoc.longitude, ts: userLoc.updatedAt } : null
       );
-
-      // Suma z aplikacji: oba odcinki widoczne na ekranie oferty.
-      const appTotalKm =
-        offer.appPickupKm != null && offer.appDeliveryKm != null
-          ? Math.round((offer.appPickupKm + offer.appDeliveryKm) * 100) / 100
-          : null;
-
-      /**
-       * Podstawa stawki: dystans z APLIKACJI, nie z Google Maps.
-       *
-       * Glovo liczy oba odcinki od biezacej pozycji kuriera i zna prawdziwy
-       * adres klienta. Maps liczy od ostatniego wyslanego GPS-a, a odcinka
-       * do klienta w ogole nie policzy, bo oferta go nie ujawnia. Wczesniej
-       * bot dzielil kwote przez zmyslona liczbe i kazal odrzucac oplacalne kursy.
-       */
-      const rateBasis: 'APP' | 'MAPS' | 'NONE' =
-        appTotalKm != null && appTotalKm > 0
-          ? 'APP'
-          : route.totalKm != null && route.totalKm > 0
-            ? 'MAPS'
-            : 'NONE';
-
-      const totalKm = rateBasis === 'APP' ? appTotalKm! : rateBasis === 'MAPS' ? route.totalKm! : 0;
-
-      const { netAmount, netRatePerKm, isProfitable } = computeOfferRate({
-        grossAmount: offer.grossAmount,
-        totalKm,
-      });
-
-      const offerId = await financeService.saveCourseOffer(tId, {
-        grossAmount: offer.grossAmount,
-        netAmount,
-        appPickupKm: offer.appPickupKm,
-        appDeliveryKm: offer.appDeliveryKm,
-        appTotalKm,
-        mapsPickupKm: route.pickupKm,
-        mapsDeliveryKm: route.deliveryKm,
-        mapsTotalKm: route.totalKm,
-        distanceTotalKm: totalKm,
-        rateBasis,
-        netRatePerKm,
-        isProfitable,
-        pickupAddress: offer.pickupAddress,
-        deliveryAddress: offer.deliveryAddress,
-      });
+      const offerId = wynik.offerId;
 
       await editProcessing(
-        offerCard({
-          isProfitable,
-          grossAmount: offer.grossAmount,
-          netAmount,
-          pickupAddress: offer.pickupAddress,
-          deliveryAddress: offer.deliveryAddress,
-          appPickupKm: offer.appPickupKm,
-          appDeliveryKm: offer.appDeliveryKm,
-          appTotalKm,
-          mapsPickupKm: route.pickupKm,
-          mapsDeliveryKm: route.deliveryKm,
-          mapsTotalKm: route.totalKm,
-          mapsReason: route.reason,
-          mapsDeliveryReason: route.deliveryReason,
-          mapsAgeMin: route.ageMin,
-          totalKm,
-          rateBasis,
-          netRatePerKm,
-          status: 'PENDING',
-        }),
+        offerCard(wynik),
         // Jak wyzej — `Markup` musi wejsc jako rozlozony obiekt.
         { ...offerDecisionKeyboard(offerId) }
       );

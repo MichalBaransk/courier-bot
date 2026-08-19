@@ -6,6 +6,8 @@ import {
   LokalizacjaSchema,
   NapiwekSchema,
   PaliwoSchema,
+  DecyzjaOfertySchema,
+  OcenOferteSchema,
   UsunSchema,
   ZmianaSchema,
   pierwszyBlad,
@@ -283,5 +285,68 @@ describe('LokalizacjaSchema', () => {
   // pinezkę z Telegrama, która przez ten schemat nigdy nie przechodzi.
   it('(0, 0) przechodzi przez schemat — łapie je dopiero warstwa reguł', () => {
     expect(LokalizacjaSchema.safeParse({ lat: 0, lon: 0 }).success).toBe(true);
+  });
+});
+
+describe('OcenOferteSchema', () => {
+  const obraz = 'A'.repeat(200);
+
+  it('sam obraz wystarczy — pozycja i typ są opcjonalne', () => {
+    const w = OcenOferteSchema.safeParse({ obraz });
+    expect(w.success).toBe(true);
+    if (w.success) {
+      expect(w.data.pozycja).toBeNull();
+      expect(w.data.typ).toBeNull();
+    }
+  });
+
+  it('odrzuca prefiks data: — chcemy samo base64', () => {
+    const w = OcenOferteSchema.safeParse({ obraz: `data:image/jpeg;base64,${obraz}` });
+    expect(w.success).toBe(false);
+    expect(pierwszyBlad(w)).toContain('data:');
+  });
+
+  it('odrzuca coś, co nie może być obrazem', () => {
+    expect(OcenOferteSchema.safeParse({ obraz: 'abc' }).success).toBe(false);
+    expect(OcenOferteSchema.safeParse({}).success).toBe(false);
+  });
+
+  it('pilnuje górnej granicy rozmiaru', () => {
+    const wielki = 'A'.repeat(8 * 1024 * 1024 + 1);
+    const w = OcenOferteSchema.safeParse({ obraz: wielki });
+    expect(w.success).toBe(false);
+    expect(pierwszyBlad(w)).toContain('MB');
+  });
+
+  it('przyjmuje pozycję z wiekiem, odrzuca współrzędne poza zakresem', () => {
+    expect(
+      OcenOferteSchema.safeParse({ obraz, pozycja: { lat: 50.26, lon: 19.02, wiekMs: 1200 } }).success
+    ).toBe(true);
+    expect(OcenOferteSchema.safeParse({ obraz, pozycja: { lat: 91, lon: 19 } }).success).toBe(false);
+    expect(OcenOferteSchema.safeParse({ obraz, pozycja: { lat: 50, lon: 181 } }).success).toBe(false);
+  });
+
+  it('pozycja bez wieku jest w porządku — serwer przyjmie „teraz"', () => {
+    const w = OcenOferteSchema.safeParse({ obraz, pozycja: { lat: 50.26, lon: 19.02 } });
+    expect(w.success).toBe(true);
+    if (w.success) expect(w.data.pozycja?.wiekMs).toBeNull();
+  });
+
+  it('przyjmuje tylko dwa typy obrazu', () => {
+    expect(OcenOferteSchema.safeParse({ obraz, typ: 'image/png' }).success).toBe(true);
+    expect(OcenOferteSchema.safeParse({ obraz, typ: 'image/webp' }).success).toBe(false);
+  });
+});
+
+describe('DecyzjaOfertySchema', () => {
+  it('przyjmuje obie decyzje', () => {
+    expect(DecyzjaOfertySchema.safeParse({ id: 5, decyzja: 'ACCEPTED' }).success).toBe(true);
+    expect(DecyzjaOfertySchema.safeParse({ id: 5, decyzja: 'REJECTED' }).success).toBe(true);
+  });
+
+  it('odrzuca trzecią wartość i złe id', () => {
+    expect(DecyzjaOfertySchema.safeParse({ id: 5, decyzja: 'MOZE' }).success).toBe(false);
+    expect(DecyzjaOfertySchema.safeParse({ id: 0, decyzja: 'ACCEPTED' }).success).toBe(false);
+    expect(DecyzjaOfertySchema.safeParse({ decyzja: 'ACCEPTED' }).success).toBe(false);
   });
 });

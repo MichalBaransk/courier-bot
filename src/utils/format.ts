@@ -57,4 +57,39 @@ export function progressBar(percent: number, totalBlocks = 10): string {
   return `[${'█'.repeat(filled)}${'░'.repeat(totalBlocks - filled)}]`;
 }
 
+/**
+ * Liczebnik porzadkowy rodzaju zenskiego w skrocie: `1` -> `1-sza`.
+ *
+ * Rodzaj zenski, bo jedyne, co tym numerujemy, to ZMIANA.
+ *
+ * Koncowke narzuca OSTATNIA CYFRA, a nie sama liczba — `21` to „dwudziesta
+ * pierwsza", czyli `21-sza`, a nie `21-ta`. Wyjatkiem sa NASTKI: `11`–`19`
+ * to „jedenasta … dziewietnasta", wiec mimo koncowki `1`, `2`, `3`, `7` czy
+ * `8` biora `-ta`. Stad `17-ta`, ale juz `27-ma` („dwudziesta siodma").
+ *
+ * Ta sama funkcja stoi w aplikacji (`src/format.ts` w `courier-app`) i obie
+ * musza dawac te same slowa — inaczej ten sam dzien czyta sie inaczej
+ * w Telegramie i na telefonie.
+ */
+export function numerZmiany(n: number): string {
+  if (!Number.isFinite(n) || n < 1) return `${n}-ta`;
+
+  const calk = Math.floor(n);
+  if (calk % 100 >= 11 && calk % 100 <= 19) return `${calk}-ta`;
+
+  switch (calk % 10) {
+    case 1:
+      return `${calk}-sza`;
+    case 2:
+      return `${calk}-ga`;
+    case 3:
+      return `${calk}-cia`;
+    case 7:
+    case 8:
+      return `${calk}-ma`;
+    default:
+      return `${calk}-ta`;
+  }
+}
+
 export const SEPARATOR = '────────────────';

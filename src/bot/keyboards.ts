@@ -1,4 +1,5 @@
 import { Markup } from 'telegraf';
+import { numerZmiany } from '../utils/format.js';
 
 /**
  * FIX (4.8): klawiatury byly budowane w kilku miejscach z kopiuj-wklej
@@ -77,7 +78,10 @@ export const zmianyKeyboard = (
 ) =>
   Markup.inlineKeyboard(
     sesje.map((s, idx) => [
-      Markup.button.callback(`🗑️ ${idx + 1}. ${s.od}–${s.do ?? '…'}`, `zmiana_usun_${s.id}_${date}`),
+      Markup.button.callback(
+        `🗑️ ${numerZmiany(idx + 1)}: ${s.od}–${s.do ?? '…'}`,
+        `zmiana_usun_${s.id}_${date}`
+      ),
     ])
   );
 

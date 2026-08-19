@@ -12,6 +12,17 @@ import { isValidDateStr, normalizeTime } from '../utils/datetime.js';
  * na telefonie, a nie programista z debuggerem.
  */
 
+/**
+ * Górna granica obrazu PO zakodowaniu w base64.
+ *
+ * Zrzut ekranu z telefonu to zwykle 200–800 KB, po base64 do ~1,1 MB.
+ * 8 MB zostawia zapas na zdjęcie z aparatu w pełnej rozdzielczości i nadal
+ * jest daleko od `MAX_PHOTO_BYTES` (20 MB), którym bot ogranicza Telegram.
+ * Limit istnieje po to, żeby żądanie odbiło się od walidacji, a nie od pamięci
+ * procesu — obraz idzie w całości do bufora, a potem do Gemini.
+ */
+const MAKS_OBRAZ_BASE64 = 8 * 1024 * 1024;
+
 const liczbaDodatnia = (pole: string, maks: number) =>
   z
     .number({ message: `Pole "${pole}" musi być liczbą.` })
@@ -110,6 +121,65 @@ export const CelSchema = z.object({
 });
 
 /**
+ * Ocena oferty ze zrzutu ekranu.
+ *
+ * Obraz idzie jako **base64 w JSON-ie**, a nie multipart. Powód jest prosty:
+ * całe API mówi JSON-em i przechodzi przez tę samą walidację, ten sam
+ * middleware idempotencji i ten sam czytnik ciała. Multipart wymagałby drugiej
+ * ścieżki obok, a jedyne, co by dał, to brak narzutu base64 (+33%).
+ *
+ * `pozycja` jest opcjonalna, ale to ONA jest powodem, dla którego ocena
+ * w aplikacji ma sens. Telefon czyta GPS w chwili oceny (wiek 1–3 s), więc
+ * budżet błędu z 8j praktycznie przestaje cokolwiek znaczyć. Bez niej serwer
+ * sięga po ostatnią zapisaną pozycję — to działa, ale to jest dokładnie ten
+ * przypadek z 2.3, gdzie Maps liczył dojazd od GPS-a sprzed kwadransa.
+ */
+export const OcenOferteSchema = z.object({
+  /** Zrzut ekranu oferty, base64 BEZ prefiksu `data:`. */
+  obraz: z
+    .string({ message: 'Pole "obraz" musi być tekstem base64.' })
+    .min(100, 'Pole "obraz" jest za krótkie, żeby było obrazem.')
+    .refine((v) => !v.startsWith('data:'), 'Prześlij samo base64, bez prefiksu "data:".')
+    .refine(
+      (v) => v.length <= MAKS_OBRAZ_BASE64,
+      `Obraz przekracza ${Math.round(MAKS_OBRAZ_BASE64 / 1024 / 1024)} MB po zakodowaniu.`
+    ),
+  /** `image/jpeg` albo `image/png`. */
+  typ: opcjonalna(
+    z.enum(['image/jpeg', 'image/png'], {
+      message: 'Pole "typ" musi być "image/jpeg" albo "image/png".',
+    })
+  ),
+  pozycja: opcjonalna(
+    z.object({
+      lat: z
+        .number({ message: 'Pole "pozycja.lat" musi być liczbą.' })
+        .refine((v) => v >= -90 && v <= 90, 'Pole "pozycja.lat" musi być w zakresie -90..90.'),
+      lon: z
+        .number({ message: 'Pole "pozycja.lon" musi być liczbą.' })
+        .refine((v) => v >= -180 && v <= 180, 'Pole "pozycja.lon" musi być w zakresie -180..180.'),
+      /**
+       * Ile ms upłynęło od złapania pozycji. Wiek, nie znacznik czasu —
+       * ta sama zasada co w `LokalizacjaSchema`: zegar telefonu nie ma prawa
+       * być drugim źródłem prawdy obok serwera.
+       */
+      wiekMs: opcjonalna(liczbaNieujemna('pozycja.wiekMs', 24 * 60 * 60 * 1000)),
+    })
+  ),
+});
+
+/** Decyzja o ofercie. Ta sama, co przyciski pod kartą w Telegramie. */
+export const DecyzjaOfertySchema = z.object({
+  id: z
+    .number({ message: 'Pole "id" musi być liczbą.' })
+    .int('Pole "id" musi być liczbą całkowitą.')
+    .positive('Pole "id" musi być dodatnie.'),
+  decyzja: z.enum(['ACCEPTED', 'REJECTED'], {
+    message: 'Pole "decyzja" musi być "ACCEPTED" albo "REJECTED".',
+  }),
+});
+
+/**
  * Te same cele co kasowanie głosem w bocie — jedna lista, jedna logika.
  *
  * `HOURS` zachowuje dotychczasowe znaczenie: WSZYSTKIE zmiany doby. Gdyby
@@ -181,6 +251,8 @@ export type BruttoBody = z.infer<typeof BruttoSchema>;
 export type ZmianaBody = z.infer<typeof ZmianaSchema>;
 export type CelBody = z.infer<typeof CelSchema>;
 export type UsunBody = z.infer<typeof UsunSchema>;
+export type OcenOferteBody = z.infer<typeof OcenOferteSchema>;
+export type DecyzjaOfertyBody = z.infer<typeof DecyzjaOfertySchema>;
 
 /**
  * Kształt wyniku `safeParse` opisany STRUKTURALNIE, a nie przez nazwę typu
