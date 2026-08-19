@@ -7,6 +7,11 @@ import {
   sumWalletPayouts,
   walletBalanceFrom,
   walletKey,
+  zakresSesji,
+  nakladajaSie,
+  dlugoscSesjiH,
+  sumaGodzinDoby,
+  walidujSesje,
 } from './finance.calc.js';
 
 describe('computeDailyTotals (FIX 2.4)', () => {
@@ -258,5 +263,188 @@ describe('computeOfferStats', () => {
     expect(s.avgNetRatePerKm).toBe(2.81);
     expect(s.ratedOffers).toBe(1);
     expect(s.totalOffers).toBe(2);
+  });
+});
+
+describe('zakresSesji — zmiana na osi minut', () => {
+  it('zwykła zmiana w obrębie doby', () => {
+    expect(zakresSesji({ od: '10:00', do: '14:00' })).toEqual({ start: 600, koniec: 840 });
+  });
+
+  it('przejście przez północ przedłuża oś, nie dzieli zmiany na dwie doby', () => {
+    expect(zakresSesji({ od: '23:50', do: '02:10' })).toEqual({ start: 1430, koniec: 1570 });
+  });
+
+  it('równe godziny znaczą pełną dobę — i dlatego odpadną na limicie 16 h', () => {
+    expect(zakresSesji({ od: '10:00', do: '10:00' })).toEqual({ start: 600, koniec: 2040 });
+  });
+
+  it('zmiana trwająca zajmuje oś aż do końca', () => {
+    expect(zakresSesji({ od: '17:30', do: null })).toEqual({ start: 1050, koniec: Infinity });
+  });
+
+  it('przesunięcie o dobę wstecz układa wczorajszą zmianę na tej samej osi', () => {
+    expect(zakresSesji({ od: '23:00', do: '02:00' }, -1)).toEqual({ start: -60, koniec: 120 });
+  });
+
+  it('zły format to null, nie zgadywanie', () => {
+    expect(zakresSesji({ od: 'abc', do: '14:00' })).toBeNull();
+    expect(zakresSesji({ od: '10:00', do: '25:00' })).toBeNull();
+  });
+});
+
+describe('nakladajaSie', () => {
+  it('styk NIE jest nakładaniem — 14:00 kończy jedną i zaczyna drugą', () => {
+    const a = zakresSesji({ od: '10:00', do: '14:00' })!;
+    const b = zakresSesji({ od: '14:00', do: '18:00' })!;
+    expect(nakladajaSie(a, b)).toBe(false);
+  });
+
+  it('wspólna godzina to nakładanie', () => {
+    const a = zakresSesji({ od: '10:00', do: '14:00' })!;
+    const b = zakresSesji({ od: '13:00', do: '18:00' })!;
+    expect(nakladajaSie(a, b)).toBe(true);
+  });
+
+  it('zmiana zawarta w drugiej', () => {
+    const a = zakresSesji({ od: '10:00', do: '20:00' })!;
+    const b = zakresSesji({ od: '12:00', do: '13:00' })!;
+    expect(nakladajaSie(a, b)).toBe(true);
+  });
+});
+
+describe('dlugoscSesjiH i sumaGodzinDoby', () => {
+  it('zmiana przez północ liczy się poprawnie', () => {
+    expect(dlugoscSesjiH({ od: '22:00', do: '02:00' })).toBe(4);
+  });
+
+  it('TRWAJĄCA zmiana to 0 h, a nie „do teraz"', () => {
+    expect(dlugoscSesjiH({ od: '17:30', do: null })).toBe(0);
+  });
+
+  it('zmiana spoza limitu 2.9 wnosi 0 zamiast fałszywej liczby', () => {
+    expect(dlugoscSesjiH({ od: '10:00', do: '09:00' })).toBe(0);
+  });
+
+  it('dwie zmiany w dobie sumują się — to jest cel całej tabeli', () => {
+    const suma = sumaGodzinDoby([
+      { od: '10:00', do: '14:00' },
+      { od: '17:30', do: '23:30' },
+    ]);
+    expect(suma).toBe(10);
+  });
+
+  it('suma z trwającą zmianą liczy tylko zamknięte', () => {
+    expect(sumaGodzinDoby([{ od: '10:00', do: '14:00' }, { od: '17:30', do: null }])).toBe(4);
+  });
+
+  it('pusta doba to zero, nie NaN', () => {
+    expect(sumaGodzinDoby([])).toBe(0);
+  });
+});
+
+describe('walidujSesje', () => {
+  it('pierwsza zmiana w pustej dobie przechodzi', () => {
+    expect(walidujSesje({ istniejace: [], nowa: { od: '10:00', do: '14:00' } })).toEqual({ ok: true });
+  });
+
+  it('druga zmiana po pierwszej przechodzi — to jest sedno work_sessions', () => {
+    const wynik = walidujSesje({
+      istniejace: [{ id: 1, od: '10:00', do: '14:00' }],
+      nowa: { od: '17:30', do: '23:30' },
+    });
+    expect(wynik).toEqual({ ok: true });
+  });
+
+  it('zmiana nachodząca na istniejącą jest odrzucana z podaniem tej drugiej', () => {
+    const wynik = walidujSesje({
+      istniejace: [{ id: 1, od: '10:00', do: '14:00' }],
+      nowa: { od: '13:00', do: '18:00' },
+    });
+    expect(wynik.ok).toBe(false);
+    if (!wynik.ok) expect(wynik.komunikat).toContain('10:00–14:00');
+  });
+
+  it('trwająca zmiana blokuje dopisanie PÓŹNIEJSZEJ', () => {
+    const wynik = walidujSesje({
+      istniejace: [{ id: 1, od: '17:30', do: null }],
+      nowa: { od: '19:00', do: '20:00' },
+    });
+    expect(wynik.ok).toBe(false);
+    if (!wynik.ok) expect(wynik.komunikat).toContain('jeszcze trwa');
+  });
+
+  it('trwająca zmiana NIE blokuje dopisania wcześniejszej, o której zapomniałem', () => {
+    const wynik = walidujSesje({
+      istniejace: [{ id: 1, od: '17:30', do: null }],
+      nowa: { od: '08:00', do: '12:00' },
+    });
+    expect(wynik).toEqual({ ok: true });
+  });
+
+  it('poprawka zmiany nie koliduje sama ze sobą', () => {
+    const wynik = walidujSesje({
+      istniejace: [{ id: 7, od: '10:00', do: '14:00' }],
+      nowa: { id: 7, od: '10:15', do: '14:30' },
+    });
+    expect(wynik).toEqual({ ok: true });
+  });
+
+  it('zmiana krótsza niż 15 minut odpada na regule 2.9', () => {
+    const wynik = walidujSesje({ istniejace: [], nowa: { od: '10:00', do: '10:10' } });
+    expect(wynik.ok).toBe(false);
+    if (!wynik.ok) expect(wynik.komunikat).toContain('minimum');
+  });
+
+  it('pojedyncza zmiana dłuższa niż 16 h odpada', () => {
+    const wynik = walidujSesje({ istniejace: [], nowa: { od: '06:00', do: '23:30' } });
+    expect(wynik.ok).toBe(false);
+    if (!wynik.ok) expect(wynik.komunikat).toContain('limit 16 h');
+  });
+
+  it('SUMA doby powyżej 16 h odpada, choć każda zmiana z osobna jest w porządku', () => {
+    // To jest kontrola, której nie da się zastąpić limitem pojedynczej zmiany.
+    const wynik = walidujSesje({
+      istniejace: [
+        { id: 1, od: '00:00', do: '06:00' },
+        { id: 2, od: '06:00', do: '12:00' },
+      ],
+      nowa: { od: '12:00', do: '18:30' },
+    });
+    expect(wynik.ok).toBe(false);
+    if (!wynik.ok) expect(wynik.komunikat).toContain('18.50 h w jednej dobie');
+  });
+
+  it('dokładnie 16 h w dobie jeszcze przechodzi', () => {
+    const wynik = walidujSesje({
+      istniejace: [{ id: 1, od: '00:00', do: '08:00' }],
+      nowa: { od: '08:00', do: '16:00' },
+    });
+    expect(wynik).toEqual({ ok: true });
+  });
+
+  it('zmiana nachodząca na WCZORAJSZĄ, która przeszła przez północ', () => {
+    const wynik = walidujSesje({
+      istniejace: [],
+      nowa: { od: '01:00', do: '05:00' },
+      zPoprzedniejDoby: { id: 9, od: '23:00', do: '02:00' },
+    });
+    expect(wynik.ok).toBe(false);
+    if (!wynik.ok) expect(wynik.komunikat).toContain('wczorajszą');
+  });
+
+  it('wczorajsza zmiana kończąca się przed północą niczego nie blokuje', () => {
+    const wynik = walidujSesje({
+      istniejace: [],
+      nowa: { od: '01:00', do: '05:00' },
+      zPoprzedniejDoby: { id: 9, od: '16:00', do: '23:00' },
+    });
+    expect(wynik).toEqual({ ok: true });
+  });
+
+  it('zły format godziny zatrzymuje walidację na pierwszym kroku', () => {
+    const wynik = walidujSesje({ istniejace: [], nowa: { od: '10:00', do: 'ćwierć po' } });
+    expect(wynik.ok).toBe(false);
+    if (!wynik.ok) expect(wynik.komunikat).toContain('GG:MM');
   });
 });

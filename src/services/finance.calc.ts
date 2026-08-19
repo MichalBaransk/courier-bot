@@ -1,4 +1,5 @@
 import { CFG } from '../config.js';
+import { calculateHours, normalizeTime } from '../utils/datetime.js';
 
 /**
  * Czysta arytmetyka rozliczen — bez bazy, w calosci testowalna.
@@ -247,4 +248,186 @@ export function computeOfferStats(offers: readonly OfferStatsInput[]): OfferStat
     totalNet: round2(totalNet),
     totalDistanceKm: Math.round(totalDistanceKm * 10) / 10,
   };
+}
+
+// =============================================================================
+// ZMIANY W CIAGU DOBY (work_sessions)
+// =============================================================================
+
+/**
+ * Jedna zmiana. `do === null` znaczy, ze zmiana TRWA.
+ *
+ * `id` jest opcjonalne, bo ta sama struktura opisuje zarowno wiersz z bazy,
+ * jak i zmiane dopiero proponowana do zapisu.
+ */
+export interface Sesja {
+  id?: number;
+  /** Godzina wyjazdu `GG:MM`. */
+  od: string;
+  /** Godzina zjazdu `GG:MM` albo `null`, gdy zmiana trwa. */
+  do: string | null;
+}
+
+/** Zmiana ulozona na osi minut liczonej od polnocy DOBY WYJAZDU. */
+export interface ZakresSesji {
+  start: number;
+  /** `Infinity` dla zmiany trwajacej — patrz `zakresSesji`. */
+  koniec: number;
+}
+
+const MINUT_W_DOBIE = 1440;
+
+/** `'09:05'` -> `545`. `null` przy zlym formacie. */
+export function minutyOdPolnocy(godzina: string): number | null {
+  const t = normalizeTime(godzina);
+  if (!t) return null;
+  const [h, m] = t.split(':').map(Number) as [number, number];
+  return h * 60 + m;
+}
+
+/**
+ * Zmiana jako przedzial minut `[start, koniec)` na osi doby wyjazdu.
+ *
+ * Trzy rzeczy, ktore ta funkcja rozstrzyga i ktore latwo przeoczyc:
+ *
+ * 1. **Przejscie przez polnoc.** Zjazd wczesniejszy albo rowny wyjazdowi znaczy
+ *    nastepny dzien, wiec `koniec` moze przekroczyc 1440. Zmiana 23:50 -> 02:10
+ *    to `[1430, 1570)`, a nie dwa kawalki w dwoch dobach.
+ * 2. **Zmiana trwajaca konczy sie w nieskonczonosci.** Nie wiemy, kiedy sie
+ *    skonczy, wiec zajmuje cala os az do konca. Dzieki temu dopisanie zmiany
+ *    PO trwajacej zostanie wykryte jako nakladanie, a dopisanie WCZESNIEJSZEJ
+ *    (np. porannej, o ktorej zapomnialem) przejdzie bez przeszkody.
+ * 3. **Przesuniecie dobowe.** `przesuniecieDni: -1` uklada zmiane z doby
+ *    poprzedniej na tej samej osi, co dzisiejsze. Bez tego zmiana 18.08
+ *    23:00 -> 02:00 i zmiana 19.08 01:00 -> 05:00 wygladalyby na rozlaczne,
+ *    a w rzeczywistosci nachodza na siebie o godzine.
+ */
+export function zakresSesji(sesja: Sesja, przesuniecieDni = 0): ZakresSesji | null {
+  const start = minutyOdPolnocy(sesja.od);
+  if (start === null) return null;
+
+  const przesuniecie = przesuniecieDni * MINUT_W_DOBIE;
+
+  if (sesja.do === null) {
+    return { start: start + przesuniecie, koniec: Number.POSITIVE_INFINITY };
+  }
+
+  const koniecSurowy = minutyOdPolnocy(sesja.do);
+  if (koniecSurowy === null) return null;
+
+  const koniec = koniecSurowy <= start ? koniecSurowy + MINUT_W_DOBIE : koniecSurowy;
+  return { start: start + przesuniecie, koniec: koniec + przesuniecie };
+}
+
+/**
+ * Czy dwa przedzialy zachodza na siebie.
+ *
+ * Styk NIE jest nakladaniem: zmiana konczaca sie o 14:00 i zaczynajaca o 14:00
+ * to dwie zmiany pod rzad, a nie konflikt. Stad ostre nierownosci.
+ */
+export function nakladajaSie(a: ZakresSesji, b: ZakresSesji): boolean {
+  return a.start < b.koniec && b.start < a.koniec;
+}
+
+/**
+ * Dlugosc jednej zmiany w godzinach.
+ *
+ * Zmiana TRWAJACA liczy sie jako **0 h**, a nie „od wyjazdu do teraz".
+ * Gdyby liczyla do teraz, stawka zl/h zmienialaby sie co minute, a to samo
+ * `/tydzien` wywolane dwa razy dawaloby dwie rozne liczby.
+ *
+ * Wynik poza `[MIN_SHIFT_HOURS, MAX_SHIFT_HOURS]` tez daje 0 — `calculateHours`
+ * zwraca wtedy `null` (2.9). W praktyce takiej zmiany nie da sie zapisac, bo
+ * `walidujSesje` ja odrzuca; to zabezpieczenie na wypadek recznej poprawki
+ * w bazie.
+ */
+export function dlugoscSesjiH(sesja: Sesja): number {
+  if (sesja.do === null) return 0;
+  return calculateHours(sesja.od, sesja.do).hours ?? 0;
+}
+
+/** Suma godzin z listy zmian. Trwajaca zmiana wnosi 0. */
+export function sumaGodzinDoby(sesje: readonly Sesja[]): number {
+  let suma = 0;
+  for (const s of sesje) suma += dlugoscSesjiH(s);
+  return round2(suma);
+}
+
+export interface WalidacjaSesjiInput {
+  /** Zmiany juz zapisane na TEJ dobie. */
+  istniejace: readonly Sesja[];
+  /** Zmiana dodawana albo poprawiana. Przy poprawce ma `id`. */
+  nowa: Sesja;
+  /**
+   * Ostatnia zmiana z doby POPRZEDNIEJ, jesli przechodzi przez polnoc.
+   * Serwis podaje ja tylko wtedy, gdy istnieje — patrz `zakresSesji` pkt 3.
+   */
+  zPoprzedniejDoby?: Sesja | null;
+}
+
+export type WynikWalidacji = { ok: true } | { ok: false; komunikat: string };
+
+/**
+ * Czy nowa zmiana moze wejsc do tej doby.
+ *
+ * Cztery kontrole, kazda z konkretnego powodu:
+ *
+ * 1. **Format godzin** — bez tego reszta liczy smieci.
+ * 2. **Dlugosc pojedynczej zmiany** w `[0,25 h; 16 h]`. To jest regula 2.9,
+ *    wolana przez `calculateHours`, zeby limit istnial w JEDNYM miejscu.
+ * 3. **Nakladanie sie zmian** — dwie zmiany na tych samych godzinach
+ *    liczylyby te godziny dwa razy.
+ * 4. **Suma doby** rowniez w limicie `MAX_SHIFT_HOURS`. Ta kontrola NIE
+ *    wynika z poprzedniej: dziesiec zmian po dwie godziny to dwadziescia
+ *    godzin pracy w dobie, a kazda z nich z osobna przechodzi bez mrugniecia.
+ *
+ * Kolejnosc nie jest przypadkowa — komunikat ma wskazywac PIERWSZA rzecz
+ * do poprawienia, a nie najbardziej ogolna.
+ */
+export function walidujSesje(input: WalidacjaSesjiInput): WynikWalidacji {
+  const zakresNowej = zakresSesji(input.nowa);
+  if (!zakresNowej) {
+    return { ok: false, komunikat: 'Nieprawidłowy format godziny (oczekiwano GG:MM).' };
+  }
+
+  if (input.nowa.do !== null) {
+    const { error } = calculateHours(input.nowa.od, input.nowa.do);
+    if (error) return { ok: false, komunikat: error };
+  }
+
+  // Poprawka zmiany nie moze kolidowac sama ze soba.
+  const inne = input.istniejace.filter((s) => input.nowa.id === undefined || s.id !== input.nowa.id);
+
+  for (const s of inne) {
+    const z = zakresSesji(s);
+    if (z && nakladajaSie(zakresNowej, z)) {
+      return {
+        ok: false,
+        komunikat:
+          s.do === null
+            ? `Zmiana od ${s.od} jeszcze trwa — najpierw ją zamknij.`
+            : `Ta zmiana nachodzi na ${s.od}–${s.do}.`,
+      };
+    }
+  }
+
+  if (input.zPoprzedniejDoby) {
+    const z = zakresSesji(input.zPoprzedniejDoby, -1);
+    if (z && nakladajaSie(zakresNowej, z)) {
+      return {
+        ok: false,
+        komunikat: `Ta zmiana nachodzi na wczorajszą (${input.zPoprzedniejDoby.od}–${input.zPoprzedniejDoby.do ?? 'trwa'}).`,
+      };
+    }
+  }
+
+  const suma = round2(sumaGodzinDoby(inne) + dlugoscSesjiH(input.nowa));
+  if (suma > CFG.MAX_SHIFT_HOURS) {
+    return {
+      ok: false,
+      komunikat: `Razem wyszłoby ${suma.toFixed(2)} h w jednej dobie (limit ${CFG.MAX_SHIFT_HOURS} h).`,
+    };
+  }
+
+  return { ok: true };
 }

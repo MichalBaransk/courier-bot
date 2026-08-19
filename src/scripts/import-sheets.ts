@@ -3,7 +3,7 @@ import path from 'node:path';
 import { parse } from 'csv-parse/sync';
 import 'dotenv/config';
 import { closeDb, db } from '../db/index.js';
-import { dailyRecords, cashTips, fuelReceipts, walletTransactions } from '../db/schema.js';
+import { dailyRecords, workSessions, cashTips, fuelReceipts, walletTransactions } from '../db/schema.js';
 import { ensureUserById } from '../services/user.service.js';
 import { normalizeTime } from '../utils/datetime.js';
 
@@ -49,6 +49,7 @@ async function importDane(): Promise<void> {
 
   let importedDays = 0;
   let importedFuel = 0;
+  let importedSessions = 0;
 
   for (let idx = 1; idx < records.length; idx++) {
     const row = records[idx];
@@ -63,7 +64,6 @@ async function importDane(): Promise<void> {
     const gross = parseNum(row[8]);
     const workFrom = normalizeTime(row[13] ?? '');
     const workTo = normalizeTime(row[14] ?? '');
-    const workHours = parseNum(row[15]);
 
     await db
       .insert(dailyRecords)
@@ -72,12 +72,23 @@ async function importDane(): Promise<void> {
         date,
         distanceKm: distance != null ? distance.toFixed(2) : null,
         grossEarnings: gross != null ? gross.toFixed(2) : null,
-        workFrom,
-        workTo,
-        workHours: workHours != null ? workHours.toFixed(2) : null,
       })
       .onConflictDoNothing();
     importedDays++;
+
+    // Godziny ida do `work_sessions` (P3). Arkusz mial jedna pare na dzien,
+    // wiec z kazdego wiersza wychodzi najwyzej jedna zmiana.
+    //
+    // Kolumna 15 arkusza (liczba godzin) jest CELOWO ignorowana: `work_sessions`
+    // nie przechowuje dlugosci, tylko ja liczy. Import wartosci, ktora sie
+    // z godzinami nie zgadza, byloby wpuszczeniem sprzecznosci do bazy.
+    if (workFrom && workTo) {
+      await db
+        .insert(workSessions)
+        .values({ telegramId: TELEGRAM_ID, date, workFrom, workTo, source: 'IMPORT' })
+        .onConflictDoNothing();
+      importedSessions++;
+    }
 
     // Paliwo trafia do osobnej tabeli (2.8).
     if (fuelCost != null && fuelCost > 0) {
@@ -92,7 +103,9 @@ async function importDane(): Promise<void> {
     }
   }
 
-  console.log(`✅ Zaimportowano ${importedDays} wpisów dziennych i ${importedFuel} paragonów z dane.csv`);
+  console.log(
+    `✅ Zaimportowano ${importedDays} wpisów dziennych, ${importedSessions} zmian i ${importedFuel} paragonów z dane.csv`
+  );
 }
 
 async function importNapiwki(): Promise<void> {

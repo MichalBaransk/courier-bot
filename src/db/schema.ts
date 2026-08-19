@@ -34,6 +34,12 @@ export const users = pgTable('users', {
  * dawalo bezsensowne liczby.
  * FIX (2.8): kolumny paliwowe wyprowadzone do osobnej tabeli `fuel_receipts`,
  * bo upsert na (telegram_id, date) kasowal drugie tankowanie tego samego dnia.
+ *
+ * P3 (19.08.2026): z tego samego powodu wyszly stad GODZINY. `work_from`,
+ * `work_to` i `work_hours` byly jedna para na dobe, wiec drugi wyjazd tego
+ * samego dnia nadpisywal pierwszy. Teraz kazda zmiana to wiersz w
+ * `work_sessions`, a suma godzin doby liczy sie z sumy sesji — nie ma juz
+ * kolumny, ktora moglaby sie z nia rozjechac.
  */
 export const dailyRecords = pgTable(
   'daily_records',
@@ -45,9 +51,6 @@ export const dailyRecords = pgTable(
     date: date('date').notNull(),
     distanceKm: numeric('distance_km', { precision: 10, scale: 2 }),
     grossEarnings: numeric('gross_earnings', { precision: 10, scale: 2 }),
-    workFrom: text('work_from'),
-    workTo: text('work_to'),
-    workHours: numeric('work_hours', { precision: 5, scale: 2 }),
     createdAt: timestamp('created_at').defaultNow().notNull(),
   },
   (table) => ({

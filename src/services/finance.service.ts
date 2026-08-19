@@ -1,13 +1,14 @@
 import { db } from '../db/index.js';
 import {
   dailyRecords,
+  workSessions,
   cashTips,
   fuelReceipts,
   walletTransactions,
   courseOffers,
   earningTargets,
 } from '../db/schema.js';
-import { eq, and, gte, lte, inArray, sql, desc } from 'drizzle-orm';
+import { eq, and, gte, lte, inArray, sql, desc, asc, isNull } from 'drizzle-orm';
 import { CFG } from '../config.js';
 import {
   todayWarsaw,
@@ -22,6 +23,7 @@ import {
   weekRange,
   weekRangeFor,
   calculateHours,
+  daysBetween,
   type DateRange,
 } from '../utils/datetime.js';
 import {
@@ -31,8 +33,22 @@ import {
   round2,
   sumWalletPayouts,
   walletKey,
+  sumaGodzinDoby,
+  walidujSesje,
+  zakresSesji,
+  type Sesja,
 } from './finance.calc.js';
 import type { VoiceExtractedData, WalletTransactionItem } from './gemini.service.js';
+
+/**
+ * Jedna zmiana w postaci gotowej do wyslania na zewnatrz (REST API, karty bota).
+ * `do === null` znaczy, ze zmiana TRWA.
+ */
+export interface SesjaItem {
+  id: number;
+  od: string;
+  do: string | null;
+}
 
 export interface DailySummary {
   date: string;
@@ -42,9 +58,21 @@ export interface DailySummary {
   totalNetto: number;
   walletPayouts: number;
   doPrzelewu: number;
+  /**
+   * Pierwszy wyjazd doby. Przy kilku zmianach to SKROT, nie cala prawda —
+   * 10:00-23:30 to 13,5 h zegarowych, a przepracowane moze byc 11,5 h.
+   * Dlatego `workHours` liczy sie z sumy sesji, a nie z tej pary.
+   *
+   * Zostaje w odpowiedzi, zeby aplikacja sprzed OTA nie pokazala "—"
+   * w miejscu godzin.
+   */
   workFrom: string | null;
+  /** Ostatni zjazd doby. `null`, gdy ostatnia zmiana jeszcze trwa. */
   workTo: string | null;
+  /** SUMA godzin ze wszystkich zamknietych zmian doby. */
   workHours: number;
+  /** Wszystkie zmiany doby, w kolejnosci wyjazdu. */
+  sesje: SesjaItem[];
   hourlyRateNetto: number;
   fuelCost: number;
   fuelLiters: number;
@@ -197,87 +225,297 @@ export class FinanceService {
     return weekRange(this.getEffectiveDate(), offsetWeeks);
   }
 
-  // --- Zmiana ---------------------------------------------------------------
+  // --- Zmiany w dobie (work_sessions) ---------------------------------------
 
+  /**
+   * Zmiany danej doby, w kolejnosci wyjazdu.
+   *
+   * Sortowanie po `work_from` jako tekscie jest poprawne, bo format `GG:MM`
+   * z wiodacym zerem porzadkuje sie leksykograficznie tak samo jak czasowo.
+   */
+  async listaSesji(telegramId: string | number, date: string): Promise<SesjaItem[]> {
+    const rows = await db
+      .select({ id: workSessions.id, od: workSessions.workFrom, do: workSessions.workTo })
+      .from(workSessions)
+      .where(and(eq(workSessions.telegramId, String(telegramId)), eq(workSessions.date, date)))
+      .orderBy(asc(workSessions.workFrom), asc(workSessions.id));
+    return rows;
+  }
+
+  /**
+   * Jedyna otwarta zmiana kuriera — NIEZALEZNIE od doby.
+   *
+   * Baza pilnuje, ze jest ich najwyzej jedna (indeks czesciowy
+   * `work_sessions_otwarta_idx`), wiec `limit(1)` nie ukrywa tu niczego.
+   * Data jest w wyniku celowo: zmiana otwarta wczoraj to zupelnie inny
+   * przypadek niz otwarta dzisiaj.
+   */
+  async otwartaSesja(
+    telegramId: string | number
+  ): Promise<{ id: number; date: string; od: string } | null> {
+    const [row] = await db
+      .select({ id: workSessions.id, date: workSessions.date, od: workSessions.workFrom })
+      .from(workSessions)
+      .where(and(eq(workSessions.telegramId, String(telegramId)), isNull(workSessions.workTo)))
+      .limit(1);
+    return row ?? null;
+  }
+
+  /**
+   * Ostatnia zmiana z doby POPRZEDNIEJ, ale tylko jesli przeszla przez polnoc.
+   *
+   * Po co: zmiana 18.08 23:00-02:00 i zmiana 19.08 01:00-05:00 leza w roznych
+   * dobach, a w rzeczywistym czasie nachodza na siebie o godzine. Bez tego
+   * te same godziny policzylyby sie dwa razy i nikt by tego nie zobaczyl.
+   *
+   * Zmiana zakonczona przed polnoca nie moze kolidowac z niczym z nastepnej
+   * doby, wiec nie ma powodu jej zwracac.
+   */
+  private async sesjaZPoprzedniejDoby(tId: string, date: string): Promise<Sesja | null> {
+    const wczoraj = addDays(date, -1);
+    const [row] = await db
+      .select({ id: workSessions.id, od: workSessions.workFrom, do: workSessions.workTo })
+      .from(workSessions)
+      .where(and(eq(workSessions.telegramId, tId), eq(workSessions.date, wczoraj)))
+      .orderBy(desc(workSessions.workFrom), desc(workSessions.id))
+      .limit(1);
+
+    if (!row) return null;
+    const zakres = zakresSesji(row, 0);
+    if (!zakres || zakres.koniec <= 1440) return null;
+    return row;
+  }
+
+  /** Sesje doby + ewentualna wczorajsza przechodzaca przez polnoc. */
+  private async kontekstWalidacji(tId: string, date: string) {
+    const [istniejace, zPoprzedniejDoby] = await Promise.all([
+      this.listaSesji(tId, date),
+      this.sesjaZPoprzedniejDoby(tId, date),
+    ]);
+    return { istniejace, zPoprzedniejDoby };
+  }
+
+  /**
+   * Otwiera nowa zmiane.
+   *
+   * Zwraca `blad` zamiast rzucac wyjatkiem, bo to nie jest awaria, tylko
+   * odmowa z powodu, ktory uzytkownik ma zobaczyc: „masz juz otwarta zmiane",
+   * „te godziny sie nakladaja", „w dobie wyszloby 18 h".
+   *
+   * Format godziny to co innego — tam nadal leci wyjatek, tak jak wszedzie
+   * indziej w tym serwisie.
+   */
+  async otworzSesje(
+    telegramId: string | number,
+    date: string,
+    od: string,
+    zrodlo: 'BOT' | 'APP' | 'VOICE' | 'IMPORT' = 'BOT'
+  ): Promise<{ sesja: SesjaItem | null; blad: string | null }> {
+    const tId = String(telegramId);
+    const godzina = normalizeTime(od);
+    if (!godzina) throw new Error('Nieprawidłowy format godziny wyjazdu.');
+
+    const otwarta = await this.otwartaSesja(tId);
+    if (otwarta) {
+      return {
+        sesja: null,
+        blad:
+          otwarta.date === date
+            ? `Zmiana od ${otwarta.od} już trwa — najpierw ją zamknij.`
+            : `Nie zamknięto zmiany z ${otwarta.date} (od ${otwarta.od}). Zamknij ją albo usuń.`,
+      };
+    }
+
+    const { istniejace, zPoprzedniejDoby } = await this.kontekstWalidacji(tId, date);
+    const wynik = walidujSesje({ istniejace, nowa: { od: godzina, do: null }, zPoprzedniejDoby });
+    if (!wynik.ok) return { sesja: null, blad: wynik.komunikat };
+
+    const [row] = await db
+      .insert(workSessions)
+      .values({ telegramId: tId, date, workFrom: godzina, source: zrodlo })
+      .returning({ id: workSessions.id, od: workSessions.workFrom, do: workSessions.workTo });
+
+    return { sesja: row ?? null, blad: null };
+  }
+
+  /**
+   * Zamyka otwarta zmiane.
+   *
+   * Kontrola doby jest tu istotna i nieoczywista. Zmiana zaczeta 23:50
+   * i zamknieta o 02:10 nastepnego dnia to normalne 2 h 20 min. Ale zmiana
+   * zaczeta wczoraj o 16:00 i zamknieta dzis o 18:00 to 26 godzin, a
+   * `calculateHours` — ktora zna tylko godziny, nie daty — policzylaby 2 h.
+   *
+   * Stad: przy roznicy jednej doby wymagamy, zeby zjazd faktycznie wypadal
+   * po polnocy (godzina <= godzina wyjazdu). Przy wiekszej roznicy nie ma
+   * dobrej odpowiedzi i mowimy o tym wprost.
+   */
+  async zamknijSesje(
+    telegramId: string | number,
+    doGodz: string
+  ): Promise<{ sesja: SesjaItem | null; blad: string | null }> {
+    const tId = String(telegramId);
+    const godzina = normalizeTime(doGodz);
+    if (!godzina) throw new Error('Nieprawidłowy format godziny zjazdu.');
+
+    const otwarta = await this.otwartaSesja(tId);
+    if (!otwarta) {
+      return { sesja: null, blad: 'Nie ma otwartej zmiany — najpierw zapisz wyjazd.' };
+    }
+
+    const roznicaDni = daysBetween(otwarta.date, this.getEffectiveDate());
+    if (roznicaDni > 1 || (roznicaDni === 1 && godzina > otwarta.od)) {
+      return {
+        sesja: null,
+        blad: `Zmiana z ${otwarta.date} od ${otwarta.od} trwałaby ponad dobę. Popraw ją ręcznie albo usuń.`,
+      };
+    }
+
+    const res = calculateHours(otwarta.od, godzina);
+    if (res.error) return { sesja: null, blad: res.error };
+
+    const pozostale = (await this.listaSesji(tId, otwarta.date)).filter((s) => s.id !== otwarta.id);
+    const suma = round2(sumaGodzinDoby(pozostale) + (res.hours ?? 0));
+    if (suma > CFG.MAX_SHIFT_HOURS) {
+      return {
+        sesja: null,
+        blad: `Razem wyszłoby ${suma.toFixed(2)} h w dobie ${otwarta.date} (limit ${CFG.MAX_SHIFT_HOURS} h).`,
+      };
+    }
+
+    const [row] = await db
+      .update(workSessions)
+      .set({ workTo: godzina })
+      .where(eq(workSessions.id, otwarta.id))
+      .returning({ id: workSessions.id, od: workSessions.workFrom, do: workSessions.workTo });
+
+    return { sesja: row ?? null, blad: null };
+  }
+
+  /**
+   * Dopisuje kompletna zmiane albo poprawia istniejaca (`id`).
+   * To jest sciezka formularza i poprawek wstecz — nie start ani zjazd.
+   */
+  async zapiszSesje(
+    telegramId: string | number,
+    date: string,
+    dane: { id?: number; od: string; do: string; zrodlo?: 'BOT' | 'APP' | 'VOICE' | 'IMPORT' }
+  ): Promise<{ sesja: SesjaItem | null; blad: string | null }> {
+    const tId = String(telegramId);
+    const od = normalizeTime(dane.od);
+    const doGodz = normalizeTime(dane.do);
+    if (!od || !doGodz) throw new Error('Nieprawidłowy format godziny.');
+
+    const { istniejace, zPoprzedniejDoby } = await this.kontekstWalidacji(tId, date);
+    const wynik = walidujSesje({
+      istniejace,
+      // `exactOptionalPropertyTypes` nie pozwala podac `id: undefined` —
+      // klucza ma po prostu nie byc, gdy dopisujemy nowa zmiane.
+      nowa: { ...(dane.id !== undefined ? { id: dane.id } : {}), od, do: doGodz },
+      zPoprzedniejDoby,
+    });
+    if (!wynik.ok) return { sesja: null, blad: wynik.komunikat };
+
+    if (dane.id !== undefined) {
+      const [row] = await db
+        .update(workSessions)
+        .set({ workFrom: od, workTo: doGodz })
+        .where(and(eq(workSessions.id, dane.id), eq(workSessions.telegramId, tId)))
+        .returning({ id: workSessions.id, od: workSessions.workFrom, do: workSessions.workTo });
+      return row
+        ? { sesja: row, blad: null }
+        : { sesja: null, blad: `Nie ma zmiany o numerze ${dane.id}.` };
+    }
+
+    const [row] = await db
+      .insert(workSessions)
+      .values({ telegramId: tId, date, workFrom: od, workTo: doGodz, source: dane.zrodlo ?? 'BOT' })
+      .returning({ id: workSessions.id, od: workSessions.workFrom, do: workSessions.workTo });
+
+    return { sesja: row ?? null, blad: null };
+  }
+
+  /** Kasuje jedna zmiane. `false` = nie bylo takiej (albo nalezy do kogos innego). */
+  async usunSesje(telegramId: string | number, id: number): Promise<boolean> {
+    const usuniete = await db
+      .delete(workSessions)
+      .where(and(eq(workSessions.id, id), eq(workSessions.telegramId, String(telegramId))))
+      .returning({ id: workSessions.id });
+    return usuniete.length > 0;
+  }
+
+  /** Kasuje wszystkie zmiany doby. Zwraca, ile ich bylo. */
+  async usunSesjeDnia(telegramId: string | number, date: string): Promise<number> {
+    const usuniete = await db
+      .delete(workSessions)
+      .where(and(eq(workSessions.telegramId, String(telegramId)), eq(workSessions.date, date)))
+      .returning({ id: workSessions.id });
+    return usuniete.length;
+  }
+
+  // --- Zgodnosc: stare wejscia bota i API -----------------------------------
+
+  /**
+   * „Wyjazd" — otwiera zmiane albo poprawia godzine tej juz otwartej.
+   *
+   * Zachowana nazwa i ksztalt wyniku, bo bot i API wolaja to w kilku
+   * miejscach. Zmienilo sie znaczenie: `workFrom` nie nadpisuje juz jednej
+   * pary w `daily_records`, tylko dotyczy KONKRETNEJ zmiany.
+   */
   async setShiftStart(
     telegramId: string | number,
     date: string,
     workFrom: string
   ): Promise<{ summary: DailySummary; hoursError: string | null }> {
     const tId = String(telegramId);
-    const from = normalizeTime(workFrom);
-    if (!from) throw new Error('Nieprawidłowy format godziny wyjazdu.');
+    const godzina = normalizeTime(workFrom);
+    if (!godzina) throw new Error('Nieprawidłowy format godziny wyjazdu.');
 
-    const existing = await this.getDailyRecord(tId, date);
+    const otwarta = await this.otwartaSesja(tId);
 
-    let hours: number | null = null;
-    let hoursError: string | null = null;
-    if (existing?.workTo) {
-      const res = calculateHours(from, existing.workTo);
-      hours = res.hours;
-      hoursError = res.error;
+    // Otwarta zmiana TEJ doby = poprawka godziny wyjazdu, nie druga zmiana.
+    if (otwarta && otwarta.date === date) {
+      const { istniejace, zPoprzedniejDoby } = await this.kontekstWalidacji(tId, date);
+      const wynik = walidujSesje({
+        istniejace,
+        nowa: { id: otwarta.id, od: godzina, do: null },
+        zPoprzedniejDoby,
+      });
+      if (!wynik.ok) {
+        return { summary: await this.getDailySummary(tId, date), hoursError: wynik.komunikat };
+      }
+      await db.update(workSessions).set({ workFrom: godzina }).where(eq(workSessions.id, otwarta.id));
+      return { summary: await this.getDailySummary(tId, date), hoursError: null };
     }
 
-    await db
-      .insert(dailyRecords)
-      .values({
-        telegramId: tId,
-        date,
-        workFrom: from,
-        workTo: existing?.workTo ?? null,
-        workHours: hours !== null ? hours.toFixed(2) : null,
-      })
-      .onConflictDoUpdate({
-        target: [dailyRecords.telegramId, dailyRecords.date],
-        set: {
-          workFrom: from,
-          // Godziny przeliczamy zawsze gdy da sie je policzyc - takze na null,
-          // zeby po poprawce wyjazdu nie zostawala stara, nieaktualna wartosc.
-          ...(existing?.workTo ? { workHours: hours !== null ? hours.toFixed(2) : null } : {}),
-        },
-      });
-
-    return { summary: await this.getDailySummary(tId, date), hoursError };
+    const { blad } = await this.otworzSesje(tId, date, godzina);
+    return { summary: await this.getDailySummary(tId, date), hoursError: blad };
   }
 
+  /**
+   * „Zjazd" — zamyka otwarta zmiane, przy okazji zapisujac dystans doby.
+   *
+   * ZMIANA ZNACZENIA wzgledem wersji sprzed P3: bez otwartej zmiany godzina
+   * zjazdu NIE zapisuje sie. Wczesniej ladowala w `work_to` przy pustym
+   * `work_from`; w modelu sesji nie ma czego zamknac. Dystans i tak leci do
+   * bazy, a o godzinie mowi `hoursError`.
+   */
   async setShiftEnd(
     telegramId: string | number,
     date: string,
     data: { workTo?: string | null; distanceKm?: number | null }
   ): Promise<{ summary: DailySummary; hoursError: string | null }> {
     const tId = String(telegramId);
-    const existing = await this.getDailyRecord(tId, date);
 
-    const workFrom = existing?.workFrom ?? null;
-    const workTo = data.workTo ? normalizeTime(data.workTo) : (existing?.workTo ?? null);
-    if (data.workTo && !workTo) throw new Error('Nieprawidłowy format godziny zjazdu.');
-
-    let hours: number | null = existing?.workHours ? parseFloat(existing.workHours) : null;
-    let hoursError: string | null = null;
-    if (workFrom && workTo) {
-      const res = calculateHours(workFrom, workTo);
-      hours = res.hours;
-      hoursError = res.error;
+    if (data.distanceKm != null) {
+      await this.setDailyDistance(tId, date, data.distanceKm);
     }
 
-    await db
-      .insert(dailyRecords)
-      .values({
-        telegramId: tId,
-        date,
-        workFrom,
-        workTo,
-        workHours: hours !== null ? hours.toFixed(2) : null,
-        distanceKm: data.distanceKm != null ? data.distanceKm.toFixed(2) : null,
-      })
-      .onConflictDoUpdate({
-        target: [dailyRecords.telegramId, dailyRecords.date],
-        set: {
-          ...(workTo ? { workTo } : {}),
-          ...(workFrom && workTo ? { workHours: hours !== null ? hours.toFixed(2) : null } : {}),
-          ...(data.distanceKm != null ? { distanceKm: data.distanceKm.toFixed(2) } : {}),
-        },
-      });
+    let hoursError: string | null = null;
+    if (data.workTo) {
+      const { blad } = await this.zamknijSesje(tId, data.workTo);
+      hoursError = blad;
+    }
 
     return { summary: await this.getDailySummary(tId, date), hoursError };
   }
@@ -290,6 +528,7 @@ export class FinanceService {
       .limit(1);
     return record;
   }
+
 
   // --- Napiwki i paliwo -----------------------------------------------------
 
@@ -599,15 +838,27 @@ export class FinanceService {
     const workFrom = data.workFrom ? normalizeTime(data.workFrom) : null;
     const workTo = data.workTo ? normalizeTime(data.workTo) : null;
 
-    let hours: number | null = null;
+    // Godziny z glosu trafiaja do `work_sessions`, a nie do `daily_records`.
+    // Trzy przypadki, bo glosem mowi sie roznie:
+    //   „jechalem od 10 do 14"  -> kompletna zmiana
+    //   „wyjechalem o 10"       -> otwarcie zmiany
+    //   „skonczylem o 14"       -> zamkniecie otwartej
     if (workFrom && workTo) {
-      const res = calculateHours(workFrom, workTo);
-      hours = res.hours;
-      hoursError = res.error;
+      const { blad } = await this.zapiszSesje(tId, date, { od: workFrom, do: workTo, zrodlo: 'VOICE' });
+      hoursError = blad;
+    } else if (workFrom) {
+      const { blad } = await this.otworzSesje(tId, date, workFrom, 'VOICE');
+      hoursError = blad;
+    } else if (workTo) {
+      const { blad } = await this.zamknijSesje(tId, workTo);
+      hoursError = blad;
     }
 
     if (data.grossEarnings != null || data.distanceKm != null || workFrom || workTo) {
       hasDailyUpdate = true;
+    }
+
+    if (data.grossEarnings != null || data.distanceKm != null) {
       await db
         .insert(dailyRecords)
         .values({
@@ -615,18 +866,12 @@ export class FinanceService {
           date,
           grossEarnings: data.grossEarnings != null ? data.grossEarnings.toFixed(2) : null,
           distanceKm: data.distanceKm != null ? data.distanceKm.toFixed(2) : null,
-          workFrom,
-          workTo,
-          workHours: hours !== null ? hours.toFixed(2) : null,
         })
         .onConflictDoUpdate({
           target: [dailyRecords.telegramId, dailyRecords.date],
           set: {
             ...(data.grossEarnings != null ? { grossEarnings: data.grossEarnings.toFixed(2) } : {}),
             ...(data.distanceKm != null ? { distanceKm: data.distanceKm.toFixed(2) } : {}),
-            ...(workFrom ? { workFrom } : {}),
-            ...(workTo ? { workTo } : {}),
-            ...(workFrom && workTo ? { workHours: hours !== null ? hours.toFixed(2) : null } : {}),
           },
         });
     }
@@ -636,7 +881,7 @@ export class FinanceService {
 
   async handleVoiceDeletion(
     telegramId: string | number,
-    target: 'LAST_TIP' | 'ALL_TIPS' | 'FUEL' | 'HOURS' | 'EARNINGS' | 'DISTANCE' | 'ALL_DAY',
+    target: 'LAST_TIP' | 'ALL_TIPS' | 'FUEL' | 'HOURS' | 'LAST_SHIFT' | 'EARNINGS' | 'DISTANCE' | 'ALL_DAY',
     targetDateStr?: string | null
   ): Promise<{ success: boolean; message: string; date: string }> {
     const tId = String(telegramId);
@@ -680,13 +925,26 @@ export class FinanceService {
         return { success: true, message: `Usunięto ${deleted.length} paragon(y) paliwowe z dnia ${date}.`, date };
       }
 
+      // Znaczenie bez zmian: „skasuj godziny" to CALA doba. Gdyby zaczelo
+      // znaczyc „ostatnia zmiana", nikt by sie nie domyslil, dlaczego
+      // wczesniejsze zostaly.
       case 'HOURS': {
-        const updated = await db
-          .update(dailyRecords)
-          .set({ workFrom: null, workTo: null, workHours: null })
-          .where(scope)
-          .returning({ id: dailyRecords.id });
-        return this.deletionResult(updated.length, `czas pracy na ${date}`, date);
+        const ile = await this.usunSesjeDnia(tId, date);
+        return this.deletionResult(ile, `czas pracy na ${date}`, date);
+      }
+
+      /** Odpowiednik `LAST_TIP` dla zmian — glosem nie da sie wskazac `id`. */
+      case 'LAST_SHIFT': {
+        const sesje = await this.listaSesji(tId, date);
+        const ostatnia = sesje.at(-1);
+        if (!ostatnia) return { success: false, message: `Brak zmian na ${date}.`, date };
+
+        await this.usunSesje(tId, ostatnia.id);
+        return {
+          success: true,
+          message: `Usunięto ostatnią zmianę: ${ostatnia.od}–${ostatnia.do ?? 'trwa'} z dnia ${date}.`,
+          date,
+        };
       }
 
       case 'EARNINGS': {
@@ -708,6 +966,7 @@ export class FinanceService {
       }
 
       case 'ALL_DAY': {
+        const removedSessions = await this.usunSesjeDnia(tId, date);
         const removedRecords = await db.delete(dailyRecords).where(scope).returning({ id: dailyRecords.id });
         const removedTips = await db
           .delete(cashTips)
@@ -718,11 +977,11 @@ export class FinanceService {
           .where(and(eq(fuelReceipts.telegramId, tId), eq(fuelReceipts.date, date)))
           .returning({ id: fuelReceipts.id });
 
-        const total = removedRecords.length + removedTips.length + removedFuel.length;
+        const total = removedRecords.length + removedTips.length + removedFuel.length + removedSessions;
         if (total === 0) return { success: false, message: `Brak jakichkolwiek danych na ${date}.`, date };
         return {
           success: true,
-          message: `Usunięto dzień ${date}: wpis dnia, ${removedTips.length} napiwk(ów), ${removedFuel.length} paragon(ów).`,
+          message: `Usunięto dzień ${date}: wpis dnia, ${removedSessions} zmian(y), ${removedTips.length} napiwk(ów), ${removedFuel.length} paragon(ów).`,
           date,
         };
       }
@@ -744,8 +1003,9 @@ export class FinanceService {
   async getDailySummary(telegramId: string | number, date: string): Promise<DailySummary> {
     const tId = String(telegramId);
 
-    const [record, tipsRow, fuelRow, txs] = await Promise.all([
+    const [record, sesje, tipsRow, fuelRow, txs] = await Promise.all([
       this.getDailyRecord(tId, date),
+      this.listaSesji(tId, date),
       db
         .select({ total: sql<string>`coalesce(sum(${cashTips.amount}), 0)` })
         .from(cashTips)
@@ -771,7 +1031,10 @@ export class FinanceService {
 
     const gross = num(record?.grossEarnings);
     const cashTipsTotal = round2(num(tipsRow?.total));
-    const workHours = num(record?.workHours);
+
+    // Godziny doby = SUMA zamknietych zmian. Trwajaca wnosi 0 — inaczej
+    // stawka zl/h zmienialaby sie co minute (patrz `dlugoscSesjiH`).
+    const workHours = sumaGodzinDoby(sesje);
 
     const { netEarnings, totalNetto, doPrzelewu, hourlyRateNetto } = computeDailyTotals({
       grossEarnings: gross,
@@ -791,9 +1054,11 @@ export class FinanceService {
       totalNetto,
       walletPayouts,
       doPrzelewu,
-      workFrom: record?.workFrom ?? null,
-      workTo: record?.workTo ?? null,
+      // Skrot dla klienta sprzed OTA: pierwszy wyjazd i ostatni zjazd doby.
+      workFrom: sesje[0]?.od ?? null,
+      workTo: sesje.at(-1)?.do ?? null,
       workHours,
+      sesje,
       hourlyRateNetto,
       fuelCost,
       fuelLiters,
@@ -806,12 +1071,21 @@ export class FinanceService {
   async getPeriodSummary(telegramId: string | number, startDate: string, endDate: string): Promise<PeriodSummary> {
     const tId = String(telegramId);
 
-    const [records, tipsRow, fuelRow, txs] = await Promise.all([
+    const [records, sesje, tipsRow, fuelRow, txs] = await Promise.all([
       db
         .select()
         .from(dailyRecords)
         .where(
           and(eq(dailyRecords.telegramId, tId), gte(dailyRecords.date, startDate), lte(dailyRecords.date, endDate))
+        ),
+      // Godziny okresu ida z sesji, nie z `daily_records` — od P3 nie ma tam
+      // juz czego czytac. Zakres jest ograniczony do 400 dni (MAX_RANGE_DAYS
+      // w routes.read), wiec to najwyzej kilkaset wierszy.
+      db
+        .select({ od: workSessions.workFrom, do: workSessions.workTo })
+        .from(workSessions)
+        .where(
+          and(eq(workSessions.telegramId, tId), gte(workSessions.date, startDate), lte(workSessions.date, endDate))
         ),
       db
         .select({ total: sql<string>`coalesce(sum(${cashTips.amount}), 0)` })
@@ -841,12 +1115,11 @@ export class FinanceService {
     ]);
 
     let totalGross = 0;
-    let totalWorkHours = 0;
     let totalDistanceKm = 0;
+    const totalWorkHours = sumaGodzinDoby(sesje);
 
     for (const r of records) {
       totalGross += num(r.grossEarnings);
-      totalWorkHours += num(r.workHours);
       totalDistanceKm += num(r.distanceKm);
     }
 
@@ -985,12 +1258,11 @@ export class FinanceService {
   ): Promise<DailyTotals[]> {
     const tId = String(telegramId);
 
-    const [rekordy, napiwki, paliwa] = await Promise.all([
+    const [rekordy, sesje, napiwki, paliwa] = await Promise.all([
       db
         .select({
           date: dailyRecords.date,
           gross: dailyRecords.grossEarnings,
-          hours: dailyRecords.workHours,
           dist: dailyRecords.distanceKm,
         })
         .from(dailyRecords)
@@ -999,6 +1271,18 @@ export class FinanceService {
             eq(dailyRecords.telegramId, tId),
             gte(dailyRecords.date, startDate),
             lte(dailyRecords.date, endDate)
+          )
+        ),
+      // Godziny per dzien — grupujemy w JS, bo dlugosc zmiany liczy
+      // `calculateHours` (przejscie przez polnoc), a nie SQL.
+      db
+        .select({ date: workSessions.date, od: workSessions.workFrom, do: workSessions.workTo })
+        .from(workSessions)
+        .where(
+          and(
+            eq(workSessions.telegramId, tId),
+            gte(workSessions.date, startDate),
+            lte(workSessions.date, endDate)
           )
         ),
       db
@@ -1033,9 +1317,17 @@ export class FinanceService {
     for (const r of rekordy) {
       const w = wpis(r.date);
       w.gross = num(r.gross);
-      w.hours = num(r.hours);
       w.dist = num(r.dist);
     }
+    // Dzien moze miec zmiany bez wpisu w `daily_records` (jechal, nic nie
+    // wpisal) — `wpis()` zaklada wtedy wiersz, wiec taki dzien nie wypadnie.
+    const sesjeDnia = new Map<string, Sesja[]>();
+    for (const r of sesje) {
+      const lista = sesjeDnia.get(r.date) ?? [];
+      lista.push({ od: r.od, do: r.do });
+      sesjeDnia.set(r.date, lista);
+    }
+    for (const [date, lista] of sesjeDnia) wpis(date).hours = sumaGodzinDoby(lista);
     for (const r of napiwki) wpis(r.date).tips = num(r.suma);
     for (const r of paliwa) wpis(r.date).fuel = num(r.suma);
 
