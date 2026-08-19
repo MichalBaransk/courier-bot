@@ -3,7 +3,7 @@ import { verifyOfferDistance } from './maps.service.js';
 import { financeService } from './finance.service.js';
 import { lokalizacjaService } from './lokalizacja.service.js';
 import { computeOfferRate } from './finance.calc.js';
-import { kilometrLubNull, wymiaryObrazu } from './obraz.rules.js';
+import { kilometrLubNull, kmZWiersza, wymiaryObrazu } from './obraz.rules.js';
 
 /**
  * Ocena oferty kursu — JEDNA sciezka dla bota i dla aplikacji.
@@ -88,15 +88,23 @@ export async function ocenOferte(
   const surowe = await geminiService.analyzeCourseOffer(obraz, mimeType);
 
   /**
-   * ZERO od modelu znaczy „nie odczytalem" — patrz `kilometrLubNull`.
-   * Bez tego do bazy trafia `0.00`, czyli „zero kilometrow do punktu odbioru",
-   * i nikt pozniej nie odrozni tego od prawdziwego pomiaru.
+   * Kilometry z DWOCH zrodel, w tej kolejnosci:
+   *
+   * 1. pole liczbowe od modelu, z zerem potraktowanym jak brak
+   *    (`kilometrLubNull` — zero to „nie odczytalem", nie „zero km"),
+   * 2. liczba wyciagnieta wlasnym regexem z wiersza przepisanego doslownie.
+   *
+   * Drugie zrodlo nie jest nadmiarem ostroznosci. Na piatce ofert z 19.08
+   * dystans do KLIENTA nie wszedl ani razu, a do punktu odbioru wchodzil raz
+   * na dwa. Wiersz „Dostawa" to samotne slowo, szeroka pusta przestrzen
+   * i liczba przy prawej krawedzi — model potrafi go przepisac i mimo to
+   * oddac `null` w polu liczbowym. Skoro tekst juz mamy, nie ma powodu pytac
+   * drugi raz ani placic za drugie wywolanie.
    */
-  const offer = {
-    ...surowe,
-    appPickupKm: kilometrLubNull(surowe.appPickupKm),
-    appDeliveryKm: kilometrLubNull(surowe.appDeliveryKm),
-  };
+  const zOdbioru = kilometrLubNull(surowe.appPickupKm) ?? kmZWiersza(surowe.wierszOdbioru);
+  const zDostawy = kilometrLubNull(surowe.appDeliveryKm) ?? kmZWiersza(surowe.wierszDostawy);
+
+  const offer = { ...surowe, appPickupKm: zOdbioru, appDeliveryKm: zDostawy };
 
   /**
    * Log diagnostyczny — jedna linia na ocene.
@@ -109,12 +117,21 @@ export async function ocenOferte(
    * Bez tego logu kazda nieudana ocena konczy sie zgadywaniem.
    */
   const wym = wymiaryObrazu(obraz);
+  const zRegexu =
+    (surowe.appPickupKm == null || surowe.appPickupKm === 0) && zOdbioru !== null
+      ? ' [odbior z wiersza]'
+      : '';
+  const zRegexuD =
+    (surowe.appDeliveryKm == null || surowe.appDeliveryKm === 0) && zDostawy !== null
+      ? ' [dostawa z wiersza]'
+      : '';
+
   console.log(
     `[Oferta] ${wym ? `${wym.szerokosc}x${wym.wysokosc} ${wym.format}` : 'nieznany format'}, ` +
       `${Math.round(obraz.length / 1024)} kB, brutto=${surowe.grossAmount}, ` +
-      `km=${surowe.appPickupKm ?? 'null'}/${surowe.appDeliveryKm ?? 'null'}` +
-      `${offer.appPickupKm !== surowe.appPickupKm || offer.appDeliveryKm !== surowe.appDeliveryKm ? ' (zero -> null)' : ''}, ` +
-      `odbior="${surowe.pickupAddress}"`
+      `model=${surowe.appPickupKm ?? 'null'}/${surowe.appDeliveryKm ?? 'null'} ` +
+      `-> uzyte=${zOdbioru ?? 'null'}/${zDostawy ?? 'null'}${zRegexu}${zRegexuD}\n` +
+      `         wiersze: "${surowe.wierszOdbioru ?? '-'}" | "${surowe.wierszDostawy ?? '-'}"`
   );
 
   const userLoc = await ustalPozycje(tId, pozycja);

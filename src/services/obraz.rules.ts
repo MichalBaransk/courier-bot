@@ -104,3 +104,39 @@ export function kilometrLubNull(v: number | null): number | null {
   if (v === null || !Number.isFinite(v) || v <= 0) return null;
   return v;
 }
+
+/**
+ * Kilometry wyciagniete z DOSLOWNIE przepisanego wiersza oferty.
+ *
+ * Drugie zrodlo tej samej liczby, i to nie z nadmiaru ostroznosci.
+ * Zaobserwowane 19.08 na piatce ofert: model przepisuje wiersz poprawnie,
+ * a w polu liczbowym oddaje `null` albo `0` — najczesciej przy wierszu
+ * „Dostawa", gdzie miedzy slowem a liczba jest szeroka pusta przestrzen.
+ * Skoro tekst mamy, liczbe wyciagniemy sami i nie trzeba pytac modelu drugi raz.
+ *
+ * Format na ekranie Glovo to `3,37 km` — przecinek dziesietny i jednostka.
+ * Akceptujemy tez kropke, bo model bywa "pomocny" i sam zamienia separator.
+ *
+ * Bierzemy OSTATNIE dopasowanie w linii. Powod: wiersz odbioru zaczyna sie
+ * od nazwy firmy, a w nazwie potrafi siedziec liczba („Zabka 7 km od centrum"
+ * to nie dystans, ale „Sklep 24h 3,37 km" juz tak). Dystans stoi zawsze
+ * na koncu wiersza, wiec ostatnie dopasowanie jest tym wlasciwym.
+ *
+ * Metry celowo NIE sa obslugiwane. Nie widzialem ich na zadnym zrzucie, a
+ * zgadywanie, ze `850 m` znaczy `0,85 km`, byloby dokladanie regul do czegos,
+ * czego nikt nie potwierdzil.
+ */
+export function kmZWiersza(wiersz: string | null): number | null {
+  if (!wiersz) return null;
+
+  const dopasowania = [...wiersz.matchAll(/(\d+)[.,](\d+)\s*km\b/gi)];
+  const ostatnie = dopasowania.at(-1);
+
+  if (!ostatnie) {
+    // Liczba calkowita z jednostka: `3 km`.
+    const calkowite = [...wiersz.matchAll(/(\d+)\s*km\b/gi)].at(-1);
+    return calkowite ? kilometrLubNull(Number(calkowite[1])) : null;
+  }
+
+  return kilometrLubNull(Number(`${ostatnie[1]}.${ostatnie[2]}`));
+}

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { kilometrLubNull, wymiaryObrazu } from './obraz.rules.js';
+import { kilometrLubNull, kmZWiersza, wymiaryObrazu } from './obraz.rules.js';
 
 /** Minimalny, ale PRAWDZIWY naglowek PNG: sygnatura + IHDR z wymiarami. */
 function png(szerokosc: number, wysokosc: number): Buffer {
@@ -74,5 +74,41 @@ describe('kilometrLubNull — zero to „nie odczytałem", nie „zero km"', () 
     expect(kilometrLubNull(null)).toBeNull();
     expect(kilometrLubNull(-1)).toBeNull();
     expect(kilometrLubNull(Number.NaN)).toBeNull();
+  });
+});
+
+describe('kmZWiersza — kilometry z dosłownie przepisanego wiersza', () => {
+  it('czyta format z ekranu Glovo: przecinek i jednostka', () => {
+    expect(kmZWiersza('Apteczka Zdrowia 3,37 km')).toBe(3.37);
+    expect(kmZWiersza('Dostawa 3,01 km')).toBe(3.01);
+  });
+
+  it('przyjmuje też kropkę — model bywa „pomocny" i sam zamienia separator', () => {
+    expect(kmZWiersza('Dostawa 5.47 km')).toBe(5.47);
+  });
+
+  it('radzi sobie z liczbą całkowitą', () => {
+    expect(kmZWiersza('Dostawa 4 km')).toBe(4);
+  });
+
+  it('bierze OSTATNIE dopasowanie — w nazwie firmy też bywają liczby', () => {
+    expect(kmZWiersza('Sklep 24h 3,37 km')).toBe(3.37);
+    expect(kmZWiersza('Stacja 7 km od centrum 2,50 km')).toBe(2.5);
+  });
+
+  it('null, gdy w wierszu nie ma kilometrów', () => {
+    expect(kmZWiersza('Dostawa')).toBeNull();
+    expect(kmZWiersza('MediaMarkt, Alpejska 6')).toBeNull();
+    expect(kmZWiersza(null)).toBeNull();
+    expect(kmZWiersza('')).toBeNull();
+  });
+
+  it('nie łapie liczb bez jednostki — 255,69 zł to nie dystans', () => {
+    expect(kmZWiersza('ZAPŁAĆ 255,69 zł')).toBeNull();
+    expect(kmZWiersza('22,04 zł')).toBeNull();
+  });
+
+  it('zero traktuje jak brak, tak samo jak `kilometrLubNull`', () => {
+    expect(kmZWiersza('Dostawa 0,00 km')).toBeNull();
   });
 });

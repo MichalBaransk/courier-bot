@@ -66,6 +66,18 @@ export const CourseOfferSchema = z.object({
   appPickupKm: nullableNumber,
   /** Dystans z aplikacji Glovo: odbior -> klient (przy wierszu "Dostawa"). */
   appDeliveryKm: nullableNumber,
+  /**
+   * DOSLOWNA tresc wiersza odbioru, razem z kilometrami.
+   *
+   * Po co drugie zrodlo tej samej liczby: model potrafi odczytac wiersz i mimo
+   * to zwrocic `null` w polu liczbowym — zwlaszcza przy wierszu „Dostawa",
+   * gdzie miedzy slowem a liczba jest szeroka pusta przestrzen i nie ma sie
+   * czego zaczepic. Przepisanie wiersza zmusza go, zeby na te linie POPATRZYL,
+   * a nam daje material, z ktorego wyciagniemy kilometry wlasnym regexem.
+   */
+  wierszOdbioru: nullableString,
+  /** DOSLOWNA tresc wiersza „Dostawa", razem z kilometrami. */
+  wierszDostawy: nullableString,
 });
 export type CourseOfferExtractedData = z.infer<typeof CourseOfferSchema>;
 
@@ -141,6 +153,16 @@ const courseOfferResponseSchema: Schema = {
       type: Type.NUMBER,
       nullable: true,
       description: 'Kilometry po PRAWEJ stronie wiersza "Dostawa" (np. 3,01 km).',
+    },
+    wierszOdbioru: {
+      type: Type.STRING,
+      nullable: true,
+      description: 'Dosłowna treść wiersza punktu odbioru wraz z kilometrami, np. "Apteczka Zdrowia 3,37 km".',
+    },
+    wierszDostawy: {
+      type: Type.STRING,
+      nullable: true,
+      description: 'Dosłowna treść wiersza dostawy wraz z kilometrami, np. "Dostawa 3,01 km".',
     },
   },
   required: ['grossAmount', 'pickupAddress', 'deliveryAddress'],
@@ -334,6 +356,17 @@ Trzy rzeczy, na które uważaj:
 3. Gdy naprawdę nie potrafisz odczytać liczby — zwróć null. NIGDY nie zwracaj 0.
    Zero znaczy "zero kilometrów" i jest gorsze od przyznania się, że nie widzisz:
    z zera policzy się bezsensowna stawka, a z null-a nie policzy się nic.
+
+NAJWAŻNIEJSZE. Zanim podasz liczby, PRZEPISZ oba wiersze dosłownie, tak jak stoją
+na ekranie, razem z kilometrami:
+
+- wierszOdbioru: np. "Apteczka Zdrowia 3,37 km"
+- wierszDostawy: np. "Dostawa 3,01 km"
+
+Wiersz "Dostawa" bywa trudniejszy: to samo słowo po lewej, potem SZEROKA PUSTA
+PRZESTRZEŃ, a liczba dopiero przy prawej krawędzi karty. Nie ma tam adresu ani
+nazwy firmy. Przejedź wzrokiem POZIOMO od słowa "Dostawa" aż do prawej krawędzi
+białej karty — liczba jest w tej samej linii.
 
 Kilometry zapisuj jako liczby, przecinek zamień na kropkę.
 `;
