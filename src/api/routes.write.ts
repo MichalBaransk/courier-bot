@@ -4,6 +4,7 @@ import { CFG } from '../config.js';
 import { financeService } from '../services/finance.service.js';
 import { ensureUserById } from '../services/user.service.js';
 import { lokalizacjaService } from '../services/lokalizacja.service.js';
+import { nowTimeWarsaw } from '../utils/datetime.js';
 import {
   BruttoSchema,
   CelSchema,
@@ -174,6 +175,21 @@ export function registerWriteRoutes(app: Hono, userId: string): void {
     return odpowiedz(c, date, null);
   });
 
+  /**
+   * Zmiana pracy. Cztery przypadki w jednym endpoincie, rozstrzygane tym,
+   * co przyszło w ciele:
+   *
+   * | `id` | `od` | `do` | co robi                                    |
+   * |------|------|------|--------------------------------------------|
+   * |  ✓   |  ✓   |  ✓   | poprawia wskazaną zmianę                   |
+   * |      |  ✓   |  ✓   | dopisuje kompletną zmianę (także wstecz)   |
+   * |      |  ✓   |      | otwiera zmianę                             |
+   * |      |      |  ✓   | zamyka otwartą                             |
+   *
+   * `409` znaczy „jest już otwarta zmiana" i jest oddzielone od `400`
+   * celowo: to nie jest błąd danych, tylko stan, w którym aplikacja ma
+   * pokazać przycisk „zamknij tamtą" zamiast komunikatu o złym wpisie.
+   */
   app.post('/api/v1/zmiana', async (c) => {
     const w = await czytajCialo(c, ZmianaSchema);
     if (!w.ok) return c.json({ error: w.komunikat }, 400);
@@ -181,20 +197,51 @@ export function registerWriteRoutes(app: Hono, userId: string): void {
     const date = dzien(w.wartosc.data);
     await ensureUserById(userId);
 
-    let ostrzezenie: string | null = null;
+    // `TERAZ` rozwijamy TUTAJ, zegarem serwera — patrz `godzinaLubTeraz`.
+    const godzina = (v: string | null): string | null =>
+      v === null ? null : v.trim().toUpperCase() === 'TERAZ' ? nowTimeWarsaw() : v;
 
-    // Kolejność ma znaczenie: `setShiftEnd` przelicza godziny dopiero wtedy,
-    // gdy `workFrom` jest już w bazie. Odwrotnie wynik byłby pusty.
-    if (w.wartosc.od !== null) {
-      const r = await financeService.setShiftStart(userId, date, w.wartosc.od);
-      ostrzezenie = r.hoursError;
-    }
-    if (w.wartosc.do !== null) {
-      const r = await financeService.setShiftEnd(userId, date, { workTo: w.wartosc.do });
-      ostrzezenie = r.hoursError;
+    const od = godzina(w.wartosc.od);
+    const doGodz = godzina(w.wartosc.do);
+
+    // Poprawka wskazanej zmiany. Schemat gwarantuje, ze przy `id` sa obie godziny.
+    if (w.wartosc.id !== null && od !== null && doGodz !== null) {
+      const r = await financeService.zapiszSesje(userId, date, { id: w.wartosc.id, od, do: doGodz, zrodlo: 'APP' });
+      if (r.blad) return c.json({ error: r.blad }, 400);
+      return odpowiedz(c, date, null);
     }
 
-    return odpowiedz(c, date, ostrzezenie);
+    // Kompletna zmiana dopisana jednym zadaniem — formularz, takze wstecz.
+    if (od !== null && doGodz !== null) {
+      const r = await financeService.zapiszSesje(userId, date, { od, do: doGodz, zrodlo: 'APP' });
+      if (r.blad) return c.json({ error: r.blad }, 400);
+      return odpowiedz(c, date, null);
+    }
+
+    if (od !== null) {
+      // Sprawdzamy PRZED zapisem, zeby odroznic 409 od 400 bez czytania
+      // tresci komunikatu. Kod odpowiedzi jest kontraktem, komunikat nie.
+      const otwarta = await financeService.otwartaSesja(userId);
+      if (otwarta) {
+        return c.json(
+          {
+            error:
+              otwarta.date === date
+                ? `Zmiana od ${otwarta.od} już trwa — najpierw ją zamknij.`
+                : `Nie zamknięto zmiany z ${otwarta.date} (od ${otwarta.od}). Zamknij ją albo usuń.`,
+            otwarta,
+          },
+          409
+        );
+      }
+      const r = await financeService.otworzSesje(userId, date, od, 'APP');
+      if (r.blad) return c.json({ error: r.blad }, 400);
+      return odpowiedz(c, date, null);
+    }
+
+    const r = await financeService.zamknijSesje(userId, doGodz!);
+    if (r.blad) return c.json({ error: r.blad }, 400);
+    return odpowiedz(c, date, null);
   });
 
   /** Cel zarobkowy na bieżący miesiąc albo tydzień ISO (§8e). */
@@ -218,7 +265,26 @@ export function registerWriteRoutes(app: Hono, userId: string): void {
     const w = await czytajCialo(c, UsunSchema);
     if (!w.ok) return c.json({ error: w.komunikat }, 400);
 
-    const wynik = await financeService.handleVoiceDeletion(userId, w.wartosc.cel, w.wartosc.data);
+    // Kasowanie WSKAZANEJ zmiany nie przechodzi przez `handleVoiceDeletion`,
+    // bo tamta funkcja operuje na dniu, a nie na wierszu. Schemat gwarantuje,
+    // ze przy `SHIFT` jest `sesjaId`.
+    if (w.wartosc.cel === 'SHIFT' && w.wartosc.sesjaId !== null) {
+      const date = dzien(w.wartosc.data);
+      const usunieta = await financeService.usunSesje(userId, w.wartosc.sesjaId);
+      return c.json({
+        usuniete: usunieta,
+        komunikat: usunieta
+          ? `Usunięto zmianę nr ${w.wartosc.sesjaId}.`
+          : `Nie ma zmiany o numerze ${w.wartosc.sesjaId}.`,
+        dzien: await financeService.getDailySummary(userId, date),
+      });
+    }
+
+    const wynik = await financeService.handleVoiceDeletion(
+      userId,
+      w.wartosc.cel as Exclude<typeof w.wartosc.cel, 'SHIFT'>,
+      w.wartosc.data
+    );
     return c.json({
       usuniete: wynik.success,
       komunikat: wynik.message,

@@ -35,7 +35,7 @@ export const VoiceExtractedSchema = z.object({
   transcription: z.string().default(''),
   action: z.enum(['UPSERT', 'DELETE']).default('UPSERT'),
   deleteTarget: z
-    .enum(['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'DISTANCE', 'ALL_DAY'])
+    .enum(['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'LAST_SHIFT', 'EARNINGS', 'DISTANCE', 'ALL_DAY'])
     .nullish()
     .transform((v) => v ?? null),
   targetDate: nullableString,
@@ -99,7 +99,7 @@ const voiceResponseSchema: Schema = {
     action: { type: Type.STRING, enum: ['UPSERT', 'DELETE'] },
     deleteTarget: {
       type: Type.STRING,
-      enum: ['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'DISTANCE', 'ALL_DAY'],
+      enum: ['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'LAST_SHIFT', 'EARNINGS', 'DISTANCE', 'ALL_DAY'],
       nullable: true,
     },
     targetDate: { type: Type.STRING, nullable: true, description: 'YYYY-MM-DD, TODAY albo YESTERDAY.' },
@@ -240,7 +240,11 @@ export class GeminiService {
 Jesteś asystentem kuriera. Przeanalizuj nagranie audio i zwróć dane w JSON.
 Rozpoznaj akcję:
 - UPSERT: tankowanie (łączna kwota, litry, cena za litr), przejechany dystans, godziny od-do, zarobki brutto, napiwek gotówkowy.
-- DELETE: 'LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'DISTANCE', 'ALL_DAY'.
+- DELETE: 'LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'LAST_SHIFT', 'EARNINGS', 'DISTANCE', 'ALL_DAY'.
+Doba moze miec kilka zmian. 'HOURS' kasuje WSZYSTKIE zmiany dnia ("skasuj godziny",
+"wyczysc czas pracy"), a 'LAST_SHIFT' tylko ostatnia ("skasuj ostatnia zmiane",
+"usun te ostatnia zmiane"). Gdy nie wiadomo, ktore z dwoch — wybierz 'LAST_SHIFT',
+bo skutek da sie cofnac jednym wpisem, a skasowania calej doby juz nie.
 Uwaga: "distanceKm" to dystans PRZEJECHANY danego dnia, nie stan licznika pojazdu.
 Jeśli kurier poda stan licznika, zostaw distanceKm puste.
 Ignoruj szum wiatru i wydechu motocykla.

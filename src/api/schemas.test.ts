@@ -115,6 +115,57 @@ describe('ZmianaSchema', () => {
     expect(ZmianaSchema.safeParse({ od: '11:75' }).success).toBe(false);
     expect(ZmianaSchema.safeParse({ od: '1130' }).success).toBe(false);
   });
+
+  it('przyjmuje TERAZ zamiast godziny — zegar podstawia serwer', () => {
+    expect(ZmianaSchema.safeParse({ od: 'TERAZ' }).success).toBe(true);
+    expect(ZmianaSchema.safeParse({ do: 'teraz' }).success).toBe(true);
+    expect(ZmianaSchema.safeParse({ do: ' Teraz ' }).success).toBe(true);
+  });
+
+  it('nie przyjmuje innych słów — TERAZ to jedyny wyjątek od GG:MM', () => {
+    expect(ZmianaSchema.safeParse({ od: 'zaraz' }).success).toBe(false);
+    expect(ZmianaSchema.safeParse({ od: 'now' }).success).toBe(false);
+  });
+
+  it('poprawka zmiany wymaga id ORAZ obu godzin', () => {
+    expect(ZmianaSchema.safeParse({ id: 7, od: '10:00', do: '14:00' }).success).toBe(true);
+    expect(ZmianaSchema.safeParse({ id: 7, od: '10:00' }).success).toBe(false);
+    expect(ZmianaSchema.safeParse({ id: 7, do: '14:00' }).success).toBe(false);
+  });
+
+  it('odrzuca id, które nie jest dodatnią liczbą całkowitą', () => {
+    expect(ZmianaSchema.safeParse({ id: 0, od: '10:00', do: '14:00' }).success).toBe(false);
+    expect(ZmianaSchema.safeParse({ id: 1.5, od: '10:00', do: '14:00' }).success).toBe(false);
+    expect(ZmianaSchema.safeParse({ id: '7', od: '10:00', do: '14:00' }).success).toBe(false);
+  });
+
+  it('brak id znaczy „dopisz nową", nie „popraw pierwszą"', () => {
+    const w = ZmianaSchema.safeParse({ od: '10:00', do: '14:00' });
+    expect(w.success).toBe(true);
+    if (w.success) expect(w.data.id).toBeNull();
+  });
+});
+
+describe('UsunSchema — kasowanie zmian', () => {
+  it('SHIFT wymaga sesjaId', () => {
+    expect(UsunSchema.safeParse({ cel: 'SHIFT' }).success).toBe(false);
+    expect(UsunSchema.safeParse({ cel: 'SHIFT', sesjaId: 41 }).success).toBe(true);
+  });
+
+  it('HOURS i LAST_SHIFT dzialaja bez sesjaId', () => {
+    expect(UsunSchema.safeParse({ cel: 'HOURS' }).success).toBe(true);
+    expect(UsunSchema.safeParse({ cel: 'LAST_SHIFT' }).success).toBe(true);
+  });
+
+  it('stare cele nadal przechodzą — kontrakt się nie zerwał', () => {
+    for (const cel of ['LAST_TIP', 'ALL_TIPS', 'FUEL', 'EARNINGS', 'DISTANCE', 'ALL_DAY']) {
+      expect(UsunSchema.safeParse({ cel }).success).toBe(true);
+    }
+  });
+
+  it('komunikat przy SHIFT bez sesjaId mówi, czego brakuje', () => {
+    expect(pierwszyBlad(UsunSchema.safeParse({ cel: 'SHIFT' }))).toContain('sesjaId');
+  });
 });
 
 describe('pierwszyBlad', () => {

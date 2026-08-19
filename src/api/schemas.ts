@@ -38,10 +38,6 @@ const dataWpisu = opcjonalna(
   z.string().refine(isValidDateStr, 'Data musi być w formacie RRRR-MM-DD.')
 );
 
-const godzina = opcjonalna(
-  z.string().refine((v) => normalizeTime(v) !== null, 'Godzina musi być w formacie GG:MM.')
-);
-
 export const NapiwekSchema = z.object({
   kwota: liczbaDodatnia('kwota', 10_000),
   data: dataWpisu,
@@ -66,14 +62,46 @@ export const BruttoSchema = z.object({
   data: dataWpisu,
 });
 
+/**
+ * Godzina albo slowo `TERAZ`.
+ *
+ * `TERAZ` istnieje po to, zeby aplikacja NIE musiala wysylac odczytu z zegara
+ * telefonu. Zegar telefonu bywa przestawiony, a strefa zla — a §8a mowi, ze
+ * o czasie decyduje serwer. Do kroku 30 aplikacja wysylala `HH:MM` z
+ * `new Date()`; od P4 wysyla `TERAZ`, a serwer podstawia `nowTimeWarsaw()`.
+ *
+ * Zwykle `GG:MM` zostaje, bo formularz „wpisz godziny wstecz" go potrzebuje.
+ */
+const godzinaLubTeraz = opcjonalna(
+  z
+    .string()
+    .refine(
+      (v) => v.trim().toUpperCase() === 'TERAZ' || normalizeTime(v) !== null,
+      'Godzina musi być w formacie GG:MM albo słowem "TERAZ".'
+    )
+);
+
 export const ZmianaSchema = z
   .object({
-    od: godzina,
-    do: godzina,
+    od: godzinaLubTeraz,
+    do: godzinaLubTeraz,
     data: dataWpisu,
+    /** Numer istniejącej zmiany — obecny TYLKO przy poprawce. */
+    id: opcjonalna(
+      z
+        .number({ message: 'Pole "id" musi być liczbą.' })
+        .int('Pole "id" musi być liczbą całkowitą.')
+        .positive('Pole "id" musi być dodatnie.')
+    ),
   })
   .refine((v) => v.od !== null || v.do !== null, {
     message: 'Podaj przynajmniej jedną godzinę — "od" albo "do".',
+  })
+  .refine((v) => v.id === null || (v.od !== null && v.do !== null), {
+    // Poprawka zmiany wymaga OBU godzin. Sama jedna zamienilaby zapisana
+    // zmiane w polowiczna i nie wiadomo by bylo, czy druga godzina zniknela
+    // celowo, czy przez pomylke.
+    message: 'Poprawka zmiany wymaga obu godzin — "od" i "do".',
   });
 
 export const CelSchema = z.object({
@@ -81,13 +109,34 @@ export const CelSchema = z.object({
   kwota: liczbaDodatnia('kwota', 1_000_000),
 });
 
-/** Te same cele co kasowanie głosem w bocie — jedna lista, jedna logika. */
-export const UsunSchema = z.object({
-  cel: z.enum(['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'EARNINGS', 'DISTANCE', 'ALL_DAY'], {
-    message: 'Nieznany zakres kasowania.',
-  }),
-  data: dataWpisu,
-});
+/**
+ * Te same cele co kasowanie głosem w bocie — jedna lista, jedna logika.
+ *
+ * `HOURS` zachowuje dotychczasowe znaczenie: WSZYSTKIE zmiany doby. Gdyby
+ * zaczęło znaczyć „ostatnia", ktoś powiedziałby głosem „skasuj godziny",
+ * zobaczył jedną zmianę mniej i nie domyślił się, dlaczego reszta została.
+ *
+ * `SHIFT` kasuje wskazaną zmianę i jest do klikania w aplikacji — głosem
+ * nie da się podać `id`. `LAST_SHIFT` jest odpowiednikiem `LAST_TIP`.
+ */
+export const UsunSchema = z
+  .object({
+    cel: z.enum(
+      ['LAST_TIP', 'ALL_TIPS', 'FUEL', 'HOURS', 'SHIFT', 'LAST_SHIFT', 'EARNINGS', 'DISTANCE', 'ALL_DAY'],
+      { message: 'Nieznany zakres kasowania.' }
+    ),
+    data: dataWpisu,
+    /** Numer zmiany — wymagany wyłącznie przy `cel: "SHIFT"`. */
+    sesjaId: opcjonalna(
+      z
+        .number({ message: 'Pole "sesjaId" musi być liczbą.' })
+        .int('Pole "sesjaId" musi być liczbą całkowitą.')
+        .positive('Pole "sesjaId" musi być dodatnie.')
+    ),
+  })
+  .refine((v) => v.cel !== 'SHIFT' || v.sesjaId !== null, {
+    message: 'Kasowanie pojedynczej zmiany wymaga pola "sesjaId".',
+  });
 
 /**
  * Pozycja kuriera.

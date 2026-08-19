@@ -19,6 +19,7 @@ import {
   removeKeyboard,
   startShiftKeyboard,
   walletImportKeyboard,
+  zmianyKeyboard,
 } from './keyboards.js';
 import {
   dailyCard,
@@ -30,6 +31,8 @@ import {
   periodCard,
   startShiftCard,
   targetCard,
+  trwaZmiana,
+  zmianyCard,
 } from './cards.js';
 import { shouldParseAsNote } from './text-note.js';
 
@@ -228,9 +231,13 @@ async function shiftCardPayload(tId: string, date: string, mode: 'START' | 'END'
   ]);
   const now = nowTimeWarsaw();
 
+  // `trwa` zamiast „czy jest zapisana godzina": doba ma teraz wiele zmian,
+  // wiec obecnosc `workFrom` nic nie mowi o tym, czy cos jest otwarte.
+  const trwa = trwaZmiana(summary);
+
   return mode === 'START'
-    ? { text: startShiftCard(summary, wallet.balance, now), keyboard: startShiftKeyboard(now, Boolean(summary.workFrom)) }
-    : { text: endShiftCard(summary, wallet.balance, now), keyboard: endShiftKeyboard(now, Boolean(summary.workTo)) };
+    ? { text: startShiftCard(summary, wallet.balance, now), keyboard: startShiftKeyboard(now, trwa) }
+    : { text: endShiftCard(summary, wallet.balance, now), keyboard: endShiftKeyboard(now, trwa) };
 }
 
 // --- Rejestracja handlerow ---------------------------------------------------
@@ -613,6 +620,45 @@ export function registerBotHandlers(bot: Telegraf): void {
     const { latitude, longitude } = ctx.message.location;
     lastCourierLocation.set(String(ctx.from.id), { latitude, longitude, updatedAt: Date.now() });
     await ctx.reply('✅ Pozycja GPS zapisana. Weryfikacja tras Glovo aktywna na 30 minut.', removeKeyboard());
+  });
+
+  // === 4b. Lista zmian doby ==================================================
+
+  /**
+   * `/zmiany [data]` — doba moze miec ich kilka i bez tej komendy nie ma
+   * jak zobaczyc, ktore sa zapisane ani skasowac pomylki.
+   *
+   * Kasowanie idzie po `id` z klawiatury, nie po pozycji na liscie — patrz
+   * `zmianyKeyboard`.
+   */
+  bot.command(['zmiany', 'zmiana'], async (ctx) => {
+    const param = ctx.message.text.trim().split(/\s+/)[1];
+    const date = isValidDateStr(param) ? param : financeService.getEffectiveDate();
+    const summary = await financeService.getDailySummary(ctx.from.id, date);
+
+    await ctx.reply(zmianyCard(summary), {
+      ...HTML,
+      ...(summary.sesje.length > 0 ? zmianyKeyboard(date, summary.sesje) : {}),
+    });
+  });
+
+  bot.action(/^zmiana_usun_(\d+)_(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
+    const id = Number(ctx.match[1]);
+    const date = ctx.match[2] as string;
+    const tId = String(ctx.from.id);
+
+    const usunieta = await financeService.usunSesje(tId, id);
+    await ctx.answerCbQuery(usunieta ? 'Skasowana.' : 'Nie ma takiej zmiany.');
+
+    // Karte przerysowujemy Z BAZY, nie z tresci wiadomosci (3.4) — inaczej
+    // po drugim kasowaniu lista pokazywalaby stan sprzed pierwszego.
+    // Data pochodzi z callbacku, nie z „dzisiaj": karta mogla dotyczyc
+    // wybranego dnia i przerysowanie jej na dzisiejszy bylo by podmiana danych.
+    const summary = await financeService.getDailySummary(tId, date);
+    await ctx.editMessageText(zmianyCard(summary), {
+      ...HTML,
+      ...(summary.sesje.length > 0 ? zmianyKeyboard(date, summary.sesje) : {}),
+    });
   });
 
   // === 5. Raporty ============================================================

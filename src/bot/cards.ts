@@ -1,8 +1,10 @@
 import { CFG } from '../config.js';
 import { b, code, i, joinLines, km, progressBar, zl, zlSigned, SEPARATOR } from '../utils/format.js';
+import { dlugoscSesjiH } from '../services/finance.calc.js';
 import type {
   CourseOfferStats,
   DailySummary,
+  SesjaItem,
   FinanceService,
   PeriodSummary,
   TargetProgress,
@@ -24,6 +26,36 @@ function fuelLine(cost: number, liters: number, pricePerLiter: number | null): s
   return `⛽ ${b('Paliwo:')} ${b(zl(cost))}${details.length > 0 ? ` (${details.join(', ')})` : ''}`;
 }
 
+/**
+ * Lista zmian doby, po jednej w linii.
+ *
+ * Doba moze miec ich kilka (P3), wiec para „od-do" przestala wystarczac.
+ * Trwajaca zmiana ma `…` zamiast godziny zjazdu i NIE pokazuje dlugosci —
+ * gdyby pokazywala, liczba rosla by z kazdym odswiezeniem karty, a suma
+ * doby i tak jej nie liczy.
+ */
+export function sesjeLinie(sesje: readonly SesjaItem[]): string[] {
+  return sesje.map((s, idx) => {
+    const dlugosc = dlugoscSesjiH(s);
+    const zakres = `${s.od} – ${s.do ?? '…'}`;
+    return s.do === null
+      ? ` ${idx + 1}. ${code(zakres)} ${i('(trwa)')}`
+      : ` ${idx + 1}. ${code(zakres)} — ${b(`${dlugosc.toFixed(2)} h`)}`;
+  });
+}
+
+/** `⏱️ Czas pracy: 10.00 h (2 zmiany) — stawka 32.56 zł/h` albo informacja o braku. */
+function czasPracyLinia(summary: DailySummary): string {
+  if (summary.sesje.length === 0) {
+    return `⏱️ ${b('Czas pracy:')} ${i('brak zmian')}`;
+  }
+  const ile = summary.sesje.length;
+  const opis = ile === 1 ? '1 zmiana' : `${ile} zmiany`;
+  return summary.workHours > 0
+    ? `⏱️ ${b('Czas pracy:')} ${b(`${summary.workHours.toFixed(2)} h`)} (${opis}) — stawka ${b(`${summary.hourlyRateNetto.toFixed(2)} zł/h`)}`
+    : `⏱️ ${b('Czas pracy:')} ${i(`${opis}, żadna niezamknięta`)}`;
+}
+
 export function dailyCard(summary: DailySummary): string {
   return joinLines([
     `📅 ${b('Raport dzienny:')} ${code(summary.date)}`,
@@ -35,9 +67,8 @@ export function dailyCard(summary: DailySummary): string {
     summary.walletPayouts > 0 && `🏧 ${b('Wypłacone z portfela:')} ${b(`-${summary.walletPayouts.toFixed(2)} zł`)}`,
     `💳 ${b('Do przelewu:')} ${b(zl(summary.doPrzelewu))} ${i('(bez gotówki w kieszeni)')}`,
     '',
-    summary.workHours > 0
-      ? `⏱️ ${b('Czas pracy:')} ${code(`${summary.workFrom ?? '--:--'} - ${summary.workTo ?? '--:--'}`)} (${b(`${summary.workHours.toFixed(2)} h`)}) — stawka ${b(`${summary.hourlyRateNetto.toFixed(2)} zł/h`)}`
-      : `⏱️ ${b('Czas pracy:')} ${i('brak pełnego wpisu')}`,
+    czasPracyLinia(summary),
+    ...sesjeLinie(summary.sesje),
     summary.distanceKm != null
       ? `🚗 ${b('Dystans dnia:')} ${b(km(summary.distanceKm))}`
       : `🚗 ${b('Dystans dnia:')} ${i('brak wpisu')}`,
@@ -134,17 +165,29 @@ function rateNote(progress: TargetProgress): string | false {
   return false;
 }
 
+/** Czy ktoras ze zmian doby jest niezamknieta. */
+export function trwaZmiana(summary: DailySummary): boolean {
+  return summary.sesje.some((s) => s.do === null);
+}
+
 export function startShiftCard(summary: DailySummary, balance: number, currentTime: string): string {
+  const trwa = trwaZmiana(summary);
+  const otwarta = summary.sesje.find((s) => s.do === null);
+
   return joinLines([
     `🚀 ${b('Rozpoczęcie zmiany')}`,
     `📅 ${b('Data:')} ${code(summary.date)}`,
     '',
-    summary.workFrom
-      ? `⏱️ ${b('Godzina wyjazdu:')} ${b(summary.workFrom)} ${i('(zapisano w bazie)')}`
+    trwa
+      ? `⏱️ ${b('Zmiana trwa od:')} ${b(otwarta?.od ?? '--:--')}`
       : `⏱️ ${b('Godzina wyjazdu:')} ${i(`nieustalona — teraz ${currentTime}`)}`,
+    ...(summary.sesje.length > 0 ? ['', `📋 ${b('Zmiany dziś:')}`, ...sesjeLinie(summary.sesje)] : []),
+    '',
     `💵 ${b('Portfel Glovo:')} ${b(zl(balance))}`,
     '',
-    summary.workFrom ? i('Godzina wyjazdu jest zapisana.') : 'Wybierz godzinę startu poniżej:',
+    trwa
+      ? i('Zmiana już trwa — przycisk poprawi godzinę wyjazdu, nie zacznie drugiej.')
+      : 'Wybierz godzinę startu poniżej:',
   ]);
 }
 
@@ -153,7 +196,8 @@ export function endShiftCard(summary: DailySummary, balance: number, currentTime
     `🏁 ${b('Zakończenie zmiany')}`,
     `📅 ${b('Data zmiany:')} ${code(summary.date)}`,
     '',
-    `⏱️ ${b('Godziny pracy:')} ${code(`${summary.workFrom ?? '--:--'} - ${summary.workTo ?? '--:--'}`)} (${b(`${summary.workHours.toFixed(2)} h`)})`,
+    czasPracyLinia(summary),
+    ...sesjeLinie(summary.sesje),
     `🚗 ${b('Dystans dnia:')} ${summary.distanceKm != null ? b(km(summary.distanceKm)) : i('brak')}`,
     `💰 ${b('Zarobek brutto:')} ${summary.grossEarnings > 0 ? b(zl(summary.grossEarnings)) : i('brak wpisu')}`,
     `💵 ${b('Zarobek łącznie netto:')} ${b(zl(summary.totalNetto))} (stawka ${b(`${summary.hourlyRateNetto.toFixed(2)} zł/h`)})`,
@@ -164,7 +208,21 @@ export function endShiftCard(summary: DailySummary, balance: number, currentTime
     }`,
     `💼 ${b('Portfel Glovo:')} ${b(zl(balance))}`,
     '',
-    summary.workTo ? i('Godzina zjazdu i rozliczenie są zapisane.') : i(`Ustaw godzinę zjazdu (teraz ${currentTime}) lub podaj dystans.`),
+    trwaZmiana(summary)
+      ? i(`Ustaw godzinę zjazdu (teraz ${currentTime}) lub podaj dystans.`)
+      : i('Żadna zmiana nie trwa — zjazd nie ma czego zamknąć. Pozostałe przyciski działają.'),
+  ]);
+}
+
+/** Karta `/zmiany` — lista doby z sumą i przyciskami kasowania. */
+export function zmianyCard(summary: DailySummary): string {
+  return joinLines([
+    `🛵 ${b('Zmiany dnia')} ${code(summary.date)}`,
+    '',
+    ...(summary.sesje.length > 0 ? sesjeLinie(summary.sesje) : [i('Brak zmian w tym dniu.')]),
+    '',
+    `⏱️ ${b('Razem:')} ${b(`${summary.workHours.toFixed(2)} h`)}`,
+    summary.workHours > 0 && `💵 ${b('Stawka:')} ${b(`${summary.hourlyRateNetto.toFixed(2)} zł netto/h`)}`,
   ]);
 }
 
@@ -301,7 +359,12 @@ export function helpCard(): string {
     ` • ${code('/wyjazd 16:00 120')} – wyjazd z parametrami (godzina, stan portfela).`,
     ` • ${code('/koniec')} – zjazd i rozliczenie.`,
     ` • ${code('/koniec 23:15 54km 180')} – szybki zjazd (godzina, dystans, stan portfela).`,
+    ` • ${code('/zmiany')} – lista zmian dnia z sumą godzin i kasowaniem.`,
+    ` • ${code('/zmiany 2026-08-15')} – to samo dla wybranego dnia.`,
     ` • ${code('/anuluj')} – przerwij oczekiwanie na wpis.`,
+    '',
+    i('Doba może mieć wiele zmian — drugi /wyjazd nie nadpisuje pierwszej.'),
+    i('Zjazd zamyka tę zmianę, która trwa. Bez trwającej godzina nie zapisze się.'),
     '',
     `💰 ${b('Zarobek i koszty:')}`,
     ` • ${code('/brutto 438.60')} – zarobek brutto z aplikacji Glovo.`,
