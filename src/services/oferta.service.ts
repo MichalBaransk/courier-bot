@@ -3,6 +3,7 @@ import { verifyOfferDistance } from './maps.service.js';
 import { financeService } from './finance.service.js';
 import { lokalizacjaService } from './lokalizacja.service.js';
 import { computeOfferRate } from './finance.calc.js';
+import { kilometrLubNull, wymiaryObrazu } from './obraz.rules.js';
 
 /**
  * Ocena oferty kursu — JEDNA sciezka dla bota i dla aplikacji.
@@ -84,7 +85,38 @@ export async function ocenOferte(
 ): Promise<WynikOceny> {
   const tId = String(telegramId);
 
-  const offer = await geminiService.analyzeCourseOffer(obraz, mimeType);
+  const surowe = await geminiService.analyzeCourseOffer(obraz, mimeType);
+
+  /**
+   * ZERO od modelu znaczy „nie odczytalem" — patrz `kilometrLubNull`.
+   * Bez tego do bazy trafia `0.00`, czyli „zero kilometrow do punktu odbioru",
+   * i nikt pozniej nie odrozni tego od prawdziwego pomiaru.
+   */
+  const offer = {
+    ...surowe,
+    appPickupKm: kilometrLubNull(surowe.appPickupKm),
+    appDeliveryKm: kilometrLubNull(surowe.appDeliveryKm),
+  };
+
+  /**
+   * Log diagnostyczny — jedna linia na ocene.
+   *
+   * Wymiary sa tu NIE dla ozdoby. Podejrzenie z 19.08 brzmi: zrzut szerszy niz
+   * ekran (czarny pas z prawej) odbiera drobnym cyfrom rozdzielczosc, gdy model
+   * skaluje obraz. Zeby to sprawdzic albo obalic, trzeba znac wymiary TEGO
+   * obrazu, ktory naprawde przyszedl — nie pliku ogladanego gdzie indziej.
+   *
+   * Bez tego logu kazda nieudana ocena konczy sie zgadywaniem.
+   */
+  const wym = wymiaryObrazu(obraz);
+  console.log(
+    `[Oferta] ${wym ? `${wym.szerokosc}x${wym.wysokosc} ${wym.format}` : 'nieznany format'}, ` +
+      `${Math.round(obraz.length / 1024)} kB, brutto=${surowe.grossAmount}, ` +
+      `km=${surowe.appPickupKm ?? 'null'}/${surowe.appDeliveryKm ?? 'null'}` +
+      `${offer.appPickupKm !== surowe.appPickupKm || offer.appDeliveryKm !== surowe.appDeliveryKm ? ' (zero -> null)' : ''}, ` +
+      `odbior="${surowe.pickupAddress}"`
+  );
+
   const userLoc = await ustalPozycje(tId, pozycja);
 
   const route = await verifyOfferDistance(userLoc, offer.pickupAddress, offer.deliveryAddress);

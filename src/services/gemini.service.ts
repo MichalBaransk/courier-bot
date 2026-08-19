@@ -308,17 +308,34 @@ Ignoruj kody CN, numery stacji i oznaczenia 95/98.
 
   async analyzeCourseOffer(imageBuffer: Buffer, mimeType = 'image/jpeg'): Promise<CourseOfferExtractedData> {
     const prompt = `
-Przeanalizuj ofertę kursu Glovo. Ekran ma układ pionowej osi z dwoma punktami.
+Przeanalizuj ofertę kursu Glovo. Dolna część ekranu to biała karta oferty:
+kwota u góry, pod nią dwa wiersze punktów połączone pionową kreską.
 
-- grossAmount: duża zielona kwota u góry. IGNORUJ "POTRZEBNA GOTÓWKA" i przycisk "ZAPŁAĆ ... zł"
-  (to gotówka do pobrania od klienta, nie zarobek).
-- pickupAddress: nazwa i adres pierwszego punktu (ikona sklepu).
-- deliveryAddress: opis drugiego punktu (ikona osoby, zwykle podpisany "Dostawa").
-  Często jest to sama nazwa miasta — przepisz dokładnie to, co widzisz, nie zgaduj adresu.
-- appPickupKm: liczba kilometrów wyrównana do PRAWEJ w wierszu punktu odbioru (np. 3,37 km).
-- appDeliveryKm: liczba kilometrów wyrównana do PRAWEJ w wierszu "Dostawa" (np. 3,01 km).
+- grossAmount: duża zielona kwota u góry karty. IGNORUJ "POTRZEBNA GOTÓWKA" i przycisk
+  "ZAPŁAĆ ... zł" (to gotówka do pobrania od klienta, nie zarobek).
+- pickupAddress: nazwa i adres PIERWSZEGO punktu (wiersz z ikoną sklepu).
+- deliveryAddress: opis DRUGIEGO punktu (ikona osoby, zwykle samo słowo "Dostawa").
+  Często nie ma tam adresu — przepisz dokładnie to, co widzisz, nie zgaduj.
 
-Kilometry zapisuj jako liczby, przecinek zamień na kropkę. Jeśli któregoś nie widać, zwróć null.
+KILOMETRY. W każdym z tych dwóch wierszy, po prawej stronie tego samego wiersza,
+w którym stoi nazwa punktu, jest dystans w formacie "3,37 km" — liczba z przecinkiem
+i słowem "km". To jest jedyne miejsce, gdzie na tym ekranie występuje słowo "km".
+
+- appPickupKm: dystans z wiersza punktu odbioru (tego z ikoną sklepu i nazwą firmy).
+- appDeliveryKm: dystans z wiersza "Dostawa".
+
+Trzy rzeczy, na które uważaj:
+
+1. Karta oferty NIE MUSI sięgać prawej krawędzi obrazu. Zrzut bywa szerszy od ekranu
+   i ma z boku czarny pas. Kilometry są wyrównane do prawej krawędzi BIAŁEJ KARTY,
+   a nie do krawędzi obrazu.
+2. Jeśli odczytałeś nazwę punktu, to kilometry są w TYM SAMYM wierszu, po prawej.
+   Poszukaj ich tam, zanim uznasz, że ich nie ma.
+3. Gdy naprawdę nie potrafisz odczytać liczby — zwróć null. NIGDY nie zwracaj 0.
+   Zero znaczy "zero kilometrów" i jest gorsze od przyznania się, że nie widzisz:
+   z zera policzy się bezsensowna stawka, a z null-a nie policzy się nic.
+
+Kilometry zapisuj jako liczby, przecinek zamień na kropkę.
 `;
     return this.generate(
       CourseOfferSchema,
