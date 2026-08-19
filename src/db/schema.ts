@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm';
 import {
   pgTable,
   serial,
@@ -51,6 +52,63 @@ export const dailyRecords = pgTable(
   },
   (table) => ({
     userDateIdx: uniqueIndex('daily_records_user_date_idx').on(table.telegramId, table.date),
+  })
+);
+
+/**
+ * Jedna ZMIANA = jeden wiersz. Doba moze miec ich wiele.
+ *
+ * Powod: `daily_records` trzyma JEDNA pare `work_from`/`work_to` na dzien,
+ * pilnowana unikalnym indeksem na (telegram_id, date). Drugi wyjazd tego
+ * samego dnia nadpisywal pierwszy i pierwsza zmiana znikala bez sladu —
+ * dlatego przycisk zmiany w aplikacji wyszarza sie po zamknieciu pierwszej.
+ *
+ * Kolumny godzinowe w `daily_records` zostaja na czas P1 i P2 — usuwa je P3,
+ * razem z kodem, ktory z nich czyta. Rozdzielenie jest celowe: usuniecie ich
+ * teraz wywalilo by `npm run typecheck` na siedmiu odwolaniach w
+ * `finance.service.ts`, ktore znikaja dopiero w P3.
+ */
+export const workSessions = pgTable(
+  'work_sessions',
+  {
+    id: serial('id').primaryKey(),
+    telegramId: text('telegram_id')
+      .notNull()
+      .references(() => users.telegramId, { onDelete: 'cascade' }),
+    /**
+     * Doba, do ktorej nalezy zmiana = data WYJAZDU.
+     *
+     * Zmiana 23:50 -> 02:10 CALA idzie na dzien wyjazdu. To nie jest wyjatek
+     * od reguly „doba konczy sie o polnocy" (2.1) — ta regula mowi, do ktorego
+     * dnia trafia WPIS robiony teraz, a nie jak dzielic zmiane na dwie doby.
+     */
+    date: date('date').notNull(),
+    /** Godzina wyjazdu `GG:MM`. Zmiana bez poczatku nie istnieje. */
+    workFrom: text('work_from').notNull(),
+    /** Godzina zjazdu `GG:MM`. NULL = zmiana TRWA. */
+    workTo: text('work_to'),
+    /** Skad wpis: 'BOT' | 'APP' | 'VOICE' | 'IMPORT'. */
+    source: text('source').notNull().default('BOT'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => ({
+    userDateIdx: index('work_sessions_user_date_idx').on(table.telegramId, table.date),
+    /**
+     * JEDNA otwarta zmiana na kuriera — pilnowana przez baze, nie przez kod.
+     *
+     * To indeks CZESCIOWY i nie jest to obejscie pulapki 2.5 („NULL != NULL
+     * psuje unikalne indeksy"). Tam problem polegal na tym, ze kolumna
+     * NULL-owalna WCHODZILA w sklad klucza; tutaj unikalnosc stoi na samym
+     * `telegram_id`, a `WHERE work_to IS NULL` jedynie zaweza zbior wierszy,
+     * ktorych indeks dotyczy.
+     *
+     * Praktyczny skutek: powtorzony `POST /api/v1/zmiana` bez naglowka
+     * `Idempotency-Key` odbija sie od bazy zamiast dopisac druga otwarta
+     * zmiane. Ochrona dziala nawet wtedy, gdy kod o niej zapomni.
+     */
+    otwartaIdx: uniqueIndex('work_sessions_otwarta_idx')
+      .on(table.telegramId)
+      .where(sql`work_to is null`),
   })
 );
 

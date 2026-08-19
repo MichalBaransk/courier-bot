@@ -1,6 +1,6 @@
 # GlovoBot — kod źródłowy
 
-Plików: 55 · linii: 8879
+Plików: 62 · linii: 9894
 
 ## Struktura
 
@@ -36,6 +36,9 @@ src/services/finance.calc.test.ts
 src/services/finance.calc.ts
 src/services/finance.service.ts
 src/services/gemini.service.ts
+src/services/lokalizacja.rules.test.ts
+src/services/lokalizacja.rules.ts
+src/services/lokalizacja.service.ts
 src/services/maps.service.ts
 src/services/user.service.ts
 src/utils/datetime.test.ts
@@ -51,7 +54,11 @@ docker/backup/README.md
 docker/backup/test-odtworzenia.sh
 drizzle/0001_rework.sql
 drizzle/0002_api_idempotency.sql
+drizzle/0003_courier_locations.sql
+drizzle/0004_courier_locations_speed.sql
+.devcontainer/devcontainer.json
 .dockerignore
+.github/workflows/sprawdz.yml
 .gitignore
 drizzle.config.ts
 scripts/wdroz-serwer.sh
@@ -338,6 +345,14 @@ API_TOKEN=
 # telegram_id właściciela danych widocznych przez API.
 # Puste = jedyny wpis z ALLOWED_TELEGRAM_IDS.
 API_TELEGRAM_ID=
+
+# --- Lokalizacja kuriera ---
+# Ile METROW bledu wolno miec pozycji, zeby liczyc z niej dojazd (domyslnie 300).
+# Blad = niepewnosc odczytu + predkosc x wiek. Pod swiatlami pozycja zyje
+# minutami, przy 100 km/h okolo 11 sekund. 0 = nie licz dojazdu z aplikacji.
+LOKALIZACJA_MAKS_BLAD_M=300
+# Twarda zapora wieku w sekundach, niezalezna od predkosci (domyslnie 300).
+LOKALIZACJA_ZAPORA_S=300
 
 # --- Backup bazy ---
 POSTGRES_PASSWORD=
@@ -1074,12 +1089,15 @@ export function registerReadRoutes(app: Hono, userId: string): void {
 ```typescript
 import type { Context, Hono } from 'hono';
 import type { z } from 'zod';
+import { CFG } from '../config.js';
 import { financeService } from '../services/finance.service.js';
 import { ensureUserById } from '../services/user.service.js';
+import { lokalizacjaService } from '../services/lokalizacja.service.js';
 import {
   BruttoSchema,
   CelSchema,
   DystansSchema,
+  LokalizacjaSchema,
   NapiwekSchema,
   PaliwoSchema,
   UsunSchema,
@@ -1150,6 +1168,56 @@ export function registerWriteRoutes(app: Hono, userId: string): void {
     };
     return c.json(body, 201);
   };
+
+  /**
+   * Pozycja kuriera. JEDYNY endpoint zapisu, ktory NIE zwraca stanu dnia.
+   *
+   * Powod: pozycja nie jest wpisem do rozliczenia, tylko stanem chwilowym.
+   * Doklejanie do kazdej odpowiedzi podsumowania dnia oznaczaloby kilka
+   * zapytan do bazy co 20 sekund przez cala zmiane, bez zadnego pozytku —
+   * aplikacja i tak tej odpowiedzi nie wyswietla.
+   *
+   * Nie przechodzi tez sensownie przez idempotencje: `Idempotency-Key` nie ma
+   * tu czego chronic, bo zapis jest upsertem i powtorzenie go nic nie psuje.
+   * Aplikacja po prostu nie wysyla tego naglowka.
+   *
+   * `false` z serwisu znaczy „wspolrzedne bez sensu" — wtedy STARA pozycja
+   * zostaje nietknieta i odpowiadamy 400. Lepiej zostac ze znana pozycja
+   * sprzed minuty niz zastapic ja zerami (§8f).
+   */
+  app.post('/api/v1/lokalizacja', async (c) => {
+    const w = await czytajCialo(c, LokalizacjaSchema);
+    if (!w.ok) return c.json({ error: w.komunikat }, 400);
+
+    await ensureUserById(userId);
+    const zapisano = await lokalizacjaService.zapisz(userId, {
+      lat: w.wartosc.lat,
+      lon: w.wartosc.lon,
+      dokladnoscM: w.wartosc.dokladnoscM,
+      wiekMs: w.wartosc.wiekMs,
+      predkoscMps: w.wartosc.predkoscMps,
+      zrodlo: 'APP',
+    });
+
+    if (!zapisano) {
+      return c.json({ error: 'Wspolrzedne poza zakresem albo dokladne (0, 0).' }, 400);
+    }
+
+    // Serwer oddaje SWOJ budzet bledu, zeby aplikacja nie musiala go zgadywac
+    // ani powtarzac w swoim kodzie. Zmiana `LOKALIZACJA_MAKS_BLAD_M` w `.env`
+    // przestawia obie strony naraz.
+    //
+    // Aplikacja moze z tego wyliczyc wlasny odstep miedzy odczytami: przy
+    // predkosci `v` pozycja starzeje sie po `budzet / v` sekundach.
+    return c.json(
+      {
+        zapisano: true,
+        maksBladM: CFG.LOKALIZACJA_MAKS_BLAD_M,
+        zaporaS: CFG.LOKALIZACJA_ZAPORA_S,
+      },
+      201
+    );
+  });
 
   app.post('/api/v1/napiwek', async (c) => {
     const w = await czytajCialo(c, NapiwekSchema);
@@ -1256,6 +1324,7 @@ import {
   BruttoSchema,
   CelSchema,
   DystansSchema,
+  LokalizacjaSchema,
   NapiwekSchema,
   PaliwoSchema,
   UsunSchema,
@@ -1418,6 +1487,74 @@ describe('UsunSchema', () => {
     expect(UsunSchema.safeParse({}).success).toBe(false);
   });
 });
+
+describe('LokalizacjaSchema', () => {
+  it('przyjmuje same współrzędne', () => {
+    const w = LokalizacjaSchema.safeParse({ lat: 50.2649, lon: 19.0238 });
+    expect(w.success).toBe(true);
+    if (w.success) {
+      expect(w.data.dokladnoscM).toBeNull();
+      expect(w.data.wiekMs).toBeNull();
+    }
+  });
+
+  it('przyjmuje dokładność, wiek i prędkość', () => {
+    const w = LokalizacjaSchema.safeParse({
+      lat: 50.2649,
+      lon: 19.0238,
+      dokladnoscM: 12,
+      wiekMs: 20_000,
+      predkoscMps: 27.8,
+    });
+    expect(w.success).toBe(true);
+    if (w.success) {
+      expect(w.data.wiekMs).toBe(20_000);
+      expect(w.data.predkoscMps).toBe(27.8);
+    }
+  });
+
+  it('prędkość jest opcjonalna — Android potrafi jej nie podać', () => {
+    const w = LokalizacjaSchema.safeParse({ lat: 50.2649, lon: 19.0238 });
+    expect(w.success).toBe(true);
+    if (w.success) expect(w.data.predkoscMps).toBeNull();
+  });
+
+  it('odrzuca prędkość ujemną i absurdalną', () => {
+    // Android zwraca -1 zamiast null. Schemat ma to ODRZUCIĆ, a nie naprawiać —
+    // klient wyśle wtedy `null` i warstwa reguł podstawi założenie ostrożne.
+    expect(LokalizacjaSchema.safeParse({ lat: 50, lon: 19, predkoscMps: -1 }).success).toBe(false);
+    expect(LokalizacjaSchema.safeParse({ lat: 50, lon: 19, predkoscMps: 500 }).success).toBe(false);
+  });
+
+  it('odrzuca współrzędne spoza mapy', () => {
+    expect(LokalizacjaSchema.safeParse({ lat: 91, lon: 19 }).success).toBe(false);
+    expect(LokalizacjaSchema.safeParse({ lat: 50, lon: -181 }).success).toBe(false);
+  });
+
+  it('odrzuca brak którejkolwiek współrzędnej', () => {
+    expect(LokalizacjaSchema.safeParse({ lat: 50.26 }).success).toBe(false);
+    expect(LokalizacjaSchema.safeParse({}).success).toBe(false);
+  });
+
+  it('odrzuca współrzędne przysłane jako tekst', () => {
+    // Telefon potrafi wysłać "50.2649" zamiast liczby — po cichu
+    // zinterpretowane dałoby pozycję, która wygląda dobrze i jest zmyślona.
+    expect(LokalizacjaSchema.safeParse({ lat: '50.2649', lon: '19.0238' }).success).toBe(false);
+  });
+
+  it('odrzuca ujemny wiek odczytu', () => {
+    expect(
+      LokalizacjaSchema.safeParse({ lat: 50.26, lon: 19.02, wiekMs: -1 }).success
+    ).toBe(false);
+  });
+
+  // Zero na zero przechodzi przez schemat, a odrzuca je dopiero
+  // `czyPoprawneWspolrzedne` — bo ta sama kontrola musi obowiązywać także
+  // pinezkę z Telegrama, która przez ten schemat nigdy nie przechodzi.
+  it('(0, 0) przechodzi przez schemat — łapie je dopiero warstwa reguł', () => {
+    expect(LokalizacjaSchema.safeParse({ lat: 0, lon: 0 }).success).toBe(true);
+  });
+});
 ```
 
 # Plik: src/api/schemas.ts
@@ -1513,6 +1650,42 @@ export const UsunSchema = z.object({
   data: dataWpisu,
 });
 
+/**
+ * Pozycja kuriera.
+ *
+ * `wiekMs` zamiast znacznika czasu — CELOWO. Wiek jest wielkoscia wzgledna,
+ * wiec nie ma w nim zegara telefonu, ktory moglby byc przestawiony. Znacznik
+ * czasu z klienta bylby drugim zrodlem prawdy obok serwera, a §8a mowi
+ * wyraznie, ze o czasie decyduje serwer.
+ *
+ * Zakresy sa tu twarde, bo to jedyne miejsce, gdzie da sie zatrzymac odczyt
+ * bez sensu. Dokladne (0, 0) odrzucamy osobno w `lokalizacja.rules.ts` —
+ * to Zatoka Gwinejska, w praktyce zawsze niezainicjowana struktura.
+ */
+export const LokalizacjaSchema = z.object({
+  lat: z
+    .number({ message: 'Pole "lat" musi byc liczba.' })
+    .refine(Number.isFinite, 'Pole "lat" musi byc skonczona liczba.')
+    .refine((v) => v >= -90 && v <= 90, 'Pole "lat" musi byc w zakresie -90..90.'),
+  lon: z
+    .number({ message: 'Pole "lon" musi byc liczba.' })
+    .refine(Number.isFinite, 'Pole "lon" musi byc skonczona liczba.')
+    .refine((v) => v >= -180 && v <= 180, 'Pole "lon" musi byc w zakresie -180..180.'),
+  /** Promien niepewnosci GPS w metrach, tak jak podaje go system. */
+  dokladnoscM: opcjonalna(liczbaNieujemna('dokladnoscM', 100_000)),
+  /** Ile ms uplynelo od zlapania pozycji do wyslania. Przycinane do 5 min. */
+  wiekMs: opcjonalna(liczbaNieujemna('wiekMs', 24 * 60 * 60 * 1000)),
+  /**
+   * Predkosc w metrach na sekunde w chwili odczytu.
+   *
+   * Od niej zalezy, jak dlugo pozycja jest cokolwiek warta — przy 100 km/h
+   * pozycja sprzed minuty jest o 1,7 km obok. Android potrafi zwrocic `-1`
+   * zamiast `null`, wiec ujemna wartosc traktujemy jak brak (w regułach,
+   * nie tutaj — schemat ma odrzucac, a nie naprawiac).
+   */
+  predkoscMps: opcjonalna(liczbaNieujemna('predkoscMps', 200)),
+});
+
 export type NapiwekBody = z.infer<typeof NapiwekSchema>;
 export type PaliwoBody = z.infer<typeof PaliwoSchema>;
 export type DystansBody = z.infer<typeof DystansSchema>;
@@ -1535,6 +1708,7 @@ export function pierwszyBlad(wynik: WynikWalidacji): string | null {
   if (wynik.success) return null;
   return wynik.error.issues[0]?.message ?? 'Nieprawidłowe dane.';
 }
+export type LokalizacjaBody = z.infer<typeof LokalizacjaSchema>;
 ```
 
 # Plik: src/bot/cards.ts
@@ -3425,8 +3599,38 @@ export const CFG = {
   /** Prog oplacalnosci kursu (zl netto / km calej trasy). */
   MIN_STAWKA_NETTO_KM: 2.0,
 
-  /** Waznosc lokalizacji GPS do weryfikacji tras (30 min). */
+  /**
+   * Waznosc pinezki przypietej RECZNIE w Telegramie (30 min).
+   *
+   * Szerokie okno jest tu uzasadnione: kurier wysyla pinezke swiadomie, tuz
+   * przed ocena oferty. Automatyczny odczyt z aplikacji ma wlasne, krotsze
+   * okno, liczone w metrach — patrz `LOKALIZACJA_MAKS_BLAD_M`.
+   */
   LOCATION_MAX_AGE_MS: 30 * 60 * 1000,
+
+  /**
+   * Ile metrow bledu wolno miec pozycji z aplikacji, zeby liczyc z niej dojazd.
+   *
+   * DLACZEGO METRY, A NIE SEKUNDY. Pierwsza wersja mowila „wazna 60 sekund".
+   * Przy 100 km/h (27,8 m/s) to 1,7 km bledu — reguła w sekundach nic o tym
+   * nie wie. Interesuje nas nie „ile minelo", tylko „jak daleko mogles
+   * odjechac", a to iloczyn predkosci i czasu.
+   *
+   * Reguła dostosowuje sie sama: pod swiatlami pozycja zyje minutami,
+   * przy 100 km/h okolo 11 sekund.
+   *
+   * `0` wylacza liczenie dojazdu z pozycji aplikacji bez wyjmowania kodu.
+   */
+  LOKALIZACJA_MAKS_BLAD_M: Number.parseInt(process.env.LOKALIZACJA_MAKS_BLAD_M ?? '300', 10) || 300,
+
+  /**
+   * Twarda zapora wieku pozycji (sekundy), niezalezna od predkosci.
+   *
+   * Bez niej telefon lezacy od godziny z predkoscia 0 uchodzilby za aktualny
+   * w nieskonczonosc. „Stoi" znaczy tylko tyle, ze nie ruszal sie W CHWILI
+   * ODCZYTU — od tamtej pory mogl przejechac pol miasta z wylaczonym GPS-em.
+   */
+  LOKALIZACJA_ZAPORA_S: Number.parseInt(process.env.LOKALIZACJA_ZAPORA_S ?? '300', 10) || 300,
   /** Od jakiej roznicy miedzy aplikacja a Google Maps ostrzegac (km). */
   DISTANCE_DIVERGENCE_KM: 1.5,
   /** Jak dlugo czeka potwierdzenie importu Portfela. */
@@ -3832,6 +4036,46 @@ export const apiIdempotency = pgTable(
     apiIdempotencyCreatedAtIdx: index('api_idempotency_created_at_idx').on(table.createdAt),
   })
 );
+
+/**
+ * Ostatnia znana pozycja kuriera — JEDEN WIERSZ NA UZYTKOWNIKA.
+ *
+ * Dlaczego w bazie, a nie w pamieci procesu: `lastCourierLocation` w
+ * `bot/index.ts` to zwykla `Map`, ktora ginie przy restarcie (10e). Oferta
+ * potrafi przyjsc minute po `docker compose up -d --build bot`, a wtedy bot
+ * nie ma pozycji i liczy dojazd od niczego.
+ *
+ * Dlaczego bez historii: do naprawy 8f wystarczy „gdzie jestes TERAZ".
+ * Historia przejazdu to osobny temat (liczenie realnego dystansu zamiast
+ * wpisywania go recznie) i osobna decyzja — przy odczycie co 20 s to setki
+ * wierszy dziennie i wlasny problem czyszczenia.
+ *
+ * `recorded_at` to moment ZLAPANIA pozycji, nie moment zapisu. Roznica ma
+ * znaczenie przy kolejce offline, gdzie odczyt lezy kilkadziesiat sekund
+ * zanim dojdzie. Telefon przysyla WIEK odczytu, a nie znacznik czasu —
+ * wiek jest wielkoscia wzgledna, wiec nie ma w nim zegara, ktory moglby byc
+ * przestawiony (8a).
+ */
+export const courierLocations = pgTable('courier_locations', {
+  telegramId: text('telegram_id')
+    .primaryKey()
+    .references(() => users.telegramId, { onDelete: 'cascade' }),
+  latitude: numeric('latitude', { precision: 9, scale: 6 }).notNull(),
+  longitude: numeric('longitude', { precision: 9, scale: 6 }).notNull(),
+  /** Promien niepewnosci w metrach, tak jak podaje go GPS. `null` = nie podano. */
+  accuracyM: integer('accuracy_m'),
+  /**
+   * Predkosc w metrach na sekunde w chwili odczytu. `null` = GPS nie podal.
+   *
+   * To NIE jest ciekawostka — od niej zalezy, jak dlugo pozycja jest cokolwiek
+   * warta. Przy 100 km/h pozycja sprzed minuty jest o 1,7 km obok.
+   */
+  speedMps: numeric('speed_mps', { precision: 6, scale: 2 }),
+  /** `APP` (automat z telefonu) albo `TELEGRAM` (przypieta pinezka). */
+  source: text('source').default('APP').notNull(),
+  recordedAt: timestamp('recorded_at').notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
 ```
 
 # Plik: src/index.ts
@@ -6483,6 +6727,592 @@ Rozpoznaj typ ekranu:
 export const geminiService = new GeminiService();
 ```
 
+# Plik: src/services/lokalizacja.rules.test.ts
+```typescript
+import { describe, expect, it } from 'vitest';
+import {
+  DOMYSLNA_DOKLADNOSC_M,
+  DOMYSLNA_PREDKOSC_MPS,
+  MAKS_WIEK_MS,
+  czasZapisu,
+  czyAktualna,
+  czyGodnaZaufania,
+  czyPoprawneWspolrzedne,
+  mozliwyBladM,
+  opisBledu,
+  opisWieku,
+  wiekSekund,
+} from './lokalizacja.rules.js';
+
+/**
+ * Sedno tych testow: pozycja nieswieza ma byc ODRZUCONA, a nie „lekko
+ * nieaktualna". Cala wartosc tego mechanizmu polega na tym, ze woli
+ * powiedziec „nie wiem" niz policzyc dojazd od punktu sprzed kwadransa (8f).
+ */
+
+const TERAZ = 1_755_500_000_000;
+
+describe('czasZapisu — wiek zamiast znacznika czasu', () => {
+  it('brak wieku znaczy „teraz"', () => {
+    expect(czasZapisu(TERAZ, null)).toBe(TERAZ);
+    expect(czasZapisu(TERAZ, undefined)).toBe(TERAZ);
+  });
+
+  it('wiek cofa moment zapisu', () => {
+    expect(czasZapisu(TERAZ, 20_000)).toBe(TERAZ - 20_000);
+  });
+
+  it('ujemny wiek nie przesuwa zapisu w przyszlosc', () => {
+    // Zegar telefonu tu nie wystepuje, ale blad klienta owszem.
+    expect(czasZapisu(TERAZ, -5_000)).toBe(TERAZ);
+  });
+
+  it('absurdalny wiek jest przycinany, a nie brany na wiare', () => {
+    // Wiek rzedu godzin to blad klienta, nie odczyt sprzed godziny.
+    expect(czasZapisu(TERAZ, 9_999_999)).toBe(TERAZ - MAKS_WIEK_MS);
+  });
+
+  it('NaN traktujemy jak brak wieku', () => {
+    expect(czasZapisu(TERAZ, NaN)).toBe(TERAZ);
+  });
+});
+
+describe('wiekSekund', () => {
+  it('liczy w dol do pelnych sekund', () => {
+    expect(wiekSekund(TERAZ - 1_999, TERAZ)).toBe(1);
+    expect(wiekSekund(TERAZ - 60_000, TERAZ)).toBe(60);
+  });
+
+  it('pozycja „z przyszlosci" ma wiek zero, a nie ujemny', () => {
+    expect(wiekSekund(TERAZ + 10_000, TERAZ)).toBe(0);
+  });
+});
+
+describe('czyAktualna', () => {
+  it('granica jest domknieta — dokladnie TTL jeszcze przechodzi', () => {
+    expect(czyAktualna(TERAZ - 60_000, TERAZ, 60)).toBe(true);
+    expect(czyAktualna(TERAZ - 61_000, TERAZ, 60)).toBe(false);
+  });
+
+  it('swieza przechodzi, stara nie', () => {
+    expect(czyAktualna(TERAZ - 5_000, TERAZ, 60)).toBe(true);
+    expect(czyAktualna(TERAZ - 15 * 60_000, TERAZ, 60)).toBe(false);
+  });
+
+  it('TTL zero albo ujemny wylacza zaufanie do wszystkiego', () => {
+    // Sposob na wylaczenie liczenia dojazdu bez wyjmowania kodu.
+    expect(czyAktualna(TERAZ, TERAZ, 0)).toBe(false);
+    expect(czyAktualna(TERAZ, TERAZ, -1)).toBe(false);
+  });
+
+  it('TTL niebedacy liczba nie przepuszcza po cichu', () => {
+    expect(czyAktualna(TERAZ, TERAZ, NaN)).toBe(false);
+  });
+});
+
+describe('opisWieku', () => {
+  it('sekundy, minuty, godziny', () => {
+    expect(opisWieku(0)).toBe('0 s');
+    expect(opisWieku(59)).toBe('59 s');
+    expect(opisWieku(60)).toBe('1 min');
+    expect(opisWieku(12 * 60 + 30)).toBe('12 min');
+    expect(opisWieku(3600)).toBe('1 h');
+    expect(opisWieku(3600 + 5 * 60)).toBe('1 h 5 min');
+  });
+
+  it('nie wypisuje wartosci ujemnych', () => {
+    expect(opisWieku(-30)).toBe('0 s');
+  });
+});
+
+describe('czyPoprawneWspolrzedne', () => {
+  it('przepuszcza Katowice', () => {
+    expect(czyPoprawneWspolrzedne(50.2649, 19.0238)).toBe(true);
+  });
+
+  it('odrzuca zakresy spoza mapy', () => {
+    expect(czyPoprawneWspolrzedne(91, 20)).toBe(false);
+    expect(czyPoprawneWspolrzedne(50, 181)).toBe(false);
+  });
+
+  it('odrzuca dokladne (0, 0)', () => {
+    // Zatoka Gwinejska. W praktyce zawsze niezainicjowana struktura
+    // wyslana zamiast odczytu — i to jest wlasnie liczba, ktora wyglada
+    // wiarygodnie, a nie znaczy nic (8f).
+    expect(czyPoprawneWspolrzedne(0, 0)).toBe(false);
+    // Ale samo zero w jednej osi jest legalne.
+    expect(czyPoprawneWspolrzedne(0, 19.0238)).toBe(true);
+  });
+
+  it('odrzuca NaN i nieskonczonosc', () => {
+    expect(czyPoprawneWspolrzedne(NaN, 19)).toBe(false);
+    expect(czyPoprawneWspolrzedne(50, Infinity)).toBe(false);
+  });
+});
+
+/**
+ * BUDZET BLEDU.
+ *
+ * Te testy istnieja, bo pierwsza wersja mierzyla swiezosc w sekundach, a
+ * pytanie „co przy 100 km/h na S-ce" pokazalo, ze to zla jednostka.
+ * 100 km/h to 27,8 m/s, wiec 60 s daje 1,7 km bledu. Sekundy nic o tym
+ * nie wiedza; metry wiedza.
+ */
+
+const stan = (over: Partial<Parameters<typeof mozliwyBladM>[0]> = {}) => ({
+  wiekS: 0,
+  predkoscMps: 0,
+  dokladnoscM: 0,
+  ...over,
+});
+
+describe('mozliwyBladM', () => {
+  it('stojac blad to sama niepewnosc odczytu', () => {
+    expect(mozliwyBladM(stan({ dokladnoscM: 12, predkoscMps: 0, wiekS: 300 }))).toBe(12);
+  });
+
+  it('100 km/h przez 60 s to 1,7 km — liczba z rozmowy', () => {
+    // 27,8 m/s x 60 s = 1668 m. To jest dokladnie ten przypadek,
+    // przez ktory reguła w sekundach wypadla.
+    expect(mozliwyBladM(stan({ predkoscMps: 27.8, wiekS: 60 }))).toBe(1668);
+  });
+
+  it('niepewnosc odczytu dodaje sie do przebytej drogi', () => {
+    expect(mozliwyBladM(stan({ dokladnoscM: 50, predkoscMps: 10, wiekS: 10 }))).toBe(150);
+  });
+
+  it('brak predkosci i dokladnosci daje zalozenia OSTROZNE, nie zerowe', () => {
+    // Nieznane nie znaczy „idealne". Zle zalozenie w te strone przepuszczaloby
+    // pozycje, ktora nic nie znaczy (8f).
+    expect(mozliwyBladM(stan({ predkoscMps: null, dokladnoscM: null, wiekS: 10 }))).toBe(
+      DOMYSLNA_DOKLADNOSC_M + DOMYSLNA_PREDKOSC_MPS * 10
+    );
+  });
+
+  it('ujemna predkosc z Androida traktowana jak brak', () => {
+    // `LocationObject.coords.speed` potrafi wrocic jako -1.
+    expect(mozliwyBladM(stan({ predkoscMps: -1, dokladnoscM: 0, wiekS: 1 }))).toBe(
+      DOMYSLNA_PREDKOSC_MPS
+    );
+  });
+});
+
+describe('czyGodnaZaufania', () => {
+  const BUDZET = 300;
+  const ZAPORA = 300;
+
+  it('pod swiatlami stara pozycja jest nadal dobra', () => {
+    expect(czyGodnaZaufania(stan({ predkoscMps: 0, dokladnoscM: 10, wiekS: 120 }), BUDZET, ZAPORA)).toBe(true);
+  });
+
+  it('przy 100 km/h juz 15 s nie wystarcza', () => {
+    expect(czyGodnaZaufania(stan({ predkoscMps: 27.8, wiekS: 10 }), BUDZET, ZAPORA)).toBe(true);
+    expect(czyGodnaZaufania(stan({ predkoscMps: 27.8, wiekS: 15 }), BUDZET, ZAPORA)).toBe(false);
+  });
+
+  it('w miescie okno jest znacznie szersze', () => {
+    // 20 km/h = 5,6 m/s. 300 m / 5,6 = 53 s.
+    expect(czyGodnaZaufania(stan({ predkoscMps: 5.6, wiekS: 50 }), BUDZET, ZAPORA)).toBe(true);
+    expect(czyGodnaZaufania(stan({ predkoscMps: 5.6, wiekS: 55 }), BUDZET, ZAPORA)).toBe(false);
+  });
+
+  it('sama niepewnosc odczytu potrafi przekroczyc budzet', () => {
+    // Miedzy blokami albo w tunelu. Swieza, a bezuzyteczna.
+    expect(czyGodnaZaufania(stan({ dokladnoscM: 500, wiekS: 0, predkoscMps: 0 }), BUDZET, ZAPORA)).toBe(false);
+  });
+
+  it('twarda zapora obowiazuje nawet przy zerowej predkosci', () => {
+    // „Stoi" znaczy tylko, ze nie ruszal sie W CHWILI ODCZYTU. Od tamtej pory
+    // mogl przejechac pol miasta z wylaczonym GPS-em.
+    expect(czyGodnaZaufania(stan({ predkoscMps: 0, dokladnoscM: 5, wiekS: 301 }), BUDZET, ZAPORA)).toBe(false);
+  });
+
+  it('budzet zero wylacza zaufanie do wszystkiego', () => {
+    expect(czyGodnaZaufania(stan(), 0, ZAPORA)).toBe(false);
+    expect(czyGodnaZaufania(stan(), BUDZET, 0)).toBe(false);
+  });
+});
+
+describe('opisBledu', () => {
+  it('metry do kilometra, potem kilometry z przecinkiem', () => {
+    expect(opisBledu(120)).toBe('±120 m');
+    expect(opisBledu(999)).toBe('±999 m');
+    expect(opisBledu(1668)).toBe('±1,7 km');
+  });
+
+  it('nie wypisuje wartosci ujemnych', () => {
+    expect(opisBledu(-5)).toBe('±0 m');
+  });
+});
+```
+
+# Plik: src/services/lokalizacja.rules.ts
+```typescript
+/**
+ * Swiezosc pozycji kuriera — CZYSTA logika, bez bazy i bez sieci.
+ *
+ * Wydzielone z tego samego powodu co `idempotency.rules.ts`: test tego pliku
+ * nie moze importowac `db/index.ts`, ktory bez `DATABASE_URL` rzuca wyjatkiem
+ * przy samym zaladowaniu modulu.
+ *
+ * PO CO TO W OGOLE JEST — patrz 8f. Realny przypadek: oferta 22,04 zl,
+ * aplikacja Glovo podala 3,37 + 3,01 km. Bot policzyl przez Maps 7,56 + 1,83
+ * i wyszlo 1,91 zl/km, czyli „odrzuc". Prawidlowo bylo 2,81 zl/km, czyli
+ * „przyjmij". Jedna z dwoch przyczyn: Maps liczyl dojazd od OSTATNIEGO
+ * WYSLANEGO GPS-a, a nie od pozycji biezacej.
+ *
+ * Ten plik odpowiada na jedno pytanie: czy pozycja, ktora mamy, jest jeszcze
+ * cokolwiek warta. Odpowiedz „nie" jest w porzadku — lepiej nie podac nic niz
+ * podac liczbe, ktora wyglada wiarygodnie i nie znaczy nic (8f).
+ */
+
+export const ZRODLA_LOKALIZACJI = ['APP', 'TELEGRAM'] as const;
+export type ZrodloLokalizacji = (typeof ZRODLA_LOKALIZACJI)[number];
+
+/**
+ * Gorna granica wieku podanego przez telefon.
+ *
+ * Telefon przysyla WIEK odczytu w milisekundach, a nie znacznik czasu.
+ * To celowe: wiek jest wielkoscia wzgledna, wiec nie ma w nim zegara, ktory
+ * moglby byc przestawiony. Znacznik czasu z telefonu bylby kolejnym zrodlem
+ * prawdy obok serwera — dokladnie tego zabrania 8a.
+ *
+ * Wiek powyzej tej granicy traktujemy jak brak wieku (czyli „teraz"), bo
+ * wartosc rzedu godzin oznacza blad klienta, nie realny odczyt sprzed godziny.
+ */
+export const MAKS_WIEK_MS = 5 * 60 * 1000;
+
+/**
+ * Kiedy odczyt naprawde powstal.
+ *
+ * `wiekMs` to ile milisekund uplynelo od zlapania pozycji do wyslania jej na
+ * serwer. Przy kolejce offline potrafi to byc kilkadziesiat sekund.
+ */
+export function czasZapisu(terazMs: number, wiekMs: number | null | undefined): number {
+  if (wiekMs == null || !Number.isFinite(wiekMs)) return terazMs;
+  const wiek = Math.min(Math.max(0, wiekMs), MAKS_WIEK_MS);
+  return terazMs - wiek;
+}
+
+/** Wiek pozycji w pelnych sekundach. Nigdy ujemny. */
+export function wiekSekund(zapisanoMs: number, terazMs: number): number {
+  return Math.max(0, Math.floor((terazMs - zapisanoMs) / 1000));
+}
+
+/**
+ * Czy pozycja miesci sie w stalym oknie czasu.
+ *
+ * Uzywane WYLACZNIE do pinezki z Telegrama, ktora nie niesie predkosci —
+ * kurier przypina ja recznie i swiadomie, wiec okno jest szerokie.
+ * Dla odczytow z aplikacji sluzy `czyGodnaZaufania`, ktore patrzy na metry.
+ *
+ * `ttlS <= 0` znaczy „nie ufaj zadnej" — sposob na wylaczenie liczenia dojazdu
+ * bez wyjmowania kodu.
+ */
+export function czyAktualna(zapisanoMs: number, terazMs: number, ttlS: number): boolean {
+  if (!Number.isFinite(ttlS) || ttlS <= 0) return false;
+  return wiekSekund(zapisanoMs, terazMs) <= ttlS;
+}
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────
+ * BUDZET BLEDU — dlaczego sekundy byly zla jednostka
+ *
+ * Pierwsza wersja mowila „pozycja wazna 60 sekund". Pytanie od uzytkownika
+ * rozbilo to jednym zdaniem: a co przy 100 km/h na drodze szybkiego ruchu?
+ *
+ *   100 km/h = 27,8 m/s.  60 s = 1,7 km bledu.
+ *   Nawet 20 s = 556 m — przy trzykilometrowym dojezdzie to 18%.
+ *
+ * Nie obchodzi nas „ile minelo", tylko „jak daleko mogles odjechac". To jest
+ * iloczyn, nie czas. Reguła w metrach dostosowuje sie sama:
+ *
+ *   pod swiatlami   → wiek ograniczony tylko twarda zapora
+ *   20 km/h         → 54 s
+ *   50 km/h         → 22 s
+ *   100 km/h        → 11 s
+ *
+ * Do tego doliczamy wlasna niepewnosc odczytu (`accuracy`), bo pozycja
+ * z bledem 500 m jest bezuzyteczna nawet gdy powstala przed sekunda —
+ * a to normalne miedzy blokami albo w tunelu.
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+
+/**
+ * Predkosc zakladana, gdy GPS jej nie poda.
+ *
+ * Android potrafi zwrocic `null` albo `-1`, zwlaszcza przy pierwszym odczycie.
+ * 14 m/s to okolo 50 km/h — zalozenie OSTROZNE, czyli takie, ktore raczej
+ * odrzuci dobra pozycje, niz przepusci zla. Przy nieznanej predkosci wolimy
+ * powiedziec „nie wiem" (8f).
+ */
+export const DOMYSLNA_PREDKOSC_MPS = 14;
+
+/** Niepewnosc zakladana, gdy GPS jej nie poda. Typowa dla telefonu na otwartym terenie. */
+export const DOMYSLNA_DOKLADNOSC_M = 30;
+
+export interface StanPozycji {
+  wiekS: number;
+  /** Metry na sekunde. `null` = GPS nie podal. */
+  predkoscMps: number | null;
+  /** Promien niepewnosci odczytu w metrach. `null` = GPS nie podal. */
+  dokladnoscM: number | null;
+}
+
+/**
+ * Ile metrow moze wynosic blad tej pozycji TERAZ.
+ *
+ * Suma dwoch skladnikow, bo obydwa naprawde wystepuja:
+ *   - niepewnosc samego odczytu (gdzie bylem, gdy go zlapano),
+ *   - przebyta droga od tamtej chwili (gdzie jestem teraz).
+ */
+export function mozliwyBladM(stan: StanPozycji): number {
+  const wiek = Math.max(0, Number.isFinite(stan.wiekS) ? stan.wiekS : 0);
+
+  const predkosc =
+    stan.predkoscMps != null && Number.isFinite(stan.predkoscMps) && stan.predkoscMps >= 0
+      ? stan.predkoscMps
+      : DOMYSLNA_PREDKOSC_MPS;
+
+  const dokladnosc =
+    stan.dokladnoscM != null && Number.isFinite(stan.dokladnoscM) && stan.dokladnoscM >= 0
+      ? stan.dokladnoscM
+      : DOMYSLNA_DOKLADNOSC_M;
+
+  return Math.round(dokladnosc + predkosc * wiek);
+}
+
+/**
+ * Czy pozycja jest dosc dokladna, zeby liczyc z niej dojazd.
+ *
+ * `zaporaS` to twardy limit niezalezny od predkosci. Bez niego telefon lezacy
+ * od godziny z predkoscia 0 uchodzilby za aktualny w nieskonczonosc — a
+ * „stoi" znaczy tylko tyle, ze w chwili ODCZYTU sie nie ruszal. Od tamtej
+ * pory mogl przejechac pol miasta z wylaczonym GPS-em.
+ */
+export function czyGodnaZaufania(stan: StanPozycji, budzetM: number, zaporaS: number): boolean {
+  if (!Number.isFinite(budzetM) || budzetM <= 0) return false;
+  if (!Number.isFinite(zaporaS) || zaporaS <= 0) return false;
+  if (stan.wiekS > zaporaS) return false;
+  return mozliwyBladM(stan) <= budzetM;
+}
+
+/** Blad po polsku, do karty oferty: `±0,4 km` albo `±120 m`. */
+export function opisBledu(metry: number): string {
+  const m = Math.max(0, Math.round(metry));
+  return m >= 1000 ? `±${(m / 1000).toFixed(1).replace('.', ',')} km` : `±${m} m`;
+}
+
+/**
+ * Wiek po polsku, do karty oferty.
+ *
+ * Celowo bez „temu" i bez sekund powyzej minuty — to ma byc etykieta obok
+ * liczby, a nie zdanie.
+ */
+export function opisWieku(sekundy: number): string {
+  const s = Math.max(0, Math.floor(sekundy));
+  if (s < 60) return `${s} s`;
+  const minuty = Math.floor(s / 60);
+  if (minuty < 60) return `${minuty} min`;
+  const godziny = Math.floor(minuty / 60);
+  const reszta = minuty % 60;
+  return reszta === 0 ? `${godziny} h` : `${godziny} h ${reszta} min`;
+}
+
+/**
+ * Zakres wspolrzednych.
+ *
+ * Osobno od schematu zod, zeby ta sama kontrola dala sie uzyc takze przy
+ * danych z Telegrama, ktore przez API nie przechodza.
+ */
+export function czyPoprawneWspolrzedne(lat: number, lon: number): boolean {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+  if (lat < -90 || lat > 90) return false;
+  if (lon < -180 || lon > 180) return false;
+  // Dokladne (0, 0) to Zatoka Gwinejska — w praktyce zawsze blad klienta,
+  // ktory wyslal niezainicjowana strukture zamiast odczytu.
+  return !(lat === 0 && lon === 0);
+}
+```
+
+# Plik: src/services/lokalizacja.service.ts
+```typescript
+import { eq } from 'drizzle-orm';
+import { db } from '../db/index.js';
+import { courierLocations } from '../db/schema.js';
+import { CFG } from '../config.js';
+import {
+  czasZapisu,
+  czyAktualna,
+  czyGodnaZaufania,
+  czyPoprawneWspolrzedne,
+  mozliwyBladM,
+  wiekSekund,
+  type ZrodloLokalizacji,
+} from './lokalizacja.rules.js';
+
+/**
+ * Ostatnia znana pozycja kuriera.
+ *
+ * Cala arytmetyka swiezosci siedzi w `lokalizacja.rules.ts` (bez bazy, wiec
+ * pod testem). Tutaj zostaje wylacznie rozmowa z Postgresem i parsowanie —
+ * `numeric` wraca jako string (9b).
+ */
+
+export interface ZapisLokalizacji {
+  lat: number;
+  lon: number;
+  /** Promien niepewnosci GPS w metrach. */
+  dokladnoscM?: number | null;
+  /** Ile ms uplynelo od zlapania pozycji do wyslania. Patrz `czasZapisu`. */
+  wiekMs?: number | null;
+  /** Predkosc w m/s w chwili odczytu. Od niej zalezy, jak szybko pozycja traci wartosc. */
+  predkoscMps?: number | null;
+  zrodlo?: ZrodloLokalizacji;
+}
+
+export interface Lokalizacja {
+  lat: number;
+  lon: number;
+  dokladnoscM: number | null;
+  predkoscMps: number | null;
+  zrodlo: ZrodloLokalizacji;
+  /** Kiedy pozycja zostala ZLAPANA, w ms epoch. */
+  zapisanoMs: number;
+  /** Wiek w pelnych sekundach na moment odczytu. */
+  wiekS: number;
+  /**
+   * Ile metrow moze wynosic blad TERAZ: niepewnosc odczytu + predkosc x wiek.
+   * To jest liczba, ktora decyduje o zaufaniu — nie sam wiek.
+   */
+  mozliwyBladM: number;
+}
+
+class LokalizacjaService {
+  /**
+   * Zapisuje pozycje, nadpisujac poprzednia.
+   *
+   * Zwraca `false`, gdy wspolrzedne nie maja sensu — wtedy STARA pozycja
+   * zostaje nietknieta. To celowe: lepiej zostac ze znana pozycja sprzed
+   * minuty niz zastapic ja zerami z niezainicjowanej struktury (8f).
+   *
+   * `ensureUser` NIE jest tu wolane — robi to warstwa wyzej. Cache istnienia
+   * wiersza w pamieci procesu juz raz zjadl nam inserty po `DROP SCHEMA` (9e),
+   * wiec ten serwis celowo nic o uzytkownikach nie zaklada.
+   */
+  async zapisz(telegramId: string | number, dane: ZapisLokalizacji): Promise<boolean> {
+    if (!czyPoprawneWspolrzedne(dane.lat, dane.lon)) return false;
+
+    const tId = String(telegramId);
+    const recordedAt = new Date(czasZapisu(Date.now(), dane.wiekMs ?? null));
+    const zrodlo: ZrodloLokalizacji = dane.zrodlo ?? 'APP';
+
+    const dokladnosc =
+      dane.dokladnoscM != null && Number.isFinite(dane.dokladnoscM)
+        ? Math.round(Math.max(0, dane.dokladnoscM))
+        : null;
+
+    // Android potrafi oddac `-1` zamiast `null`, gdy predkosci nie zna.
+    // Zapisujemy wtedy `null`, zeby warstwa regul mogla siegnac po ostrozne
+    // zalozenie zamiast liczyc z liczby, ktora nic nie znaczy.
+    const predkosc =
+      dane.predkoscMps != null && Number.isFinite(dane.predkoscMps) && dane.predkoscMps >= 0
+        ? dane.predkoscMps.toFixed(2)
+        : null;
+
+    const wiersz = {
+      telegramId: tId,
+      latitude: dane.lat.toFixed(6),
+      longitude: dane.lon.toFixed(6),
+      accuracyM: dokladnosc,
+      speedMps: predkosc,
+      source: zrodlo,
+      recordedAt,
+      updatedAt: new Date(),
+    };
+
+    await db
+      .insert(courierLocations)
+      .values(wiersz)
+      .onConflictDoUpdate({
+        target: courierLocations.telegramId,
+        set: {
+          latitude: wiersz.latitude,
+          longitude: wiersz.longitude,
+          accuracyM: wiersz.accuracyM,
+          speedMps: wiersz.speedMps,
+          source: wiersz.source,
+          recordedAt: wiersz.recordedAt,
+          updatedAt: wiersz.updatedAt,
+        },
+      });
+
+    return true;
+  }
+
+  /** Ostatnia zapisana pozycja, bez oceny swiezosci. `null` = nigdy nie bylo. */
+  async ostatnia(telegramId: string | number): Promise<Lokalizacja | null> {
+    const tId = String(telegramId);
+    const [wiersz] = await db
+      .select()
+      .from(courierLocations)
+      .where(eq(courierLocations.telegramId, tId))
+      .limit(1);
+
+    if (!wiersz) return null;
+
+    const zapisanoMs = wiersz.recordedAt.getTime();
+    const wiekS = wiekSekund(zapisanoMs, Date.now());
+    const predkoscMps = wiersz.speedMps != null ? parseFloat(wiersz.speedMps) : null;
+    const dokladnoscM = wiersz.accuracyM;
+
+    return {
+      lat: parseFloat(wiersz.latitude),
+      lon: parseFloat(wiersz.longitude),
+      dokladnoscM,
+      predkoscMps,
+      zrodlo: wiersz.source === 'TELEGRAM' ? 'TELEGRAM' : 'APP',
+      zapisanoMs,
+      wiekS,
+      mozliwyBladM: mozliwyBladM({ wiekS, predkoscMps, dokladnoscM }),
+    };
+  }
+
+  /**
+   * Pozycja na tyle wiarygodna, zeby liczyc z niej dojazd — albo `null`.
+   *
+   * DWIE ROZNE MIARY, bo to dwie rozne rzeczy:
+   *
+   *   - `APP` — odczyt automatyczny. Liczy sie MOZLIWY BLAD W METRACH
+   *     (niepewnosc + predkosc x wiek), nie sam czas. Przy 100 km/h pozycja
+   *     sprzed minuty jest o 1,7 km obok i zadna liczba sekund tego nie widzi.
+   *   - `TELEGRAM` — pinezka przypieta RECZNIE, bez predkosci. Kurier wysyla
+   *     ja swiadomie tuz przed ocena oferty, wiec zostaje przy starym,
+   *     szerokim oknie czasu (`CFG.LOCATION_MAX_AGE_MS`). Inaczej dotychczasowy
+   *     sposob pracy przestalby dzialac z dnia na dzien.
+   */
+  async swieza(telegramId: string | number): Promise<Lokalizacja | null> {
+    const loc = await this.ostatnia(telegramId);
+    if (!loc) return null;
+
+    if (loc.zrodlo === 'TELEGRAM') {
+      const ttlS = Math.round(CFG.LOCATION_MAX_AGE_MS / 1000);
+      return czyAktualna(loc.zapisanoMs, Date.now(), ttlS) ? loc : null;
+    }
+
+    const godna = czyGodnaZaufania(
+      { wiekS: loc.wiekS, predkoscMps: loc.predkoscMps, dokladnoscM: loc.dokladnoscM },
+      CFG.LOKALIZACJA_MAKS_BLAD_M,
+      CFG.LOKALIZACJA_ZAPORA_S
+    );
+
+    return godna ? loc : null;
+  }
+}
+
+export const lokalizacjaService = new LokalizacjaService();
+```
+
 # Plik: src/services/maps.service.ts
 ```typescript
 import 'dotenv/config';
@@ -8473,6 +9303,136 @@ CREATE INDEX IF NOT EXISTS api_idempotency_created_at_idx
   ON api_idempotency (created_at);
 ```
 
+# Plik: drizzle/0003_courier_locations.sql
+```sql
+-- Ostatnia znana pozycja kuriera. Jeden wiersz na uzytkownika.
+--
+-- Migracja BEZPIECZNA: sama dodaje tabele, niczego nie rusza i nie kasuje.
+-- Da sie uruchomic na dzialajacej bazie, przy chodzacym bocie.
+--
+-- Uruchomienie na serwerze (§5 kompendium — ZAWSZE przez `-c`, nigdy `< plik`):
+--
+--   cd /share/courier-bot
+--   docker compose exec -T postgres psql -U postgres -d courierdb -c "$(cat drizzle/0003_courier_locations.sql)"
+--
+-- Albo, jesli `docker compose` znowu znikl po restarcie dodatku SSH:
+--
+--   docker exec -i courier-db psql -U postgres -d courierdb < drizzle/0003_courier_locations.sql
+--
+-- `drizzle-kit push` tez by to zrobil, ale przy realnych danych wolimy jawny
+-- SQL — push potrafi zapytac „created or renamed?" i przy zlej odpowiedzi
+-- podpiac stare dane pod nowa nazwe (§9c).
+
+CREATE TABLE IF NOT EXISTS "courier_locations" (
+  "telegram_id" text PRIMARY KEY NOT NULL,
+  "latitude"    numeric(9, 6) NOT NULL,
+  "longitude"   numeric(9, 6) NOT NULL,
+  "accuracy_m"  integer,
+  "source"      text NOT NULL DEFAULT 'APP',
+  "recorded_at" timestamp NOT NULL,
+  "updated_at"  timestamp NOT NULL DEFAULT now()
+);
+
+-- Klucz obcy dokladany osobno i warunkowo: `ADD CONSTRAINT` nie ma wariantu
+-- `IF NOT EXISTS`, wiec powtorne uruchomienie migracji wywalilo by sie bledem.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'courier_locations_telegram_id_users_telegram_id_fk'
+  ) THEN
+    ALTER TABLE "courier_locations"
+      ADD CONSTRAINT "courier_locations_telegram_id_users_telegram_id_fk"
+      FOREIGN KEY ("telegram_id") REFERENCES "users"("telegram_id") ON DELETE CASCADE;
+  END IF;
+END $$;
+```
+
+# Plik: drizzle/0004_courier_locations_speed.sql
+```sql
+-- Predkosc w chwili odczytu pozycji.
+--
+-- DLACZEGO OSOBNA MIGRACJA, A NIE POPRAWKA 0003: 0003 mogl juz pojsc na
+-- produkcje. Migracja, ktora zmienia sie po wykonaniu, jest gorsza niz dwie
+-- migracje po kolei.
+--
+-- DLACZEGO TA KOLUMNA W OGOLE: pierwsza wersja mierzyla swiezosc pozycji
+-- w sekundach („wazna 60 s"). Przy 100 km/h to 1,7 km bledu — a reguła
+-- w sekundach nic o predkosci nie wie. Od tej kolumny zalezy, czy pozycja
+-- jest jeszcze cokolwiek warta:
+--
+--   blad = niepewnosc odczytu + predkosc x wiek
+--
+-- URUCHOMIENIE (po 0003, ktore tworzy tabele):
+--
+--   cd /share/courier-bot
+--   docker exec -i courier-db psql -U postgres -d courierdb < drizzle/0004_courier_locations_speed.sql
+--
+-- Bezpieczna: tylko dodaje kolumne dopuszczajaca NULL, niczego nie przepisuje.
+-- Istniejace wiersze dostana `NULL`, co warstwa regul czyta jako „nie wiem"
+-- i podstawia zalozenie ostrozne, a nie zerowa predkosc.
+
+ALTER TABLE "courier_locations"
+  ADD COLUMN IF NOT EXISTS "speed_mps" numeric(6, 2);
+```
+
+# Plik: .devcontainer/devcontainer.json
+```json
+// Środowisko pracy w przeglądarce (GitHub Codespaces) — bot.
+//
+// PO CO TO JEST.
+//
+// Do tej pory kod dało się edytować tylko na jednym komputerze: w kopii
+// roboczej w WSL. Ten plik opisuje gotowe środowisko, które GitHub stawia
+// u siebie na żądanie — Linux, Node 22, terminal, VS Code w przeglądarce.
+// Otwierasz je z dowolnej maszyny, także cudzej, i masz to samo repo.
+//
+// Środowisko jest WERSJONOWANE RAZEM Z KODEM. Ta sama myśl co w Dockerfile:
+// opis maszyny leży obok tego, co na niej biegnie, więc nie da się ich
+// rozjechać po cichu.
+//
+// Docelowo to źródło prawdy przenosi się na GitHuba, a kopia w WSL przestaje
+// być potrzebna — znika dług „dwie kopie repozytorium" (§17).
+//
+// JAK URUCHOMIĆ: na stronie repozytorium zielony przycisk Code → zakładka
+// Codespaces → Create codespace on main. Pierwsze uruchomienie trwa 2–3
+// minuty, kolejne kilkanaście sekund.
+//
+// CZEGO TU NIE MA: PostgreSQL. `npm run typecheck` i `npm test` go nie
+// potrzebują — testy celowo nie dotykają bazy (§5: arytmetyka siedzi
+// w `finance.calc.ts`, bez zależności od `db/index.ts`). Żeby URUCHOMIĆ
+// bota w Codespace, trzeba by dołożyć usługę Postgresa; nie robimy tego,
+// dopóki nie okaże się potrzebne — bot i tak działa na serwerze.
+{
+  "name": "courier-bot",
+
+  // Obraz Microsoftu z Node 22, gitem i narzędziami powłoki. Ta sama główna
+  // wersja Node co w Dockerfile (`node:22-alpine`) — rozjazd tutaj oznaczałby
+  // pisanie kodu pod inny runtime niż ten, który go uruchamia.
+  "image": "mcr.microsoft.com/devcontainers/typescript-node:22",
+
+  // Uruchamiane raz, przy tworzeniu środowiska.
+  //
+  // `npm install`, nie `npm ci` — z tego samego powodu co w CI: esbuild ciągnie
+  // 27 pakietów platformowych jako opcjonalne, a różne wersje npm-a zapisują je
+  // w locku niezgodnie (npm/cli#8805). Szczegóły w `claude/ci-github-actions.md`.
+  "postCreateCommand": "npm install",
+
+  // Krótkie przypomnienie po każdym otwarciu — łatwo zapomnieć, gdzie się jest.
+  "postAttachCommand": "echo 'courier-bot — sprawdzenie: npm run sprawdz'",
+
+  "customizations": {
+    "vscode": {
+      "settings": {
+        // Ten projekt jest w całości po polsku, łącznie z nazwami plików
+        // i komentarzami. Domyślne sortowanie i tak działa, ale terminal
+        // zaczynamy w katalogu repo, nie w katalogu domowym.
+        "terminal.integrated.cwd": "${containerWorkspaceFolder}"
+      }
+    }
+  }
+}
+```
+
 # Plik: .dockerignore
 ```gitignore
 # Bez tego `COPY . .` wciaga node_modules i .git do obrazu:
@@ -8501,6 +9461,89 @@ data
 codebase.md
 *.md
 !README.md
+```
+
+# Plik: .github/workflows/sprawdz.yml
+```yaml
+# Kontrola jakości przy każdym pushu — bot.
+#
+# DLACZEGO TO ISTNIEJE.
+#
+# `tsx` nie sprawdza typów (§6d). Dockerfile odpala `npx tsx src/index.ts`,
+# co tylko wycina adnotacje — błąd typu nie wyjdzie ani przy budowaniu obrazu,
+# ani w runtime, dopóki nie trafi się na tę jedną linię. Jedynym miejscem,
+# które te typy sprawdza, jest `npm run typecheck`, uruchamiany ręcznie.
+#
+# Do tej pory pilnowała tego wyłącznie pamięć człowieka. Teraz pilnuje tego
+# GitHub, na każdym pushu, niezależnie od tego, z jakiego komputera poszedł.
+#
+# Komenda jest CELOWO ta sama, którą uruchamiasz u siebie (`npm run sprawdz`
+# = `typecheck && test`). Gdyby CI odpalało coś innego, „u mnie działa"
+# przestałoby cokolwiek znaczyć.
+
+name: sprawdz
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Pozwala odpalić ręcznie z zakładki Actions — przydatne, gdy chcesz
+  # potwierdzić stan repo bez robienia pustego commita.
+  workflow_dispatch:
+
+# Nowy push na tę samą gałąź anuluje poprzedni, jeszcze trwający przebieg.
+# Bez tego trzy pushe pod rząd zajmują trzy razy tyle minut, a interesuje
+# nas i tak tylko wynik ostatniego.
+concurrency:
+  group: sprawdz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sprawdz:
+    name: typy i testy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Ta sama wersja co w Dockerfile. Rozjazd tutaj oznaczałby, że CI
+          # sprawdza inny runtime niż ten, który faktycznie uruchamia bota.
+          node-version: '22'
+          cache: npm
+
+      # `npm install`, NIE `npm ci` — decyzja świadoma, nie niedopatrzenie.
+      #
+      # `npm ci` byłby tu właściwszy, bo instaluje dokładnie to, co w locku.
+      # Ale ten stos ma z lockfile'ami trwały kłopot: esbuild ciągnie 27
+      # pakietów platformowych jako zależności OPCJONALNE, a npm od 11.6.2
+      # zapisuje je w locku inaczej niż wersje wcześniejsze (npm/cli#8805).
+      # Lokalnie stoi npm 11.17.0, a runner bierze npm-a dołączonego do
+      # Node 22 — lock napisany przez jeden bywa nieczytelny dla drugiego.
+      #
+      # Dwie próby naprawy dały dwa RÓŻNE błędy, co samo w sobie jest
+      # diagnozą (rozjazd wersji, nie zepsuty lock):
+      #   1. `Missing: esbuild@0.28.2 from lock file` — lock ich nie miał,
+      #   2. po przebudowie locka: `EBADPLATFORM: @esbuild/aix-ppc64` — czyli
+      #      esbuild na IBM AIX/PowerPC, którego na Linuksie zainstalować
+      #      się nie da i nie trzeba, a npm na runnerze uznał go za wymagany.
+      #
+      # `npm install` rozwiązuje zależności od nowa i pakiety nie na tę
+      # platformę zwyczajnie pomija.
+      #
+      # CO PRZEZ TO TRACIMY, wprost: CI nie sprawdza już dokładnie tych wersji
+      # pakietów, które masz u siebie — w ramach zakresów `^` może wziąć
+      # nowsze. Przy tym projekcie strata jest umiarkowana, bo testy sprawdzają
+      # NASZ kod, nie cudze biblioteki. Ten sam kompromis stoi w Dockerfile
+      # i z tego samego powodu (§12d).
+      #
+      # Gdyby kiedyś wrócić do `npm ci`: trzeba wymusić po obu stronach tę samą
+      # wersję npm-a (`npm install -g npm@<wersja>` przed instalacją), a nie
+      # liczyć na to, że przypadkiem się zgodzą.
+      - run: npm install --no-audit --no-fund
+
+      - run: npm run sprawdz
 ```
 
 # Plik: .gitignore
