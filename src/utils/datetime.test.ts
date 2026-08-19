@@ -153,6 +153,13 @@ describe('calculateHours (FIX 2.9)', () => {
     expect(result.error).toContain('minimum');
   });
 
+  it('równe godziny to zmiana za krótka, a nie 24 h', () => {
+    const r = calculateHours('20:05', '20:05');
+    expect(r.hours).toBeNull();
+    expect(r.error).toContain('minimum');
+    expect(r.error).not.toContain('24');
+  });
+
   it('zgłasza błąd formatu zamiast zwracać 0', () => {
     expect(calculateHours('abc', '10:00').error).toContain('format');
   });

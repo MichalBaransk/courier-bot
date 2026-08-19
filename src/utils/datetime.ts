@@ -157,7 +157,18 @@ export function calculateHours(fromStr: string, toStr: string): ShiftHours {
   const [tH, tM] = to.split(':').map(Number) as [number, number];
 
   let diffMinutes = tH * 60 + tM - (fH * 60 + fM);
-  if (diffMinutes <= 0) diffMinutes += 24 * 60; // zmiana przez polnoc
+  // Tylko UJEMNA roznica znaczy przejscie przez polnoc.
+  //
+  // Wczesniej bylo `<= 0`, wiec RONWE godziny dawaly 24 h. Znalezione testem
+  // mostu 19.08: przycisk zmiany w aplikacji dotkniety dwa razy w tej samej
+  // minucie wysylal `od == do`, a serwer odpowiadal „wychodzi 24.00 h (limit
+  // 16 h)" — komunikat, z ktorego nie da sie odgadnac, co sie stalo.
+  // Aplikacja od poczatku liczyla `(b - a + 1440) % 1440`, czyli ZERO. To byl
+  // rozjazd miedzy dwiema stronami tej samej reguly.
+  //
+  // Zero godzin i tak odpada na `MIN_SHIFT_HOURS`, tylko z komunikatem, ktory
+  // mowi prawde: zmiana jest za krotka.
+  if (diffMinutes < 0) diffMinutes += 24 * 60;
 
   const hours = Math.round((diffMinutes / 60) * 100) / 100;
 

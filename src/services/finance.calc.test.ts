@@ -275,8 +275,10 @@ describe('zakresSesji — zmiana na osi minut', () => {
     expect(zakresSesji({ od: '23:50', do: '02:10' })).toEqual({ start: 1430, koniec: 1570 });
   });
 
-  it('równe godziny znaczą pełną dobę — i dlatego odpadną na limicie 16 h', () => {
-    expect(zakresSesji({ od: '10:00', do: '10:00' })).toEqual({ start: 600, koniec: 2040 });
+  it('równe godziny to zmiana ZEROWEJ długości, nie doba', () => {
+    // Regresja z 19.08: serwer liczył tu 24 h, aplikacja 0. Ta rozbieżność
+    // wychodziła przy dwukrotnym dotknięciu przycisku w tej samej minucie.
+    expect(zakresSesji({ od: '10:00', do: '10:00' })).toEqual({ start: 600, koniec: 600 });
   });
 
   it('zmiana trwająca zajmuje oś aż do końca', () => {

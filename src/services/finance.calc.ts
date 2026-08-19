@@ -315,7 +315,9 @@ export function zakresSesji(sesja: Sesja, przesuniecieDni = 0): ZakresSesji | nu
   const koniecSurowy = minutyOdPolnocy(sesja.do);
   if (koniecSurowy === null) return null;
 
-  const koniec = koniecSurowy <= start ? koniecSurowy + MINUT_W_DOBIE : koniecSurowy;
+  // `<`, nie `<=` — rowne godziny to zmiana ZEROWEJ dlugosci, nie doba.
+  // Ta sama poprawka co w `calculateHours`; obie musza mowic to samo.
+  const koniec = koniecSurowy < start ? koniecSurowy + MINUT_W_DOBIE : koniecSurowy;
   return { start: start + przesuniecie, koniec: koniec + przesuniecie };
 }
 
