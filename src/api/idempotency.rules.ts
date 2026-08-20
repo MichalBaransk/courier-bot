@@ -16,10 +16,20 @@ export const RETENCJA_H = 48;
  * Po tylu sekundach wiersz „w toku" uznajemy za porzucony.
  *
  * Bez tego pojedynczy ubity proces zostawialby klucz zablokowany na zawsze
- * i ten konkretny wpis nigdy by nie przeszedl. 60 s jest z duzym zapasem
- * powyzej 10-sekundowego timeoutu klienta.
+ * i ten konkretny wpis nigdy by nie przeszedl.
+ *
+ * PROG MUSI BYC WIEKSZY NIZ NAJDLUZSZY TIMEOUT KLIENTA. Wczesniej stalo tu 60 s
+ * z uzasadnieniem „z duzym zapasem powyzej 10-sekundowego timeoutu klienta" —
+ * i to bylo prawda, dopoki jedynymi zapisami byly napiwki. Ocena oferty wola
+ * Gemini i czeka do 90 s (`TIMEOUT_OCENY_MS` w aplikacji). Przy progu 60 s
+ * ponowienie wysylane po timeoucie trafialo na wiersz uznany za porzucony,
+ * PRZEJMOWALO klucz i puszczalo DRUGIE wywolanie modelu rownolegle z pierwszym,
+ * ktore ciagle trwalo. Zamiast ochrony przed duplikatem — dwa wiersze
+ * w `course_offers` i dwa platne odczyty.
+ *
+ * 120 s to 90 s timeoutu plus zapas na kolejke i siec.
  */
-export const PORZUCONY_PO_S = 60;
+export const PORZUCONY_PO_S = 120;
 
 /** Co ile zapisow uruchamiamy sprzatanie starych wierszy. */
 export const SPRZATAJ_CO = 50;

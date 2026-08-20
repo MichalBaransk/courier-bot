@@ -71,9 +71,18 @@ describe('czyPorzucony', () => {
     expect(czyPorzucony(new Date('2026-08-16T11:59:30Z'), teraz)).toBe(false);
   });
 
-  it('granica 60 s', () => {
-    expect(czyPorzucony(new Date('2026-08-16T11:59:00Z'), teraz)).toBe(false);
-    expect(czyPorzucony(new Date('2026-08-16T11:58:59Z'), teraz)).toBe(true);
+  /**
+   * Granica MUSI lezec powyzej najdluzszego timeoutu klienta (90 s przy ocenie
+   * oferty). Gdyby ktos wrocil do 60 s, ten test zapali sie natychmiast — i o to
+   * chodzi, bo skutkiem bylyby dwa rownolegle wywolania Gemini dla jednego zrzutu.
+   */
+  it('granica 120 s', () => {
+    expect(czyPorzucony(new Date('2026-08-16T11:58:00Z'), teraz)).toBe(false);
+    expect(czyPorzucony(new Date('2026-08-16T11:57:59Z'), teraz)).toBe(true);
+  });
+
+  it('zadanie sprzed 90 s — czyli po timeoucie oceny oferty — NIE jest porzucone', () => {
+    expect(czyPorzucony(new Date('2026-08-16T11:58:30Z'), teraz)).toBe(false);
   });
 
   it('zadanie sprzed godziny to ubity proces, nie praca w toku', () => {
