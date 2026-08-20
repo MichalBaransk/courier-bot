@@ -392,10 +392,23 @@ describe('walidujSesje', () => {
     expect(wynik).toEqual({ ok: true });
   });
 
-  it('zmiana krótsza niż 15 minut odpada na regule 2.9', () => {
-    const wynik = walidujSesje({ istniejace: [], nowa: { od: '10:00', do: '10:10' } });
-    expect(wynik.ok).toBe(false);
-    if (!wynik.ok) expect(wynik.komunikat).toContain('minimum');
+  it('zmiana krótsza niż 15 minut PRZECHODZI — dolnego progu nie ma', () => {
+    expect(walidujSesje({ istniejace: [], nowa: { od: '10:00', do: '10:10' } })).toEqual({
+      ok: true,
+    });
+  });
+
+  it('zmiana zerowa też przechodzi i wnosi 0 h do sumy', () => {
+    expect(walidujSesje({ istniejace: [], nowa: { od: '10:00', do: '10:00' } })).toEqual({
+      ok: true,
+    });
+    expect(dlugoscSesjiH({ od: '10:00', do: '10:00' })).toBe(0);
+  });
+
+  it('krótka zmiana wnosi do sumy swoją PRAWDZIWĄ długość', () => {
+    // Nie zero. Przed 20.08 `calculateHours` zwracał tu `null`, a `?? 0`
+    // zamieniało to w ciche zero godzin przy niezerowym zarobku.
+    expect(dlugoscSesjiH({ od: '10:00', do: '10:10' })).toBeCloseTo(0.17, 2);
   });
 
   it('pojedyncza zmiana dłuższa niż 16 h odpada', () => {

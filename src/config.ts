@@ -67,8 +67,11 @@ export const CFG = {
   /** Timeout pobierania pliku z serwerow Telegrama. */
   DOWNLOAD_TIMEOUT_MS: 30 * 1000,
 
-  /** Sanity-check dlugosci zmiany. Poza zakresem = blad wpisu, nie cicha korekta. */
-  MIN_SHIFT_HOURS: 0.25,
+  /**
+   * Gorny sanity-check dlugosci zmiany. Przekroczenie = blad wpisu, nie cicha korekta.
+   *
+   * Dolnego progu NIE MA (usuniety 20.08) — patrz `calculateHours`.
+   */
   MAX_SHIFT_HOURS: 16,
 
   /** Stawka przyjmowana do prognoz, dopoki nie ma wlasnej historii godzin. */

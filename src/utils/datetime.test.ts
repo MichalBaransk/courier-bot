@@ -147,17 +147,24 @@ describe('calculateHours (FIX 2.9)', () => {
     expect(result.error).toContain('limit');
   });
 
-  it('odrzuca zmianę krótszą niż minimum', () => {
+  it('krótka zmiana jest POPRAWNA — dolnego progu nie ma', () => {
+    // Do 20.08 odpadała na `MIN_SHIFT_HOURS`. Wyjazd i natychmiastowy powrót
+    // to prawdziwe zdarzenie, a nie literówka; literówki łapie górny limit.
     const result = calculateHours('10:00', '10:10');
-    expect(result.hours).toBeNull();
-    expect(result.error).toContain('minimum');
+    expect(result.error).toBeNull();
+    expect(result.hours).toBeCloseTo(0.17, 2);
   });
 
-  it('równe godziny to zmiana za krótka, a nie 24 h', () => {
+  it('równe godziny to ZERO, a nie 24 h', () => {
     const r = calculateHours('20:05', '20:05');
-    expect(r.hours).toBeNull();
-    expect(r.error).toContain('minimum');
-    expect(r.error).not.toContain('24');
+    expect(r.error).toBeNull();
+    expect(r.hours).toBe(0);
+  });
+
+  it('minuta zmiany liczy się jako minuta, nie jako zero', () => {
+    // Gdyby krótka zmiana wracała jako `null`, `dlugoscSesjiH` zamieniłby
+    // ją na 0 h — zarobek byłby, godzin nie, a stawka zł/h poszłaby w górę.
+    expect(calculateHours('23:59', '00:00').hours).toBeCloseTo(0.02, 2);
   });
 
   it('zgłasza błąd formatu zamiast zwracać 0', () => {

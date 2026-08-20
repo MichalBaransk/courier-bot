@@ -338,10 +338,14 @@ export function nakladajaSie(a: ZakresSesji, b: ZakresSesji): boolean {
  * Gdyby liczyla do teraz, stawka zl/h zmienialaby sie co minute, a to samo
  * `/tydzien` wywolane dwa razy dawaloby dwie rozne liczby.
  *
- * Wynik poza `[MIN_SHIFT_HOURS, MAX_SHIFT_HOURS]` tez daje 0 — `calculateHours`
- * zwraca wtedy `null` (2.9). W praktyce takiej zmiany nie da sie zapisac, bo
- * `walidujSesje` ja odrzuca; to zabezpieczenie na wypadek recznej poprawki
- * w bazie.
+ * Zmiana dluzsza niz `MAX_SHIFT_HOURS` tez daje 0 — `calculateHours` zwraca
+ * wtedy `null`. W praktyce takiej zmiany nie da sie zapisac, bo `walidujSesje`
+ * ja odrzuca; to zabezpieczenie na wypadek recznej poprawki w bazie.
+ *
+ * ⚠️ Zmiana KROTKA liczy sie normalnie. Do 20.08 dolny prog 0,25 h sprawial,
+ * ze pieciominutowa zmiana wchodzila do bazy (przez reczna poprawke) i wnosila
+ * `0 h` do sumy — czyli zarobek byl, godzin nie bylo, a stawka zl/h szla
+ * w gore bez powodu. Prog zniknal i ten cichy rozjazd razem z nim.
  */
 export function dlugoscSesjiH(sesja: Sesja): number {
   if (sesja.do === null) return 0;
@@ -375,8 +379,9 @@ export type WynikWalidacji = { ok: true } | { ok: false; komunikat: string };
  * Cztery kontrole, kazda z konkretnego powodu:
  *
  * 1. **Format godzin** — bez tego reszta liczy smieci.
- * 2. **Dlugosc pojedynczej zmiany** w `[0,25 h; 16 h]`. To jest regula 2.9,
- *    wolana przez `calculateHours`, zeby limit istnial w JEDNYM miejscu.
+ * 2. **Dlugosc pojedynczej zmiany** do `MAX_SHIFT_HOURS`. Wolana przez
+ *    `calculateHours`, zeby limit istnial w JEDNYM miejscu. Dolnej granicy
+ *    nie ma — zmiana zerowa jest poprawna.
  * 3. **Nakladanie sie zmian** — dwie zmiany na tych samych godzinach
  *    liczylyby te godziny dwa razy.
  * 4. **Suma doby** rowniez w limicie `MAX_SHIFT_HOURS`. Ta kontrola NIE

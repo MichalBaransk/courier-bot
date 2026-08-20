@@ -178,11 +178,21 @@ export function calculateHours(fromStr: string, toStr: string): ShiftHours {
       error: `Zmiana ${from}-${to} wychodzi ${hours.toFixed(2)} h (limit ${CFG.MAX_SHIFT_HOURS} h). Sprawdz godziny.`,
     };
   }
-  if (hours < CFG.MIN_SHIFT_HOURS) {
-    return {
-      hours: null,
-      error: `Zmiana ${from}-${to} to tylko ${hours.toFixed(2)} h (minimum ${CFG.MIN_SHIFT_HOURS} h).`,
-    };
-  }
+  /**
+   * DOLNEGO PROGU NIE MA — usuniety 20.08 na prosbe uzytkownika.
+   *
+   * Stalo tu `hours < MIN_SHIFT_HOURS` (0,25 h), czyli zmiana krotsza niz
+   * kwadrans nie dawala sie zamknac. Regula mialaby sens, gdyby chronila
+   * przed literowka — ale przed literowka chroni GORNY limit: to on lapie
+   * `10:00 -> 09:00` (23 h), czyli przypadek, dla ktorego 2.9 powstala.
+   * Dolny prog lapal wylacznie zmiany, ktore naprawde byly krotkie.
+   *
+   * A takie sie zdarzaja: wyjazd, natychmiastowy powrot, zamkniecie zmiany.
+   * Kurier zostawal wtedy z otwarta zmiana, ktorej nie dalo sie zamknac
+   * inaczej niz skasowaniem — czyli reguła „chroniaca dane" kazala je usunac.
+   *
+   * Zero godzin jest teraz poprawnym wynikiem. Przed przypadkowym dotknieciem
+   * przycisku dwa razy chroni pytanie w aplikacji, a nie zakaz w bazie.
+   */
   return { hours, error: null };
 }
